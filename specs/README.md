@@ -4,10 +4,13 @@ Machine-checked models of five pieces of DMI whose correctness arguments are
 currently carried by prose: the catalog version allocator, the publisher lease
 and fenced publish protocol, the lease *lifecycle* inside
 `CaptureStorageService`, the clock-skew bounds in the fence margin and the
-default start wait, and the payload ring's span arithmetic.
+default start wait, and the payload ring's span arithmetic. Of the ring, only
+the arithmetic that splits a reservation into two spans is checked; its
+publish/consume protocol (the ready words, the head and tail updates and their
+memory ordering) is not modelled.
 
 Nothing here is built, imported or executed by DMI. The specs are checked by
-hand with the commands below; none of them runs in CI.
+hand, with `specs/check.sh` or the commands below; none of them runs in CI.
 
 ```text
 specs/
@@ -16,7 +19,10 @@ specs/
 └── cbmc/   C++ harness, checked with CBMC
 ```
 
-Everything below was checked against `fix/lease-recovery` @ `2b74d14`.
+Line references point at `fix/lease-recovery` @ `c0361d7`, the head of #150.
+The models were written against `204a8d2` (first published as `2b74d14`, the
+same tree); `c0361d7` changes only `run_cycle()`'s upload gate and comments,
+which no model covers.
 
 ## What each spec models
 
@@ -24,9 +30,9 @@ Everything below was checked against `fix/lease-recovery` @ `2b74d14`.
 |---|---|---|
 | `tla/VersionAllocator.tla` | the sole-claimant version allocation loop: floor read, jittered candidate, claim INSERT, singleton read-back, retry | `native/csrc/catalog/version_allocator.cpp:49-89`, header claim at `version_allocator.h:5-7`, watermark publish at `native/csrc/catalog/catalog_writer.cpp:587-620`, `clickhouse_client.cpp:107` |
 | `tla/PublisherLease.tla` | the lease claim/renew/release protocol and the fenced publish: `claim_with_rival`, `head()`, `fence()`, `fence_eval()`, `reject_live()`, and `publish_snapshot`'s manifest chunks and watermark INSERT | `native/csrc/catalog/lease_coordinator.cpp:83-247`, `native/csrc/catalog/catalog_writer.cpp:148-158,478-640`, `clickhouse_client.cpp:107`, `docs/catalog-descriptor-key.md:290-360,461-560`, `src/dmi/storage/capture/clickhouse_lease.py:83-92,198-210` |
-| `tla/LeaseLifecycle.tla` | the lease lifecycle *above* that protocol: the lease thread, the quarantine window, the `2 x TTL` latch, the start wait and the spool sweep | `native/csrc/catalog/storage_service.cpp:65-67,104-175,177-207,278-400,433-437,588-628,630-640,642-670,672-721,723-739,762-781`, `catalog_writer.cpp:243-253,268-274,285-293,296-310`, `lease_coordinator.cpp:45-55,57-68,70-81,220-247`, `indexer.cpp:258`, `src/dmi/storage/native_capture.py:139-145,215-219` |
-| `z3/clock_skew.py` | two obligations: the two-host derivation behind the fence margin `publish_timeout_ns + clock_skew_ns`, and the default start wait `lease_ttl_s + publish_timeout_s + clock_skew_s` | the SQL at `docs/catalog-descriptor-key.md:352-362` (emitted by `catalog_writer.cpp:583`), the derivation at `:365-372`, the cap at `catalog_writer.cpp:519`; for the start wait, `native_capture.py:215-219`, `storage_service.cpp:642-670`, `lease_coordinator.cpp:138-153,225-233` |
-| `cbmc/payload_ring_span.cpp` | `payload_compute_spans` and its stated precondition | `native/csrc/ring/payload_ring.cuh:44-86` |
+| `tla/LeaseLifecycle.tla` | the lease lifecycle *above* that protocol: the lease thread, the quarantine window, the `2 x TTL` latch, the start wait and the spool sweep | `native/csrc/catalog/storage_service.cpp:65-67,104-175,177-207,278-406,439-443,594-634,636-646,648-676,678-727,729-745,768-787`, `catalog_writer.cpp:243-253,268-274,285-293,296-310`, `lease_coordinator.cpp:45-55,57-68,70-81,220-247`, `indexer.cpp:258`, `src/dmi/storage/native_capture.py:139-145,215-219` |
+| `z3/clock_skew.py` | two obligations: the two-host derivation behind the fence margin `publish_timeout_ns + clock_skew_ns`, and the default start wait `lease_ttl_s + publish_timeout_s + clock_skew_s` | the SQL at `docs/catalog-descriptor-key.md:352-362` (emitted by `catalog_writer.cpp:583`), the derivation at `:365-372`, the cap at `catalog_writer.cpp:519`; for the start wait, `native_capture.py:215-219`, `storage_service.cpp:648-676`, `lease_coordinator.cpp:138-153,225-233` |
+| `cbmc/payload_ring_span.cpp` | `payload_compute_spans` and its stated precondition: the span arithmetic only, not the ring's publish/consume protocol | `native/csrc/ring/payload_ring.cuh:44-86` |
 
 All three TLA+ models are written against the **code**, not the prose. Where
 the two disagree, the spec follows the code and a comment in the `.tla` says so.
@@ -46,15 +52,41 @@ curl -fsSLO https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tool
 # Z3 (Python bindings include the solver)
 pip install z3-solver
 
-# CBMC (Debian/Ubuntu; or grab a release from github.com/diffblue/cbmc)
-apt-get install cbmc
+# CBMC: a release package from github.com/diffblue/cbmc/releases. The .deb
+# also unpacks without installing: dpkg -x ubuntu-*-cbmc-*.deb DIR puts the
+# binaries in DIR/usr/bin.
 ```
 
-Checked with TLC 2.19 on Java 21, Z3 4.13 (`z3-solver` 4.13.x) and CBMC 5.95.
-Any recent version of each should do; nothing here relies on a version-specific
-feature.
+Do not use apt's `cbmc` on Ubuntu 20.04: it is too old for this harness. Take
+a release package instead.
+
+Recorded with TLC 2.19 on Java 21, Z3 4.13 (`z3-solver` 4.13.x) and CBMC 5.95,
+and re-run with `specs/check.sh` on a TLC build from 2026-09, Z3 4.15 and CBMC
+6.4.1. Any recent version of each should do; nothing here relies on a
+version-specific feature.
 
 ## Running the checks
+
+### All at once
+
+```sh
+TLA2TOOLS_JAR=/path/to/tla2tools.jar CBMC=/path/to/cbmc PYTHON=/path/to/python \
+    specs/check.sh
+```
+
+`check.sh` runs every TLC config not marked manual, `z3/clock_skew.py` and both
+CBMC builds, compares each verdict with the one it expects, and exits non-zero
+on any mismatch. The expected verdicts are a table at the top of the script
+(`specs/check.sh --list`); a `.cfg` without a row, or a row without a `.cfg`, is
+an error. `--all` adds the manual configs, which take minutes each:
+`PublisherLease.cfg`, `believers`, `holderssafe`, `overrun`, `nonlin_fence`,
+`stalepid` and `noovr1`. Arguments that are not options select checks by shell
+glob, e.g. `specs/check.sh 'LeaseLifecycle_O3_*' 'cbmc_*'`. TLC runs in a
+scratch copy of `specs/tla`, so no `states/` directory or trace file lands in
+the tree. `TLC_WORKERS` (default 4) and `TLC_HEAP` (default `4g`) tune TLC,
+and `GOTO_CC` overrides the `goto-cc` found next to `$CBMC`.
+
+The sections below give the commands for running one check by hand.
 
 ### TLA+
 
@@ -95,9 +127,9 @@ quarantine, `O3_*` the latch, `O4_*` the start wait, `O5_*` the spool sweep, and
 `vac_*` the vacuity guards.
 
 The largest runs (`believers`, `holderssafe`, `overrun`, `nonlin_fence`,
-`PublisherLease.cfg`) generate 20M-61M states and take roughly 15-60 minutes on
-four workers with a 3 GB heap. Every `LeaseLifecycle` run finishes in under two
-minutes. The rest finish in seconds.
+`stalepid`, `noovr1` and `PublisherLease.cfg`) generate 15M-61M states and take
+minutes each; `check.sh` runs them only with `--all`. Every `LeaseLifecycle`
+run finishes in under two minutes. The rest finish in seconds.
 
 ### Z3
 
@@ -106,7 +138,7 @@ python3 specs/z3/clock_skew.py
 ```
 
 Prints one line per check and exits non-zero if any result differs from the
-expected one. Six checks, no arguments, a couple of seconds.
+expected one. Seven checks, no arguments, a couple of seconds.
 
 ### CBMC
 
@@ -135,13 +167,16 @@ in parentheses, are the number of states in the trace TLC printed, including
 the initial state.
 
 **State counts for runs that completed are exact and reproducible.** Every
-completed run in the tables below reproduced its previously recorded distinct
-count to the state when re-run against `2b74d14`.
+completed `VersionAllocator` and `PublisherLease` run in the tables below
+reproduced its previously recorded distinct count to the state when re-run
+with `check.sh`. The `LeaseLifecycle` counts were re-recorded after
+`NoSelfRefusal` was tightened, which changed the history variable it reads and
+so the number of distinct states in several configs; no verdict changed.
 
 **State counts and trace depths for refuted runs are not reproducible.** TLC
 stops as soon as any worker hits the violation, so both the count and the
 trace length depend on the worker count and on scheduling. The figures here
-were recorded with 2 or 4 workers; `NoOrphanManifestRows` has been seen at both
+were recorded with 2, 4 or 8 workers; `NoOrphanManifestRows` has been seen at both
 9 and 14 states on the same config. Only the verdict is stable for a refuted
 run, not the number beside it.
 
@@ -186,13 +221,16 @@ Base model: two publishers, `Lids = {1,2,3}`, `MaxTerm = 3`, `MaxTime = 5`,
 
 | Config | Invariant | Verdict | States |
 |---|---|---|---|
-| `PublisherLease.cfg` (base) | `AllSafety` | **holds** | 19,807,266 / 9,665,700 |
+| `PublisherLease.cfg` (base) | `AllSafety` | **holds** (its `NoOverlappingAdmit` conjunct vacuously; see below) | 19,807,266 / 9,665,700 |
 | `base5` (`MaxTerm 5`, `MaxTime 8`) | `AllSafety` | **holds** | 5,195,821 / 2,408,145 |
+| `base5_ovr` (`base5`, `AllowOverrun`) | `NoOverlappingAdmit` | violated (29) | 1,432,673 / 678,409 |
 | `believers` | `AtMostOneBeliever` | **holds** | 19,807,266 / 9,665,700 |
 | `holderssafe` | `TwoHoldersIsSafe` | **holds** | 19,807,266 / 9,665,700 |
 | `holders` | `AtMostOneHolder` | violated (12) | 10,865 / 6,280 |
 | `noovr0` (empty refs, cap enforced) | `NoOverlappingAdmit` | **holds** | 1,761,711 / 799,611 |
 | `ovr0` (empty refs, `AllowOverrun`) | `NoOverlappingAdmit` | violated (15) | 64,379 / 34,191 |
+| `noovr1` (`noovr0` with 1 chunk) | `NoOverlappingAdmit` | **holds** | 15,555,231 / 7,204,077 |
+| `ovr1` (`noovr1`, `AllowOverrun`) | `NoOverlappingAdmit` | violated (32) | 4,235,316 / 2,001,749 |
 | `overrun` (`AllowOverrun`, 1 chunk) | `NoOverlappingAdmit` | **holds** (vacuously) | 20,855,772 / 9,873,900 |
 | `selfrace` (shared writer, no lock) | `WatermarkMonotonic` | violated (29) | 11,890,931 / 6,074,002 |
 | `selfracelocked` (shared writer, lock) | `AllSafety` | **holds** | 947,826 / 524,274 |
@@ -229,11 +267,24 @@ invariant that holds because its subject is unreachable proves nothing.
 constants, `overrun` reports `NoOverlappingAdmit` as holding — but it holds
 **vacuously**: the term budget at `MaxTerm = 3` with a manifest chunk is too
 small to reach a takeover at all, so no two watermark statements are ever in
-flight to compare. `base5`, `noovr0`, `ovr0` and `vac0` exist for that reason.
-`vac0` refutes `NeverAdmits` at the `ovr0`/`noovr0` constants, which proves
-admissions are reached there; at those constants the cap-enforced run holds
-(799,611 states) and the cap-overrun run is violated. That pair, not the
-`overrun` row, is the evidence about the takeover instant.
+flight to compare. The same goes for the base run itself: `AllSafety` includes
+`NoOverlappingAdmit`, so `PublisherLease.cfg` holding says nothing about
+overlapping admissions. That does not make its other four conjuncts vacuous,
+but it does not show them reached either; the guards above do that for the
+publish, fence and admission states. `base5`, `noovr0`, `ovr0`, `noovr1`, `ovr1` and `vac0` exist for that
+reason, and each holding run has a partner that differs only in allowing the
+statement cap to overrun and is refuted, which proves the takeover is reached
+at its constants:
+
+| Holds (cap enforced) | Refuted (`AllowOverrun`) | Publish |
+|---|---|---|
+| `base5` (`AllSafety`) | `base5_ovr` | one manifest chunk, `MaxTerm 5` |
+| `noovr0` | `ovr0` | empty refs, `MaxTerm 4` |
+| `noovr1` | `ovr1` | one manifest chunk, `MaxTerm 4` |
+
+`vac0` also refutes `NeverAdmits` at the `ovr0`/`noovr0` constants, which proves
+admissions are reached there. Those pairs, not the `overrun` row or the base
+run, are the evidence about the takeover instant.
 
 ### Lease lifecycle (`LeaseLifecycle.tla`)
 
@@ -249,20 +300,39 @@ integers. Most configs run one service with `TTL = 6`.
 | `O1_tries12` (`TTL 12`) | `ThreeTriesFit` + `FourTriesFit` | **holds** | 6 / 6 |
 | `O1_tries60` (`TTL 60`) | `ThreeTriesFit` + `FourTriesFit` | **holds** | 6 / 6 |
 | `O1_tries5` | `FiveTriesFit` | violated (constant-level) | — |
-| `O1_clean` | `NoPhantomLease` | **holds** | 206 / 126 |
-| `O1_cut` (ClickHouse cut) | `NoPhantomLease` | **holds** | 7,795 / 3,879 |
-| `O1_late` (`MaxLate 1`) | `NoPhantomLease` | **holds** | 22,268 / 9,880 |
-| `O1_absorb` | `OneFailureAbsorbed` | violated (9) | 148 / 90 |
-| `O1_skip` (`AllowSkipPublish`) | `NoPhantomLease` | violated (19) | 344 / 196 |
+| `O1_clean` | `NoPhantomLease` | **holds**, if requests are fast (see below) | 206 / 126 |
+| `O1_cut` (ClickHouse cut) | `NoPhantomLease` | **holds**, if requests are fast | 7,419 / 3,660 |
+| `O1_late` (`MaxLate 1`) | `NoPhantomLease` | **holds**, if requests are fast | 21,085 / 9,276 |
+| `O1_slowreq3` (`MaxLate 3`, no cycle) | `NoPhantomLease` | **holds** | 382 / 230 |
+| `O1_slowreq` (`MaxLate 4`, no cycle) | `NoPhantomLease` | violated (10) | 450 / 281 |
+| `O1_absorb` | `OneFailureAbsorbed` | violated (9) | 314 / 175 |
+| `O1_skip` (`AllowSkipPublish`) | `NoPhantomLease` | violated (19) | 479 / 265 |
+
+**The `O1` HOLDS verdicts assume every lease request completes in about half
+the TTL.** The model settles each ClickHouse call in the step that issues it:
+`RenewIfDue`, `EnsureLease` and `StartClaim` take zero time. The code does not.
+`keep_lease()` holds `lease_mutex_` across `renew_lease()`, which is three
+requests (head read, claim `INSERT`, read-back), each bounded only by the
+client's `request_s` — 60 s by default, against a 15 s default TTL. A slow
+request delays every later wake exactly as a late wake does, so `MaxLate`
+stands in for it. With no publishes to renew the row (`CycleOn = FALSE`, the
+idle service), `NoPhantomLease` holds at `MaxLate = 3`, half the TTL
+(`O1_slowreq3`), and falls at `MaxLate = 4` (`O1_slowreq`): the row expires
+under a service that still believes it holds it. So `O1_clean`, `O1_cut` and
+`O1_late` show the renewal schedule is sound while requests are fast, not that
+the lease survives a slow ClickHouse. Nothing in the code bounds a lease
+request below half the TTL yet; a follow-up PR will bound lease request time.
 
 `O1_tries` / `O1_tries5` together pin the comment at
-`storage_service.cpp:631-632` — *"which leaves two more tries"*. Exactly **four**
+`storage_service.cpp:637-638` — *"which leaves two more tries"*. Exactly **four**
 lease-thread wakes fall between the instant the renewal falls due
 (`last_renew + ttl/3`) and the instant the row dies (`last_renew + ttl`), at
 every phase offset: three fit, four fit, five do not. The arithmetic is
-correct and conservative. `FiveTriesFit` is refuted at the constant level — the
-arithmetic is decided before any state is explored, so TLC reports no state
-count.
+correct on the tick grid, and nominal: it assumes every wake is on time and
+every renewal completes at once, which `O1_slowreq` shows is load-bearing, and
+`last_renew_ns_` is stamped after the round trip returns, not when the row is
+written. `FiveTriesFit` is refuted at the constant level — the arithmetic is
+decided before any state is explored, so TLC reports no state count.
 
 Two caveats on that comment. The first is read from the code and confirmed
 by `O1_absorb`; the second is a model result:
@@ -271,14 +341,16 @@ by `O1_absorb`; the second is a model result:
   **fails**: a failed renewal costs the lease at once, whatever the cause. A
   refusal drops it in the coordinator (`reject_live`,
   `lease_coordinator.cpp:226`, or the failed read-back at `:128`). A transport
-  error, timeout or parse error is a `ClickHouseError` and takes the
-  `std::exception` path at `catalog_writer.cpp:285-292`, which quarantines on
-  the *first* one. No renewal failure is retried under the same lease.
+  error, timeout, server error or parse error is a `ClickHouseError` and takes
+  the `std::exception` path at `catalog_writer.cpp:285-292`, which quarantines
+  on the *first* error that survives the client's retries (reads only; a write
+  that may have reached the server is never retried). No renewal failure is
+  retried under the same lease.
   `O1_absorb` is that, refuted as expected.
 * `O1_skip` is a real defect, not a modelling artefact. See below.
 
 **`O1_skip` — a lease can lapse under a service that still believes it holds
-it.** `storage_service.cpp:435-437` bumps `last_renew_ns_` when
+it.** `storage_service.cpp:441-443` bumps `last_renew_ns_` when
 `indexed_packs > 0 || skipped_packs > 0`, with the comment *"a publish renews
 the lease"*. But `indexer.cpp:258` gates the whole publish on
 `!all_rows.empty() || !indexed.empty()`: an index pass whose packs were all
@@ -310,14 +382,14 @@ alone, or the indexer should report whether it actually published.
 
 | Config | Invariant | Verdict | States |
 |---|---|---|---|
-| `O2_quar` | `QuarantineOutlastsItsRow` | **holds** | 7,795 / 3,879 |
-| `O2_skew` (`Skew 1`) | `QuarantineOutlastsItsRow` | violated (27) | 1,632 / 854 |
-| `O2_reuse` (`ReuseLid`) | `QuarantineOutlastsItsRow` | violated (27) | 1,422 / 765 |
-| `O2_selfref` | `NoSelfRefusal` | violated (29) | 1,856 / 1,001 |
+| `O2_quar` | `QuarantineOutlastsItsRow` | **holds**, if an unknown outcome lands at once (see below) | 7,419 / 3,660 |
+| `O2_skew` (`Skew 1`) | `QuarantineOutlastsItsRow` | violated (27) | 1,948 / 1,049 |
+| `O2_reuse` (`ReuseLid`) | `QuarantineOutlastsItsRow` | violated (27) | 1,635 / 851 |
+| `O2_selfref` (`Skew 1`) | `NoSelfRefusal` | violated (26) | 2,494 / 1,324 |
 
 `QuarantineTakesNothing` holds everywhere it is checked: a quarantined writer
 takes no claim at all, not even with a fresh `lease_id`
-(`storage_service.cpp:678-684`).
+(`storage_service.cpp:684-690`).
 
 With `Skew = 0` the window at `catalog_writer.cpp:273` does outlast the row it
 dropped. With one tick of skew it does not — the window is
@@ -329,40 +401,60 @@ after the window would be worse still, which is why the fresh-id rule at
 `reject_live`'s `claimants == 1` exemption cannot recognise a fresh id, so a
 writer can be refused by its own dropped row.
 
+`NoSelfRefusal` is refuted only by a claim the service actually takes and that
+comes back `kHeld` from a head row the service itself wrote (`SelfRefused` in
+the `.tla`). A tick on which the service is quarantined, backing off or
+holding a lease takes no claim and is never counted. `O2_selfref` runs at
+`Skew = 1`; with `Skew = 0` and every other constant the same, the invariant
+holds (7,419 / 3,660 states), so in this model a self-refusal needs replica
+skew, or a late-landing row the model does not have (see Limitations).
+
+**`O2_quar` holds only if an outcome-unknown statement lands at once.** When a
+request fails with its outcome unknown, the model either drops it or lands its
+row at that same instant, expiring a TTL later. Nothing in the code bounds a
+later landing: `catalog_writer.cpp:519-520`'s `max_execution_time` covers only
+`publish_snapshot`'s statements, and the lease `INSERT`
+(`lease_coordinator.cpp:204-217`) carries only the `insert_quorum` settings. A
+lease `INSERT` the client gave up on can still land later, and its row then
+outlives the quarantine window by as much as it landed late.
+
 #### O3 — the `2 x TTL` latch
 
 | Config | Invariant | Verdict | States |
 |---|---|---|---|
-| `O3_rival` (persistent rival) | `NeverLatches` | violated (68) | 110,815 / 54,130 |
-| `O3_rivaljust` | `NoFalsePositiveLatch` | **holds** | 172,656 / 81,516 |
-| `O3_stops2` (rival stops < 2 TTL) | `NeverLatches` | **holds** | 355,934 / 170,480 |
-| `O3_false` (`Skew 0`) | `NoFalsePositiveLatch` | **holds** | 355,934 / 170,480 |
+| `O3_rival` (persistent rival) | `NeverLatches` | violated (70) | 102,421 / 49,985 |
+| `O3_rivaljust` | `NoFalsePositiveLatch` | **holds** | 154,642 / 72,699 |
+| `O3_stops2` (rival stops < 2 TTL) | `NeverLatches` | **holds** | 290,254 / 137,745 |
+| `O3_false` (`Skew 0`) | `NoFalsePositiveLatch` | **holds**, if an unknown outcome lands at once | 290,254 / 137,745 |
 | `O3_falsenocut` (`Skew 0`, no cut) | `NoFalsePositiveLatch` | **holds** | 1,743 / 1,166 |
-| `O3_selflatch` (`Skew 1`, no rival) | `NoFalsePositiveLatch` | violated (65) | 13,938 / 9,559 |
-| `O3_selflatch_latch` (`Skew 1`, no rival) | `NeverLatches` | violated (68) | 16,865 / 11,614 |
+| `O3_selflatch` (`Skew 1`, no rival) | `NoFalsePositiveLatch` | violated (65) | 13,076 / 8,958 |
+| `O3_selflatch_latch` (`Skew 1`, no rival) | `NeverLatches` | violated (65) | 17,339 / 11,859 |
 | `O3_stops` | `NeverLatches` | **holds** — but see below | 821 / 563 |
 
 The latch is justified when it is meant to be: a rival that keeps renewing does
 latch (`O3_rival`), and it latches *legitimately* — `O3_rivaljust` shows the
 rival really did hold a live row at every instant of the window. A rival that
-stops inside two TTLs does **not** latch (`O3_stops2`, 170,480 states). With no
-skew, no false positive is reachable at all (`O3_false`).
+stops inside two TTLs does **not** latch (`O3_stops2`, 137,745 states). With no
+skew, no false positive is reachable at all (`O3_false`) — as long as an
+outcome-unknown statement lands at the instant it fails, which is the
+assumption `O2_quar` rests on too.
 
 **`O3_selflatch` — the latch fires with no rival in existence.** `Foreign =
 FALSE`, `MaxCuts = 0`: no other publisher, no ClickHouse outage, only bounded
 request timeouts and `Skew = 1`. The service latches
 `"publisher lease held by another publisher for over 2 x TTL"` against itself,
-at depth 70. Two independent causes, both needed:
+at depth 65 to 70 depending on scheduling. Two independent causes, both
+needed:
 
 1. The quarantine window at `catalog_writer.cpp:273` is measured on the local
    steady clock with **no skew allowance**, while the row it dropped is read
-   from a replica that may still report it live. `2b74d14` gave the start wait
+   from a replica that may still report it live. `204a8d2` gave the start wait
    a `+ clock_skew_s` term; the quarantine window did not get one. The writer
    therefore comes out of quarantine and is refused by its own corpse.
-2. `storage_service.cpp:731` tests `now - held_elsewhere_since_ns_ >= 2 * ttl`,
-   and `held_elsewhere_since_ns_` is set on the **first** refusal (`:726`) and
-   cleared only by a **successful** claim (`:707`). The justification written
-   directly above it at `:728-730` — *"a refusal that has lasted 2 x TTL is a
+2. `storage_service.cpp:737` tests `now - held_elsewhere_since_ns_ >= 2 * ttl`,
+   and `held_elsewhere_since_ns_` is set on the **first** refusal (`:732`) and
+   cleared only by a **successful** claim (`:714`). The justification written
+   directly above it at `:734-736` — *"a refusal that has lasted 2 x TTL is a
    publisher that means to stay"* — requires an unbroken **run** of refusals.
    The code measures elapsed time since the first one instead, and nothing in
    between resets it.
@@ -382,7 +474,7 @@ The trace, at `TTL = 6` and `Skew = 1`:
    (`runBroken := TRUE`), which is exactly what `NoFalsePositiveLatch` watches.
 5. Ticks 9 and 15. Two further acquire attempts return unknown outcomes and
    take the `catalog_writer.cpp:296-310` path, quarantining again each time.
-   Neither is a refusal, and neither is a success — so `:707` never runs and
+   Neither is a refusal, and neither is a success — so `:714` never runs and
    `held_elsewhere_since_ns_` stays at 8. (The second of these does leave a
    live row on the server, expiring at 22.)
 6. Tick 21. The last window ends, the claim is refused by that row, and
@@ -397,8 +489,14 @@ Suggested fixes, one for each: add `clock_skew_ns` to the quarantine window at
 `catalog_writer.cpp:273`, matching what the start wait now does; and reset
 `held_elsewhere_since_ns_ = 0` whenever a claim is *not* refused with `kHeld`
 — on a quarantine, on a transport error, on anything that breaks the run —
-rather than only on success. Either one alone kills this trace; both are
-independently wrong.
+rather than only on success. Either one alone kills this trace, and both are
+independently wrong, but only the second is robust. The model lands an
+outcome-unknown statement at the instant the client gives up on it, and the code
+does not bound a later landing: the lease `INSERT` carries no
+`max_execution_time` (see `O2`). A row that lands late outlives a skew-padded
+window as easily as an unpadded one, so the first fix alone does not close the
+self-latch. Resetting `held_elsewhere_since_ns_` does, whatever the row's
+lifetime, because the refusal clock then measures an unbroken run.
 
 #### O4 — the start wait
 
@@ -407,7 +505,7 @@ independently wrong.
 | `O4_same` (`PredTTL == TTL`) | `StartAlwaysSucceeds` | **holds** | 98 / 66 |
 | `O4_skew` (`Skew 1`) | `StartAlwaysSucceeds` | **holds** | 85 / 59 |
 | `O4_bigger` (`PredTTL > TTL + PT`) | `StartAlwaysSucceeds` | violated (16) | 16 / 16 |
-| `O4_compose` | `NoConcurrentHolder` | **holds** | 11,809 / 5,872 |
+| `O4_compose` | `NoConcurrentHolder` | **holds** | 11,635 / 5,769 |
 
 The start wait composes correctly: `O4_compose` finds no instant at which two
 parties both believe they hold the lease. The `O4_same` / `O4_bigger` pair
@@ -420,14 +518,16 @@ outlasts the wait.
 | Config | Invariant | Verdict | States |
 |---|---|---|---|
 | `O5_refused` | `RefusedStartNeverSweeps` | **holds** | 15 / 14 |
-| `O5_cosweep` | `SweepOnlyWhenAlone` | violated (22) | 4,498 / 2,653 |
+| `O5_cosweep` | `SweepOnlyWhenAlone` | violated (22) | 5,747 / 3,418 |
 
 A start that is refused the catalog never touches the spool — `O5_refused`
 holds, which is `test_a_start_refused_the_lease_leaves_the_spool_unswept`
 generalised over the model.
 
 **`O5_cosweep` — two processes sweep one spool at once.** No ClickHouse cut is
-needed, and no skew: `MaxCuts = 0`, `Skew = 0`. The trace, at `TTL = 6`:
+needed, and no skew: the config allows one cut (`MaxCuts = 1`), but the trace
+below takes none, and the run is refuted just the same with `MaxCuts = 0`;
+`Skew = 0`. The trace, at `TTL = 6`:
 
 1. Tick 0. `s1` starts, claims lease 1 (row expires at tick 6), sweeps the
    spool, and enters `run`. It is now the live sink, writing `.open` packs.
@@ -449,11 +549,11 @@ Nothing reports an error. `s1` keeps writing into files that have been
 unlinked, and `s2`'s `swept_on_start` counts a live sink's work as recovered
 debris.
 
-This is not a new discovery so much as the **witness for the comment `2b74d14`
+This is not a new discovery so much as the **witness for the comment `204a8d2`
 already weakened**. `storage_service.cpp:115-120` now says *"usually"* and
 names exactly this gap: *"a holder that is quarantined has let its row lapse,
 and a second process can take the lease in that gap"*. That comment is correct.
-`storage_service.h:100-104` was not updated with it and still reads as the
+`storage_service.h:104-108` was not updated with it and still reads as the
 strong form — *"It runs after the lease is taken, so a start refused the
 catalog never touches the spool"* — which is true of a *refused* start and
 says nothing about this one. The real fix is the spool owner lock the comment
@@ -466,17 +566,17 @@ Every one of these must be refuted, or the run above it proves nothing.
 | Config | Guard | Refuted at | States |
 |---|---|---|---|
 | `vac_held` | `VacHeld` | yes (2) | 2 / 2 |
-| `vac_quar` | `VacQuarantine` | yes (8) | 142 / 86 |
-| `vac_recov` | `VacRecovered` | yes (26) | 1,417 / 757 |
-| `vac_refus` | `VacRefusal` | yes (27) | 2,191 / 1,158 |
-| `vac_rival` | `VacRivalHeld` | yes (3) | 70 / 43 |
+| `vac_quar` | `VacQuarantine` | yes (8) | 211 / 126 |
+| `vac_recov` | `VacRecovered` | yes (26) | 1,915 / 1,020 |
+| `vac_refus` | `VacRefusal` | yes (27) | 2,541 / 1,350 |
+| `vac_rival` | `VacRivalHeld` | yes (2) | 182 / 109 |
 | `vac_cut` | `VacCut` | yes (2) | 6 / 6 |
-| `vac_latch` | `VacLatch` | yes (68) | 112,205 / 54,658 |
+| `vac_latch` | `VacLatch` | yes (68) | 104,456 / 50,506 |
 | `vac_start` | `VacStartWaited` | yes (2) | 2 / 2 |
 | `vac_o4waited` | `VacStartWaited` at the `O4` constants | yes (2) | 2 / 2 |
 | `vac_refusedstart` | `StartAlwaysSucceeds` at the `O5_refused` constants | yes (2) | 2 / 2 |
-| `vac_stops2refusal` | `VacRefusal` at the `O3_stops2` constants | yes (29) | 4,989 / 2,775 |
-| `vac_stops2rival` | `VacRivalHeld` at the `O3_stops2` constants | yes (2) | 44 / 30 |
+| `vac_stops2refusal` | `VacRefusal` at the `O3_stops2` constants | yes (27) | 5,770 / 3,131 |
+| `vac_stops2rival` | `VacRivalHeld` at the `O3_stops2` constants | yes (2) | 186 / 109 |
 | `vac_stopsrefusal` | `VacRefusal` at the `O3_stops` constants | **NO — holds** | 821 / 563 |
 
 `SweepOnlyWhenAlone` is its own vacuity guard: it is refuted, so the co-sweep
@@ -508,7 +608,7 @@ does stop — and is proved non-vacuous by `vac_stops2refusal` and
 declared bound, any expiry and any schedule — not a sample of one. All
 quantities are reals: no discretisation and no bound on the magnitudes.
 
-The second obligation discharges the change `2b74d14` made at
+The second obligation discharges the change `204a8d2` made at
 `native_capture.py:215-219`, which added `+ clock_skew_s` to the default start
 wait. The result: **the wait outlasts a crashed predecessor iff
 `predecessor_ttl <= successor_ttl + publish_timeout`**, and `clock_skew_s`
@@ -532,7 +632,7 @@ predecessor's INSERT and the replica that answers the successor's `head()`.
 
 ### CBMC — payload ring spans
 
-Four assertions over `payload_compute_spans`, for every capacity in `1..64`,
+Five assertions over `payload_compute_spans`, for every capacity in `1..64`,
 every `head` up to `2^40` and every `nbytes`:
 
 | Assertion | With the precondition | Without it |
@@ -541,10 +641,20 @@ every `head` up to `2^40` and every `nbytes`:
 | P2 `off1 + len1 <= cap` | SUCCESS | SUCCESS |
 | P3 `off2 + len2 <= cap` | SUCCESS | **FAILURE** |
 | P4 spans disjoint | SUCCESS | **FAILURE** |
+| P5 no span byte lies in the unconsumed region `[tail, head)` | SUCCESS | **FAILURE** |
 
-Witness for the failures: `cap = 22`, `head = 15`, `tail = 0` — so seven bytes
-are free — and `n = 1152921504606846983`. The second span runs past the end of
-the buffer.
+Witness for the P3/P4 failures: `cap = 22`, `head = 15`, `tail = 0` — so seven
+bytes are free — and `n = 1152921504606846983`. The second span runs past the
+end of the buffer.
+
+P5 is the property the precondition exists for: a reservation never overwrites
+bytes the consumer has not released. It picks any byte of the reservation and
+any unconsumed position and asserts that the spans put them at different buffer
+offsets. It takes head's offset from `off1`, which both branches of
+`payload_compute_spans` set to `head % capacity` on their first line, rather
+than recomputing `head % cap`: asking the solver to prove two 64-bit dividers
+equal does not finish. P5 therefore checks the span lengths and the wrap point
+and trusts that one assignment. With it the proof takes a few seconds.
 
 ## Limitations
 
@@ -562,8 +672,14 @@ runs do not corroborate the Z3 ones, or the reverse.
 where a config says otherwise.** Every deciding read in `PublisherLease.tla`
 sees every accepted row whenever `Linearizable = TRUE`, which is every config
 except the three `nonlin_*`. That is the single load-bearing assumption of the
-safety argument. It models `select_sequential_consistency=1`
-(`clickhouse_client.cpp:107`) being honoured; it does not check that it is.
+safety argument. On a replicated deployment it takes two settings, not one:
+`select_sequential_consistency=1` on every deciding read
+(`clickhouse_client.cpp:107`) is only the read half, and means something only
+if every deciding write waited for the same quorum, which is `insert_quorum`
+(`LeaseCoordinator::quorum_write`, `lease_coordinator.cpp:37-43`, and its twin
+in `version_allocator.cpp`). `insert_quorum` is optional and unset by default,
+so a replicated catalog must set it. The model assumes both are in force; it
+does not check either.
 
 **The non-linearizable store model is a generous over-approximation.** With
 `Linearizable = FALSE` a deciding read may observe any subset of the in-flight
@@ -572,6 +688,52 @@ adversarial. The `nonlin_*` counterexamples are therefore "this is what you are
 exposed to if the setting is not in force", not "this exact interleaving will
 occur". Their value is the shape of the failure and which obligations fall, not
 a probability.
+
+**`LeaseLifecycle` settles every ClickHouse call in zero time, so its `O1`
+HOLDS verdicts assume each lease request completes in about half the TTL.**
+`RenewIfDue`, `EnsureLease` and `StartClaim` issue and settle a request in one
+step. In the code `keep_lease()` holds `lease_mutex_` across `renew_lease()`,
+three requests each bounded only by `request_s` (60 s by default, against a
+15 s TTL). `O1_slowreq3` / `O1_slowreq` put the threshold at half the TTL for
+the idle service: `NoPhantomLease` holds at `MaxLate = 3` and falls at 4.
+Nothing in the code bounds lease requests that tightly yet; a follow-up PR will
+bound lease request time. See the `O1` section.
+
+**An outcome-unknown statement lands at once or never.** The model's "landed"
+branch stamps the row at the instant the client sees the failure. The code
+bounds nothing later: `catalog_writer.cpp:519-520`'s `max_execution_time` is
+set only on `publish_snapshot`'s statements, and the lease `INSERT`
+(`lease_coordinator.cpp:204-217`) carries only the `insert_quorum` settings. A
+lease row that lands late outlives the quarantine window by as much. `O2_quar`
+and `O3_false` hold only under this assumption, and of the two fixes suggested
+under `O3`, adding `clock_skew_ns` to the quarantine window is insufficient on
+its own; resetting `held_elsewhere_since_ns_` whenever a run of refusals breaks
+is the robust one.
+
+**`LeaseLifecycle`'s skew runs one way.** Every live row is seen `Skew` ticks
+longer than its true expiry (`hExp` adds `Skew`), as if every read went to a
+replica lagging by the full bound. A replica that reports a row dead early, or
+successive reads that disagree in opposite directions, are not modelled.
+
+**`Stop` is never enabled in `LeaseLifecycle`.** Every shipped config sets
+`AllowStop = FALSE`, so no verdict depends on it. Its tombstone also differs
+from the code's: the model overwrites the head's expiry with `now`, instantly
+and as seen by every replica, and only while ClickHouse is up; the code inserts
+a separate tombstone row (`lease_coordinator.cpp:70-90`) that can fail, be read
+through a lagging replica, or land with an unknown outcome.
+
+**Each allocator in `VersionAllocator` allocates once.** An allocator runs one
+`allocate_version()` call to `done`, `published`, `refused` or `failed` and
+stops, so the model says nothing about successive calls from one process, and
+it has no cross-call monotonicity invariant (that a process's second version
+exceeds its first). `FloorMonotonic` compares a returned version with the
+watermark at that moment, not with the same process's earlier versions.
+
+**The ring check is span arithmetic only.** `payload_ring_span.cpp` checks
+`payload_compute_spans` against its precondition; the ring's publish/consume
+protocol (ready words, the head and tail atomics, their memory ordering, the
+CUDA side) is not modelled. P5 takes head's buffer offset from `off1` rather
+than recomputing `head % cap` (see the CBMC section).
 
 **`LeaseLifecycle` abstracts `LeaseCoordinator` to its contract, so every
 HOLDS verdict in its tables is conditional on `PublisherLease.tla` discharging
@@ -587,21 +749,24 @@ exact, but anything finer than a sixth of the TTL is invisible to it. The real
 start poll is `ttl/10` clamped to 50-500 ms — *finer* than one tick — so a
 start the model reports as refused purely at an expiry boundary would be
 retried sooner in reality. In the other direction, `MaxLate = 0` means the
-lease thread wakes exactly on its tick; real OS scheduling can only make it
-later, which strictly reduces the number of renewal attempts in the window.
-`O1_late` runs `MaxLate = 1` separately.
+lease thread wakes exactly on its tick; real OS scheduling and slow requests
+can only make it later, which strictly reduces the number of renewal attempts
+in the window. `O1_late` runs `MaxLate = 1`, and `O1_slowreq3` / `O1_slowreq`
+find where lateness breaks `O1` (see the zero-time limitation above).
 
 **Counts and trace depths for REFUTED runs are scheduling-dependent; counts
 for completed runs are exact.** Stated again here because it is the most
 commonly misread number in the tables. A refuted run's count tells you nothing
 reproducible. A completed run's count does, and every completed run above
-reproduced its recorded figure exactly when re-run against `2b74d14`.
+reproduced its recorded figure exactly when re-run with `check.sh` (the
+`LeaseLifecycle` ones since `NoSelfRefusal` was tightened).
 
 **`overrun` holding at the base constants proves nothing.** See the vacuity
 note in the `PublisherLease` section: at `MaxTerm = 3` the takeover race is out
-of budget, so the obligation holds because its subject is unreachable. `base5`,
-`noovr0` and `ovr0` are the configs that carry that claim. The same trap caught
-`LeaseLifecycle_O3_stops`, disclosed above.
+of budget, so the obligation holds because its subject is unreachable, and
+the same goes for the base run's `AllSafety`. The `base5` / `base5_ovr`,
+`noovr0` / `ovr0` and `noovr1` / `ovr1` pairs carry that claim. The same trap
+caught `LeaseLifecycle_O3_stops`, disclosed above.
 
 **Every result is bounded.** TLC explores the state space cut off by the
 constants in each `.cfg` — at most three lease ids, five or eight time steps,

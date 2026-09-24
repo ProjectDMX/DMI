@@ -35,7 +35,7 @@ Expected: UNSAT for d <= S (no overlap exists, for any p, S, e and any
 schedule), SAT for d > S (the documented race is reachable).  UNSAT is a proof
 over all timings, which is strictly more than a two-host experiment can show.
 
-Second obligation: the default START WAIT.  2b74d14 ("Count clock skew in the
+Second obligation: the default START WAIT.  204a8d2 ("Count clock skew in the
 default start wait") changed the default in
 src/dmi/storage/native_capture.py:215-219 from
 
@@ -52,7 +52,7 @@ and the config comment at :139-145 records a caveat by hand:
 
 start_wait_constraints() below encodes that claim and its caveat against the
 code that decides it: the successor gives up at start + start_lease_wait_ns
-(native/csrc/catalog/storage_service.cpp:642-670, a steady-clock deadline),
+(native/csrc/catalog/storage_service.cpp:648-676, a steady-clock deadline),
 and a claim is refused while the predecessor's row still reads live under
 LeaseCoordinator::reject_live -- head.live_until_ns > head.now_ns, with BOTH
 sides of that comparison stamped by the ClickHouse replica serving the read
@@ -179,7 +179,7 @@ def main():
         check("margin without the skew term, any d > 0",
               lambda d, S: And(S == 0, d > 0), sat),
 
-        # --- the default start wait (2b74d14) ---------------------------
+        # --- the default start wait (204a8d2) ---------------------------
         # (a) Same knobs on both sides: the wait outlasts the dead
         #     predecessor, for any TTL, any timeout, any declared bound and
         #     any real skew within it.
