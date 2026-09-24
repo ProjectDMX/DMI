@@ -151,15 +151,12 @@ S3Response S3Client::Exchange(
     response.error = "https endpoint with allow_insecure_http is refused";
     return response;
   }
-  const std::string amz_date = AmzDate(std::time(nullptr));
-  const std::string datestamp = Datestamp(amz_date);
-
   const std::string encoded_resource = "/" + config_.bucket + "/" + key;
   const std::string encoded_path = UriEncode(encoded_resource, true);
 
+  // Every signed header except x-amz-date, which each attempt stamps.
   std::map<std::string, std::string> headers;
   headers["host"] = host_;
-  headers["x-amz-date"] = amz_date;
   headers["x-amz-content-sha256"] = body_hash_hex;
   if (!config_.session_token.empty()) {
     headers["x-amz-security-token"] = config_.session_token;
@@ -167,10 +164,6 @@ S3Response S3Client::Exchange(
   for (const auto& [name, value] : extra_headers) {
     headers[LowerHeader(name)] = value;
   }
-  const std::string authz = AuthorizationHeader(
-      config_.access_key, config_.secret_key, datestamp, amz_date,
-      config_.region, "s3", method, encoded_path, query, headers,
-      body_hash_hex);
 
   // Canonical query string for the URL (same encoding the signer used).
   std::string query_text;
@@ -196,6 +189,16 @@ S3Response S3Client::Exchange(
   last_attempts_ = 0;
   for (int attempt = 0; attempt < config_.max_attempts; ++attempt) {
     ++last_attempts_;
+    // Signed per attempt, not once before the loop: SigV4 binds the
+    // signature to x-amz-date, and S3 refuses a date more than 15 minutes
+    // off. Replaying the first attempt's date let a slow first attempt (up
+    // to read_timeout_s each, plus backoff) age every retry after it.
+    const std::string amz_date = AmzDate(std::time(nullptr));
+    headers["x-amz-date"] = amz_date;
+    const std::string authz = AuthorizationHeader(
+        config_.access_key, config_.secret_key, Datestamp(amz_date), amz_date,
+        config_.region, "s3", method, encoded_path, query, headers,
+        body_hash_hex);
     CURL* curl = curl_easy_init();
     if (!curl) {
       response.error = "curl_easy_init failed";

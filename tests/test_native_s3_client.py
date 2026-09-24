@@ -176,6 +176,11 @@ class FakeS3Handler(BaseHTTPRequestHandler):
             STATE.fault_counts[key] = n + 1
         if under("fault/once-500") and n == 0:
             return 500, b"boom"
+        if under("fault/slow-once-500") and n == 0:
+            # Outlive the one-second resolution of x-amz-date, so a retry
+            # that reuses the first attempt's signature is visible.
+            time.sleep(1.2)
+            return 500, b"boom"
         if under("fault/always-500"):
             return 500, b"boom"
         if under("fault/forbidden"):
@@ -482,6 +487,37 @@ def test_retry_then_success_on_500(fake_s3):
                 content_type="application/octet-stream")
     assert put["ok"], put
     assert put["attempts"] == 2
+
+
+def _header(call: dict, name: str) -> str:
+    return next(v for k, v in call["headers"].items() if k.lower() == name)
+
+
+def test_every_attempt_is_signed_afresh(fake_s3):
+    """A retry carries its own x-amz-date and signature, both still valid.
+
+    SigV4 binds the signature to x-amz-date, and S3 refuses a request whose
+    date is more than 15 minutes off. Signing once before the loop replayed
+    the first attempt's date on every retry, so a slow first attempt (up to
+    read_timeout_s each, plus backoff) aged every later one. The first
+    attempt here outlives a second before failing with a 500: a fresh
+    signature must carry a later date. Both attempts passed the server's
+    botocore re-signing check -- the 500 is only reached after it -- and
+    the second one stored the object.
+    """
+    put = _call("put", **_base(fake_s3), key="fault/slow-once-500",
+                data_b64=base64.b64encode(b"data").decode(), metadata={},
+                content_type="application/octet-stream")
+    assert put["ok"], put
+    assert put["attempts"] == 2
+    attempts = [call for call in STATE.calls
+                if call["path"].endswith("/fault/slow-once-500")]
+    assert len(attempts) == 2, attempts
+    first, second = attempts
+    assert _header(second, "x-amz-date") > _header(first, "x-amz-date")
+    assert _header(second, "authorization") != \
+        _header(first, "authorization")
+    assert STATE.objects["fault/slow-once-500"]["body"] == b"data"
 
 
 def test_no_retry_on_403(fake_s3):
