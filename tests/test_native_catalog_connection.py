@@ -426,6 +426,11 @@ def test_https_refuses_a_server_its_roots_do_not_vouch_for(driver, ca):
         _opened(driver, clickhouse_scheme="https", clickhouse_port=fake.port,
                 clickhouse_user="catalog_writer", clickhouse_password=PASSWORD)
         response = driver.execute(READ)
+        # The fake counts on its own thread, which may learn of the refused
+        # handshake a moment after the client has given up.
+        deadline = time.monotonic() + 5.0
+        while fake.failed_handshakes < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
     assert not response["ok"]
     assert "certificate" in response["message"].lower(), response
     assert fake.requests == []

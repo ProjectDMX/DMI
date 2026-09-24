@@ -795,6 +795,12 @@ def test_capture_round_trips_through_a_verified_tls_catalog(fake_s3, tmp_path):
             untrusted = _storage_config(fake_s3, catalog.table_prefix, **tls)
             with pytest.raises(RuntimeError, match="(?i)certificate"):
                 _service(untrusted, spool_root).start()
+            # Counted on the terminator's thread, which may learn of the
+            # refused handshake a moment after the client has given up.
+            deadline = time.monotonic() + 5.0
+            while (terminator.failed_handshakes < 1
+                   and time.monotonic() < deadline):
+                time.sleep(0.01)
             assert terminator.failed_handshakes >= 1
 
             config = _storage_config(fake_s3, catalog.table_prefix,
