@@ -12,6 +12,7 @@
 #include "ring/ring_debug.h"
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <stdexcept>
@@ -138,6 +139,14 @@ struct RingEnginePy::Impl {
     at::Tensor       payload_view;
     bool             record_mode{false};
 
+    // Record rings only.  The step counter is written by the reserving
+    // thread; the atomics let record_capture_status read from any thread.
+    RecordRuntimeOptions         record_options;
+    std::atomic<uint64_t>        step_wait_ns{0};
+    std::atomic<uint64_t>        reserve_wait_ns{0};
+    std::atomic<uint64_t>        max_step_wait_ns{0};
+    std::atomic<uint64_t>        stall_budget_exhaustions{0};
+
     Impl(ring::RingConfig cfg, SubmitFn sf)
         : engine(std::move(cfg), fifo, std::move(sf))
     {
@@ -150,8 +159,10 @@ struct RingEnginePy::Impl {
             at::TensorOptions().dtype(at::kByte).device(at::kCUDA, dev_idx));
     }
 
-    Impl(ring::RingConfig cfg, std::shared_ptr<ring::RecordSinkLease> lease)
-        : engine(std::move(cfg), std::move(lease)), record_mode(true)
+    Impl(ring::RingConfig cfg, std::shared_ptr<ring::RecordSinkLease> lease,
+         RecordRuntimeOptions options)
+        : engine(std::move(cfg), std::move(lease), options.failure_policy),
+          record_mode(true), record_options(options)
     {
         const auto& state = engine.ring_state();
         int dev_idx = 0;
@@ -160,6 +171,75 @@ struct RingEnginePy::Impl {
             state.payload_buf,
             {static_cast<int64_t>(state.payload_cap)},
             at::TensorOptions().dtype(at::kByte).device(at::kCUDA, dev_idx));
+    }
+
+    void account_record_wait(FlushClock::time_point started) {
+        const uint64_t waited = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                FlushClock::now() - started).count());
+        reserve_wait_ns.fetch_add(waited, std::memory_order_relaxed);
+        const uint64_t step = step_wait_ns.fetch_add(
+            waited, std::memory_order_relaxed) + waited;
+        uint64_t worst = max_step_wait_ns.load(std::memory_order_relaxed);
+        while (step > worst && !max_step_wait_ns.compare_exchange_weak(
+                   worst, step, std::memory_order_relaxed)) {
+        }
+    }
+
+    // Make room for a record reservation that did not fit: finish the
+    // producers already queued, then drain the ring.  The drain is held back
+    // by the record worker, and the worker by the sink, so this is where a
+    // slow or stuck sink reaches the forward.  The wait is bounded by what
+    // is left of this step's stall budget; past it the failure policy
+    // applies.
+    void wait_for_record_space() {
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+        cudaStreamSynchronize(stream);
+        auto& drain = engine.drain_thread();
+        auto& consumer = engine.record_consumer();
+        const bool disable = record_options.failure_policy ==
+            ring::RecordFailurePolicy::kDisableCapture;
+        const auto started = FlushClock::now();
+        // Once capture is off the worker discards instead of submitting, so
+        // the sink is out of the path and only the device-to-host copy of
+        // what the ring already holds is left to wait for.
+        if (record_options.step_stall_budget_ms == 0 ||
+            (disable && consumer.failed())) {
+            drain.force_flush_and_wait_until(FlushClock::time_point::max());
+            account_record_wait(started);
+            return;
+        }
+        const auto budget = std::chrono::duration_cast<FlushClock::duration>(
+            std::chrono::milliseconds(record_options.step_stall_budget_ms));
+        const auto spent = std::chrono::duration_cast<FlushClock::duration>(
+            std::chrono::nanoseconds(
+                step_wait_ns.load(std::memory_order_relaxed)));
+        const auto deadline =
+            started + (spent < budget ? budget - spent : FlushClock::duration{});
+        const bool drained = drain.force_flush_and_wait_until(deadline);
+        account_record_wait(started);
+        if (drained) return;
+
+        stall_budget_exhaustions.fetch_add(1, std::memory_order_relaxed);
+        const auto step_ms =
+            step_wait_ns.load(std::memory_order_relaxed) / 1'000'000ull;
+        const std::exception_ptr failure =
+            std::make_exception_ptr(std::runtime_error(
+                "record capture stall budget exhausted: reservations waited " +
+                std::to_string(step_ms) + " ms this step for the sink to "
+                "free ring space (step_stall_budget_ms=" +
+                std::to_string(record_options.step_stall_budget_ms) + ")"));
+        // Latched in the consumer either way, so the checked flush, the
+        // capture status and close report it.
+        consumer.record_failure(failure);
+        if (!disable) std::rethrow_exception(failure);
+        // Capture is off now, so the drain is held back only by the one sink
+        // admission already in progress (bounded by the sink's own admission
+        // timeout).  The reservation must still complete: under CUDA-graph
+        // replay the producers launch whatever the host decides.
+        const auto resumed = FlushClock::now();
+        drain.force_flush_and_wait_until(FlushClock::time_point::max());
+        account_record_wait(resumed);
     }
 };
 
@@ -187,13 +267,16 @@ RingEnginePy::RingEnginePy(RingConfig cfg, SubmitFn submit_fn) {
 }
 
 RingEnginePy::RingEnginePy(
-    RingConfig cfg, std::shared_ptr<ring::RecordSink> sink)
+    RingConfig cfg, std::shared_ptr<ring::RecordSink> sink,
+    RecordRuntimeOptions options)
     : RingEnginePy(
-          std::move(cfg), ring::RecordSinkLease::acquire(std::move(sink))) {}
+          std::move(cfg), ring::RecordSinkLease::acquire(std::move(sink)),
+          options) {}
 
 RingEnginePy::RingEnginePy(
-    RingConfig cfg, std::shared_ptr<ring::RecordSinkLease> lease) {
-    impl_ = std::make_unique<Impl>(convert(cfg), std::move(lease));
+    RingConfig cfg, std::shared_ptr<ring::RecordSinkLease> lease,
+    RecordRuntimeOptions options) {
+    impl_ = std::make_unique<Impl>(convert(cfg), std::move(lease), options);
 }
 
 RingEnginePy::~RingEnginePy() = default;
@@ -499,11 +582,17 @@ int RingEnginePy::reserve_record(
     drain.rethrow_drain_failure();
     drain.rethrow_record_reclaim_failure();
     drain.apply_pending_record_reclaims();
+    // A latched failure raises here, before anything is reserved, rather
+    // than from the descriptor push after a reservation no producer uses.
+    // Under kDisableCapture it never raises: the ring keeps its protocol
+    // and the consumer discards.
+    if (impl_->record_options.failure_policy ==
+        ring::RecordFailurePolicy::kRaiseAtProducer) {
+        impl_->engine.record_consumer().rethrow_if_failed();
+    }
 
     if (reservation_bytes > effective_cap || num_tasks > task_cap) {
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-        cudaStreamSynchronize(stream);
-        drain.force_flush_and_wait();
+        impl_->wait_for_record_space();
         drain.rethrow_drain_failure();
         drain.rethrow_record_reclaim_failure();
         drain.apply_pending_record_reclaims();
@@ -524,9 +613,7 @@ int RingEnginePy::reserve_record(
         return STEP_RING_OK;
     }
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    cudaStreamSynchronize(stream);
-    drain.force_flush_and_wait();
+    impl_->wait_for_record_space();
     drain.rethrow_drain_failure();
     drain.rethrow_record_reclaim_failure();
     drain.apply_pending_record_reclaims();
@@ -536,6 +623,35 @@ int RingEnginePy::reserve_record(
     }
     drain.reserve_record(items);
     return STEP_RING_FLUSHED;
+}
+
+void RingEnginePy::begin_record_step() {
+    if (!impl_->record_mode) {
+        throw std::logic_error("record steps require a record ring");
+    }
+    impl_->step_wait_ns.store(0, std::memory_order_relaxed);
+}
+
+RecordCaptureStatus RingEnginePy::record_capture_status() const {
+    if (!impl_->record_mode) {
+        throw std::logic_error("record capture status requires a record ring");
+    }
+    const ring::RecordConsumerSnapshot consumer =
+        impl_->engine.record_consumer().snapshot();
+    RecordCaptureStatus status;
+    status.failure_policy = consumer.policy;
+    status.failed = consumer.failed;
+    status.failure = consumer.failure;
+    status.discarded_descriptors = consumer.discarded_descriptors;
+    status.discarded_payloads = consumer.discarded_payloads;
+    status.step_stall_budget_ms = impl_->record_options.step_stall_budget_ms;
+    status.stall_budget_exhaustions =
+        impl_->stall_budget_exhaustions.load(std::memory_order_relaxed);
+    status.reserve_wait_ns =
+        impl_->reserve_wait_ns.load(std::memory_order_relaxed);
+    status.max_step_wait_ns =
+        impl_->max_step_wait_ns.load(std::memory_order_relaxed);
+    return status;
 }
 
 void RingEnginePy::push_record_descriptors(

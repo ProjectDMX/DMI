@@ -20,6 +20,7 @@
 #include <future>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -776,6 +777,162 @@ static void test_record_flush_reaches_sink_durability_boundary() {
     engine.stop();
 }
 
+// A sink that admits every record, each after `admission` -- a slow disk or
+// a full queue with a bounded admission timeout. While it is inside
+// submit(), the record worker holds every later payload's staging bytes.
+class SlowRecordSink final : public ring::RecordSink {
+public:
+    explicit SlowRecordSink(std::chrono::milliseconds admission)
+        : admission_(admission) {}
+
+    void submit(ring::RecordEnvelope) override {
+        std::this_thread::sleep_for(admission_);
+        submissions.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    bool flush_and_wait(Duration) override { return true; }
+    void rethrow_if_failed() const override {}
+
+    std::atomic<int> submissions{0};
+
+private:
+    std::chrono::milliseconds admission_;
+};
+
+static ring::RecordDescriptor stall_descriptor() {
+    ring::RecordDescriptor descriptor;
+    descriptor.layout = "stall";
+    descriptor.rows = {{std::vector<ring::EncodedRecordCell>{
+        std::string("record"), ring::PayloadSlice{}}}};
+    return descriptor;
+}
+
+// Reserve, publish and launch one 1 KiB record, as RecordRuntime.emit_output
+// and the hook it returns to do.
+static int emit_stall_record(ring_py::RingEnginePy& engine,
+                             const uint8_t* device) {
+    constexpr uint64_t kBytes = 1024;
+    const int reservation = engine.reserve_record({{kBytes, false}});
+    engine.push_record_descriptors({stall_descriptor()});
+    engine.record_no_notify(
+        reinterpret_cast<uint64_t>(device), kBytes, 0, 0,
+        reinterpret_cast<uint64_t>(at::cuda::getCurrentCUDAStream().stream()));
+    return reservation;
+}
+
+struct StallOutcome {
+    bool threw{false};
+    std::string error;
+    int reservation{-1};
+    std::chrono::steady_clock::duration stall{};
+    ring_py::RecordCaptureStatus status;
+    bool later_reserve_threw{false};
+    std::chrono::steady_clock::duration later_reserve{};
+    bool flush_threw{false};
+    int submissions{0};
+};
+
+// Fill a 4 KiB ring twice while the sink sits inside its first admission:
+// records 1-4 reach the worker (which blocks in record 1), records 5-8 fill
+// the ring again and cannot drain, because 2-4 still hold the staging. The
+// ninth reservation has to wait for the sink.
+static StallOutcome run_stalled_reservation(ring::RecordFailurePolicy policy) {
+    constexpr auto kBudget = std::chrono::milliseconds(50);
+    constexpr auto kAdmission = std::chrono::milliseconds(400);
+    ring_py::RingConfig cfg;
+    cfg.task_ring_entries = 16;
+    cfg.payload_ring_bytes = 4096;
+    cfg.pinned_staging_bytes = 4096;
+    cfg.drain_poll_timeout_us = 100;
+    ring_py::RecordRuntimeOptions options;
+    options.failure_policy = policy;
+    options.step_stall_budget_ms = kBudget.count();
+    auto sink = std::make_shared<SlowRecordSink>(kAdmission);
+    ring_py::RingEnginePy engine(cfg, sink, options);
+    engine.init();
+    engine.start();
+
+    const std::vector<uint8_t> source = pattern(1024, 7);
+    uint8_t* device = upload(source, at::cuda::getCurrentCUDAStream().stream());
+
+    StallOutcome outcome;
+    for (int index = 0; index < 8; ++index) {
+        engine.begin_record_step();
+        emit_stall_record(engine, device);
+    }
+    engine.begin_record_step();
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        outcome.reservation = emit_stall_record(engine, device);
+    } catch (const std::runtime_error& error) {
+        outcome.threw = true;
+        outcome.error = error.what();
+    }
+    outcome.stall = std::chrono::steady_clock::now() - started;
+    outcome.status = engine.record_capture_status();
+
+    engine.begin_record_step();
+    const auto later = std::chrono::steady_clock::now();
+    try {
+        emit_stall_record(engine, device);
+    } catch (const std::runtime_error&) {
+        outcome.later_reserve_threw = true;
+    }
+    outcome.later_reserve = std::chrono::steady_clock::now() - later;
+
+    try {
+        engine.flush_records_and_wait(5000);
+    } catch (const std::runtime_error&) {
+        outcome.flush_threw = true;
+    }
+    engine.stop();
+    outcome.submissions = sink->submissions.load(std::memory_order_acquire);
+    CUDA_CHECK(cudaFree(device));
+    return outcome;
+}
+
+static void test_raise_policy_bounds_a_stalled_reservation() {
+    banner("raise policy: a reservation stalled past the budget raises");
+    const StallOutcome outcome =
+        run_stalled_reservation(ring::RecordFailurePolicy::kRaiseAtProducer);
+    EXPECT(outcome.threw);
+    EXPECT(outcome.error.find("stall budget") != std::string::npos);
+    // The budget, not the sink's 400 ms admission, bounds the wait.
+    EXPECT(outcome.stall < std::chrono::milliseconds(300));
+    EXPECT(outcome.status.failed);
+    EXPECT(outcome.status.stall_budget_exhaustions == 1);
+    EXPECT(outcome.status.step_stall_budget_ms == 50);
+    // Latched: the next reservation raises before it waits for anything.
+    EXPECT(outcome.later_reserve_threw);
+    EXPECT(outcome.later_reserve < std::chrono::milliseconds(50));
+    EXPECT(outcome.flush_threw);
+}
+
+static void test_disable_capture_bounds_a_stalled_reservation() {
+    banner("disable_capture: a stalled reservation stops capture, not the forward");
+    const StallOutcome outcome =
+        run_stalled_reservation(ring::RecordFailurePolicy::kDisableCapture);
+    EXPECT(!outcome.threw);
+    EXPECT(outcome.reservation == ring_py::RingEnginePy::STEP_RING_FLUSHED);
+    // At most the budget plus the one admission already in progress; once
+    // capture is off the worker discards instead of calling the sink.
+    EXPECT(outcome.stall >= std::chrono::milliseconds(50));
+    EXPECT(outcome.stall < std::chrono::milliseconds(50 + 400 + 250));
+    EXPECT(outcome.status.failure_policy ==
+           ring::RecordFailurePolicy::kDisableCapture);
+    EXPECT(outcome.status.failed);
+    EXPECT(outcome.status.failure.find("stall budget") != std::string::npos);
+    EXPECT(outcome.status.stall_budget_exhaustions == 1);
+    EXPECT(outcome.status.max_step_wait_ns >= 50'000'000ull);
+    // Capture is off: the next step reserves without raising or stalling.
+    EXPECT(!outcome.later_reserve_threw);
+    EXPECT(outcome.later_reserve < std::chrono::milliseconds(200));
+    // The failure still surfaces at the checked flush.
+    EXPECT(outcome.flush_threw);
+    // Only the record the sink was already admitting reached it.
+    EXPECT(outcome.submissions == 1);
+}
+
 int main() {
     setbuf(stdout, nullptr);
     ring::set_ring_null_mode(false);
@@ -797,6 +954,8 @@ int main() {
     test_drain_worker_binds_owner_device();
     test_record_flush_bounds_current_stream_prefix_wait();
     test_record_flush_reaches_sink_durability_boundary();
+    test_raise_policy_bounds_a_stalled_reservation();
+    test_disable_capture_bounds_a_stalled_reservation();
 
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
