@@ -182,8 +182,15 @@ def _capture_engine(monkeypatch, tmp_path, *, fail_ring=False):
     native = ModuleType("dmi.transport.native")
     native.RecordSink = _RecordSink
     native._load_named_extension = _load_named_extension
-    native.RingEngine = type("RingEngine", (), {
-        "create_record": staticmethod(lambda config, target: _NewRing())})
+    class _RingEngine(_NewRing):
+        """enable_ring_transport's plain ring; create_record's record ring."""
+
+        def __init__(self, config, host):
+            events.append(("ring", "create"))
+
+        create_record = staticmethod(lambda config, target: _NewRing())
+
+    native.RingEngine = _RingEngine
     ring = ModuleType("dmi.transport.ring")
     ring.RingTransport = _FakeTransport
     ring.activate = lambda transport: None
@@ -317,3 +324,29 @@ def test_close_releases_the_lease_even_when_the_drain_fails(monkeypatch, tmp_pat
     engine.close()
 
     assert events[-1] == ("service", "stop")
+
+
+def test_replacing_a_record_ring_drains_and_stops_the_service(
+        monkeypatch, tmp_path):
+    """enable_ring_transport over a record ring used to leave the service
+    running and holding the catalog lease, with the sink unsealed: the open
+    pack's records were dropped, and the next create_record_runtime built a
+    second service that its own process's lease refused."""
+    engine, events, services = _capture_engine(monkeypatch, tmp_path)
+    engine.create_record_runtime(_record_format())
+    events.clear()
+
+    engine.enable_ring_transport(object())
+
+    assert [event[:2] for event in events] == [
+        ("sink", "flush"), ("ring", "stop"),
+        ("service", "flush"), ("service", "stop"), ("ring", "create")]
+    assert 59.0 <= events[0][2] <= 60.0
+    assert engine._capture_storage is None
+    assert engine._record_mode is False
+
+    # A second record runtime starts its own service; nothing still holds
+    # the lease it takes.
+    engine.create_record_runtime(_record_format())
+    assert len(services) == 2
+    assert engine._capture_storage is not None
