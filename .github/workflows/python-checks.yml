@@ -477,7 +477,8 @@ jobs:
     # bindings.cpp and the torch/CUDA link could break on any PR and stay
     # broken until someone built on a GPU host -- which is how the C++20
     # floor torch 2.14 imposes went unnoticed (#138). This job compiles and
-    # links `make -C native all`, imports the result, and builds the ring
+    # links `make -C native all`, imports the result, checks that the capture
+    # sink built beside it derives from its RecordSink, and builds the ring
     # test binaries, running the two that need no device.
     #
     # No GPU is needed to COMPILE, only the toolkit, and this runner has
@@ -613,6 +614,55 @@ jobs:
           print(module.__file__)
           assert hasattr(module, 'RecordSink'), 'no RecordSink in the backend'
           "
+
+      - name: Build the capture sink beside the backend
+        # _dmi_native_sink decides its RecordSink base once, when it loads:
+        # it derives NativePackSink from _native_backend's registration when
+        # that backend is loadable, and registers module-local stand-ins of
+        # its own when it is not. Only the first is attachable --
+        # create_record_runtime checks isinstance against the BACKEND's
+        # RecordSink -- yet the cpu and live jobs build the sink with no
+        # backend, so the stand-in branch was the only one CI ever took.
+        # This is the one job that has a backend to bind to. Same torch and
+        # PYTHON as the backend build above.
+        run: make -C native build/_dmi_native_sink PYTHON=python
+
+      - name: Check the sink binds the backend's RecordSink
+        # Two import orders, one process each, because the binding is fixed
+        # for the process by whichever order ran. Through dmi's loaders, the
+        # order the engine uses: backend first, then the sink. And the bare
+        # `import _dmi_native_sink` the adapter suite does, where the module
+        # has to find the backend itself through dmi.transport.native. Both
+        # assert the stand-ins were NOT taken, which is what the pytest run
+        # after them cannot: its test passes on either branch by design, so
+        # on its own it would stay green with the binding broken. It still
+        # runs, because here it takes the test's backend branch, which no
+        # other job reaches; the grep refuses a skip as a pass.
+        run: |
+          PYTHONPATH=src python -c "
+          from dmi.storage.capture.native_sink import _load_native_sink_extension
+          from dmi.transport import native
+          backend = native._load_extension()
+          sink = _load_native_sink_extension()
+          assert not sink.RING_TYPES_ARE_STANDINS, 'the sink bound stand-ins'
+          assert issubclass(sink.NativePackSink, backend.RecordSink), sink.NativePackSink.__mro__
+          assert not hasattr(sink, 'RecordSink'), 'the sink registered a second RecordSink'
+          print('loaders:', sink.NativePackSink.__mro__)
+          "
+          PYTHONPATH=src:native/build python -c "
+          import torch  # first, as the suite does: the .so has no rpath to libtorch_cpu
+          import _dmi_native_sink as sink
+          from dmi.transport import native
+          assert not sink.RING_TYPES_ARE_STANDINS, 'the sink bound stand-ins'
+          assert issubclass(sink.NativePackSink, native._load_extension().RecordSink), sink.NativePackSink.__mro__
+          print('bare import:', sink.NativePackSink.__mro__)
+          "
+          python -m pip install pytest
+          python -m pytest -q -p no:cacheprovider \
+            "tests/test_native_adapter_torch.py::test_the_sink_derives_from_the_engines_record_sink" \
+            > sink-test.out || { cat sink-test.out; exit 1; }
+          cat sink-test.out
+          grep -Eq '^1 passed in ' sink-test.out
 
       - name: Build the ring tests and run the host-only ones
         # All six binaries are compiled, so a .cu test that no longer builds
