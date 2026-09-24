@@ -13,7 +13,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from dmi.engine import effective_ring_bytes
 from dmi.transport.native import _load_extension
 
 pytestmark = pytest.mark.native_backend
@@ -167,6 +166,9 @@ class _FakeEagerRingEngine:
         self.reserved: list[int] = []
         self.flushes = 0
 
+    def payload_tensor(self) -> torch.Tensor:
+        return torch.empty(64, dtype=torch.uint8, device="cuda")
+
     def available_capacity(self) -> int:
         return self.available
 
@@ -183,39 +185,44 @@ class _FakeEagerRingEngine:
         self.flushes += 1
 
 
-class _FakeEagerTransport:
-    force_eager = True
+def _eager_hook(monkeypatch, engine, dispatched):
+    """A hook armed on the eager path, with dispatch_producer captured.
 
-    def __init__(self, engine: _FakeEagerRingEngine):
-        self._ring_engine = engine
-        self.direct: list[torch.Tensor] = []
-        self.effective_cap = effective_ring_bytes(
-            engine.payload_cap(), engine.staging_cap())
+    The transport is a real RingTransport over the fake engine, so the eager
+    safety net reads the production attributes (force_eager, capture_step,
+    the cached effective_cap) rather than a hand-kept copy of them. Only
+    submit_cpu_direct is replaced, to record what bypassed the ring.
+    """
+    from dmi.hooks.point import HookPoint
+    from dmi.transport import ring as ring_transport
+    from dmi.transport.ring import RingTransport
 
-    def submit_cpu_direct(self, tensor, hook_type, hook_id) -> None:
-        self.direct.append(tensor)
+    transport = RingTransport(engine)
+    transport.force_eager = True
+    transport.direct = []
+    transport.submit_cpu_direct = (
+        lambda tensor, hook_type, hook_id: transport.direct.append(tensor))
+    monkeypatch.setattr(ring_transport, "_active_transport", transport)
+    monkeypatch.setattr(
+        "dmi.hooks.point.dispatch_producer",
+        lambda *args: dispatched.append(args),
+    )
+    hook = HookPoint()
+    hook._ring_hook_type = 1
+    hook._ring_hook_id = 2
+    hook._ring_payload = transport._ring_payload
+    return hook, transport
 
 
 @pytest.mark.gpu
 def test_eager_ring_capacity_uses_padded_transport_size(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    from dmi.hooks.point import HookPoint
-    from dmi.transport import ring as ring_transport
 
     engine = _FakeEagerRingEngine(available=17, capacity=64)
-    transport = _FakeEagerTransport(engine)
-    monkeypatch.setattr(ring_transport, "_active_transport", transport)
     dispatched = []
-    monkeypatch.setattr(
-        "dmi.hooks.point.dispatch_producer",
-        lambda *args: dispatched.append(args),
-    )
+    hook, transport = _eager_hook(monkeypatch, engine, dispatched)
 
-    hook = HookPoint()
-    hook._ring_hook_type = 1
-    hook._ring_hook_id = 2
-    hook._ring_payload = torch.empty(64, dtype=torch.uint8, device="cuda")
     value = torch.arange(17, dtype=torch.uint8, device="cuda")
     result = hook(value)
 
@@ -230,22 +237,10 @@ def test_eager_ring_capacity_uses_padded_transport_size(monkeypatch):
 def test_eager_stripped_v0_uses_cpu_direct_without_reservation(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    from dmi.hooks.point import HookPoint
-    from dmi.transport import ring as ring_transport
 
     engine = _FakeEagerRingEngine(available=4096, capacity=4096)
-    transport = _FakeEagerTransport(engine)
-    monkeypatch.setattr(ring_transport, "_active_transport", transport)
     dispatched = []
-    monkeypatch.setattr(
-        "dmi.hooks.point.dispatch_producer",
-        lambda *args: dispatched.append(args),
-    )
-
-    hook = HookPoint()
-    hook._ring_hook_type = 1
-    hook._ring_hook_id = 2
-    hook._ring_payload = torch.empty(64, dtype=torch.uint8, device="cuda")
+    hook, transport = _eager_hook(monkeypatch, engine, dispatched)
     hook._strip_tensor = torch.tensor([1], dtype=torch.int64, device="cuda")
     hook._strip_row_bytes = 8
     value = torch.arange(17, dtype=torch.uint8, device="cuda")
@@ -257,24 +252,6 @@ def test_eager_stripped_v0_uses_cpu_direct_without_reservation(monkeypatch):
     assert dispatched == []
     assert len(transport.direct) == 1
     assert torch.equal(transport.direct[0], value.cpu())
-
-
-def _eager_hook(monkeypatch, engine, dispatched):
-    """A hook armed on the eager path, with dispatch_producer captured."""
-    from dmi.hooks.point import HookPoint
-    from dmi.transport import ring as ring_transport
-
-    transport = _FakeEagerTransport(engine)
-    monkeypatch.setattr(ring_transport, "_active_transport", transport)
-    monkeypatch.setattr(
-        "dmi.hooks.point.dispatch_producer",
-        lambda *args: dispatched.append(args),
-    )
-    hook = HookPoint()
-    hook._ring_hook_type = 1
-    hook._ring_hook_id = 2
-    hook._ring_payload = torch.empty(64, dtype=torch.uint8, device="cuda")
-    return hook, transport
 
 
 @pytest.mark.gpu
@@ -342,3 +319,38 @@ def test_eager_ring_still_uses_the_ring_when_staging_covers_the_tensor(monkeypat
     assert engine.reserved == [128]
     assert len(dispatched) == 1
     assert transport.direct == []
+
+
+@pytest.mark.gpu
+def test_eager_path_dispatches_nothing_on_a_step_the_schedule_refused(monkeypatch):
+    """A refused step must not reach the eager safety net at all.
+
+    When the capture schedule refuses a step, the driver skips plan/commit:
+    no ring space is reserved and no meta is pushed. HookPoint.forward checks
+    transport.capture_step after its `if not self.enabled` early return and
+    before the CUDA probe, so the eager block below it never runs. If that
+    gate sat after the eager block, force_eager would flush, reserve and
+    dispatch unreserved bytes, or submit to cpu_direct, and desync the
+    task/meta FIFO.
+
+    The two calls would each take a different eager branch without the gate:
+    a tensor over staging goes to flush + cpu_direct, and one that fits
+    staging but not the current slack goes to flush + reserve + ring.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    engine = _FakeEagerRingEngine(available=16, capacity=4096, staging=64)
+    dispatched = []
+    hook, transport = _eager_hook(monkeypatch, engine, dispatched)
+    transport.capture_step = False
+
+    over_staging = torch.arange(128, dtype=torch.uint8, device="cuda")
+    over_slack = torch.arange(32, dtype=torch.uint8, device="cuda")
+    assert hook(over_staging) is over_staging
+    assert hook(over_slack) is over_slack
+
+    assert engine.flushes == 0
+    assert engine.reserved == []
+    assert transport.direct == []
+    assert dispatched == []
