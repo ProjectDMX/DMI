@@ -264,7 +264,8 @@ correct and conservative. `FiveTriesFit` is refuted at the constant level — th
 arithmetic is decided before any state is explored, so TLC reports no state
 count.
 
-Two caveats on that comment, neither a model result:
+Two caveats on that comment. The first is read from the code and confirmed
+by `O1_absorb`; the second is a model result:
 
 * The four wakes are room for a renewal that runs **late**, not for one that
   **fails**: a failed renewal costs the lease at once, whatever the cause. A
