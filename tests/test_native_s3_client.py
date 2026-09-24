@@ -359,7 +359,13 @@ class FakeS3Handler(BaseHTTPRequestHandler):
         if not numbers:
             self._send(400, {}, b"invalid xml")
             return
-        assembled = b"".join(upload["parts"][n] for n in sorted(numbers))
+        ordered = sorted(numbers)
+        # S3's rule: every part but the last is at least 5 MiB.
+        if any(len(upload["parts"][n]) < 5 * 1024 * 1024
+               for n in ordered[:-1]):
+            self._send(400, {}, b"<Error><Code>EntityTooSmall</Code></Error>")
+            return
+        assembled = b"".join(upload["parts"][n] for n in ordered)
         meta = upload["meta"]
         with STATE.lock:
             STATE.objects[key] = {
@@ -452,16 +458,52 @@ def test_put_get_head_delete_round_trip(fake_s3):
     assert missing["ok"] and not missing["found"]
 
 
+MIB = 1024 * 1024
+
+
 def test_put_multipart_round_trip(fake_s3):
-    payload = bytes((i * 7) & 0xFF for i in range(3 * 1024 * 1024))
+    """Real part sizes: S3 refuses a part under 5 MiB unless it is the last.
+
+    12 MiB in 5 MiB parts is two full parts and a 2 MiB tail -- the
+    smallest shape with both a minimum-size part and a short final one.
+    """
+    payload = bytes((i * 7) & 0xFF for i in range(12 * MIB))
     put = _call("put", **_base(fake_s3), key="packs/big.dmi-pack",
                 data_b64=base64.b64encode(payload).decode(), metadata={},
                 content_type="application/vnd.dmi.pack",
-                multipart_threshold=1024 * 1024, multipart_chunk=1024 * 1024)
+                multipart_threshold=5 * MIB, multipart_chunk=5 * MIB)
     assert put["ok"], put
+    parts = [call["body_len"] for call in STATE.calls
+             if call["method"] == "PUT" and "partNumber=" in call["path"]]
+    assert parts == [5 * MIB, 5 * MIB, 2 * MIB]
     echo = _call("get", **_base(fake_s3), key="packs/big.dmi-pack",
                  offset=0, length=len(payload))
     assert echo["ok"] and base64.b64decode(echo["data_b64"]) == payload
+
+
+def test_multipart_part_under_5_mib_is_refused_before_any_request(fake_s3):
+    """The client refuses the part size, as the Python store does (s3.py).
+
+    Left to the server, a sub-5 MiB part fails only at
+    CompleteMultipartUpload, after every part was sent -- and a payload
+    under the threshold never notices. The refusal is the configuration's,
+    so it lands on every operation, before any request.
+    """
+    payload = bytes(3 * MIB)
+    put = _call("put", **_base(fake_s3), key="packs/small-parts.dmi-pack",
+                data_b64=base64.b64encode(payload).decode(), metadata={},
+                content_type="application/vnd.dmi.pack",
+                multipart_threshold=MIB, multipart_chunk=MIB)
+    assert not put["ok"], put
+    assert "multipart_chunk_bytes" in put["what"], put
+    assert str(5 * MIB) in put["what"], put
+    head = _call("head", **_base(fake_s3), key="anything",
+                 multipart_chunk=5 * MIB - 1)
+    assert not head["ok"] and "multipart_chunk_bytes" in head["what"], head
+    assert STATE.calls == []
+    # Exactly 5 MiB is S3's minimum, and is accepted.
+    assert _call("head", **_base(fake_s3), key="anything",
+                 multipart_chunk=5 * MIB)["ok"]
 
 
 def test_list_pagination(fake_s3):

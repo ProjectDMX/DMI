@@ -111,6 +111,23 @@ std::string XmlTag(const std::string& xml, const std::string& tag) {
 
 }  // namespace
 
+std::string S3Client::ValidateConfig(const S3Config& config) {
+  const bool https = config.endpoint.compare(0, 8, "https://") == 0;
+  if (https && config.allow_insecure_http) {
+    // Silently downgrading TLS was never the intent of the flag -- it gates
+    // plain http:// endpoints for local Garage.
+    return "https endpoint with allow_insecure_http is refused";
+  }
+  if (config.multipart_chunk_bytes < kMinMultipartPartBytes) {
+    // The Python store refuses the same (s3.py _MIN_MULTIPART_BYTES). Left
+    // to the server, the upload fails only at CompleteMultipartUpload, after
+    // every part was sent.
+    return "multipart_chunk_bytes must be at least " +
+           std::to_string(kMinMultipartPartBytes) + " (S3's minimum part size)";
+  }
+  return "";
+}
+
 S3Client::S3Client(S3Config config) : config_(std::move(config)) {
   // Explicit, rather than leaning on the implicit init inside
   // curl_easy_init: that implicit path carries libcurl's thread-safety
@@ -132,11 +149,7 @@ S3Client::S3Client(S3Config config) : config_(std::move(config)) {
   }
   while (!rest.empty() && rest.back() == '/') rest.pop_back();
   host_ = rest;
-  if (is_https_ && config_.allow_insecure_http) {
-    // Refused at construction: silently downgrading TLS was never the intent
-    // of the flag — it gates plain http:// endpoints for local Garage.
-    host_.clear();
-  }
+  config_error_ = ValidateConfig(config_);
 }
 
 S3Client::~S3Client() = default;
@@ -147,8 +160,9 @@ S3Response S3Client::Exchange(
     const std::map<std::string, std::string>& extra_headers,
     const uint8_t* body, size_t body_len, const std::string& body_hash_hex) {
   S3Response response;
-  if (host_.empty()) {
-    response.error = "https endpoint with allow_insecure_http is refused";
+  if (!config_error_.empty()) {
+    last_attempts_ = 0;
+    response.error = config_error_;
     return response;
   }
   const std::string encoded_resource = "/" + config_.bucket + "/" + key;
