@@ -354,6 +354,17 @@ class HuggingFaceAdapter(BackendAdapter):
         goes on. So the failure is logged, once per adapter, and the
         step is lost.
 
+        Two consequences of swallowing that the log does not show:
+
+        * Only the first failure is logged. Every later failure from this
+          adapter, whatever its cause, is swallowed without a log line, so
+          one WARNING can stand for many lost steps.
+        * A step that fails after ``prepare_step`` reserved its ring space
+          (in ``set_step_context`` or the metadata push, say) leaks that
+          reservation: nothing publishes or releases it, so the ring's
+          ``available_capacity()`` stays that much lower until the ring is
+          torn down. Repeated failures shrink it step by step.
+
         In capture or record mode the same failure means the hooks cannot
         reach the storage the config chose -- ``commit_step`` refuses record
         mode outright -- so every step would fail the same way and the
