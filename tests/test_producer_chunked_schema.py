@@ -319,3 +319,38 @@ def test_eager_ring_still_uses_the_ring_when_staging_covers_the_tensor(monkeypat
     assert engine.reserved == [128]
     assert len(dispatched) == 1
     assert transport.direct == []
+
+
+@pytest.mark.gpu
+def test_eager_path_dispatches_nothing_on_a_step_the_schedule_refused(monkeypatch):
+    """A refused step must not reach the eager safety net at all.
+
+    When the capture schedule refuses a step, the driver skips plan/commit:
+    no ring space is reserved and no meta is pushed. HookPoint.forward checks
+    transport.capture_step after its `if not self.enabled` early return and
+    before the CUDA probe, so the eager block below it never runs. If that
+    gate sat after the eager block, force_eager would flush, reserve and
+    dispatch unreserved bytes, or submit to cpu_direct, and desync the
+    task/meta FIFO.
+
+    The two calls would each take a different eager branch without the gate:
+    a tensor over staging goes to flush + cpu_direct, and one that fits
+    staging but not the current slack goes to flush + reserve + ring.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    engine = _FakeEagerRingEngine(available=16, capacity=4096, staging=64)
+    dispatched = []
+    hook, transport = _eager_hook(monkeypatch, engine, dispatched)
+    transport.capture_step = False
+
+    over_staging = torch.arange(128, dtype=torch.uint8, device="cuda")
+    over_slack = torch.arange(32, dtype=torch.uint8, device="cuda")
+    assert hook(over_staging) is over_staging
+    assert hook(over_slack) is over_slack
+
+    assert engine.flushes == 0
+    assert engine.reserved == []
+    assert transport.direct == []
+    assert dispatched == []
