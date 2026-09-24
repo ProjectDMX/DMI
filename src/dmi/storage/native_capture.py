@@ -169,6 +169,10 @@ class NativeCaptureStorageConfig:
     # engine.close()'s total budget for draining capture: sealing the sink's
     # open pack, then getting every staged pack into the catalog.
     close_flush_timeout_s: float = 60.0
+    # Bytes of packs the uploader holds in flight at once. A staged pack
+    # larger than this is never uploaded, so the sink's max_pack_bytes must
+    # not exceed it (validate_capture_bounds). The native default.
+    uploader_max_in_flight_bytes: int = 256 * 1024 * 1024
 
     def __post_init__(self) -> None:
         for name in ("s3_endpoint", "s3_bucket", "s3_access_key",
@@ -203,6 +207,9 @@ class NativeCaptureStorageConfig:
         _positive("clickhouse_request_timeout_s",
                   self.clickhouse_request_timeout_s, float)
         _positive("close_flush_timeout_s", self.close_flush_timeout_s, float)
+        if (type(self.uploader_max_in_flight_bytes) is not int
+                or self.uploader_max_in_flight_bytes <= 0):
+            raise ValueError("uploader_max_in_flight_bytes must be positive")
         if type(self.reconcile_interval_s) not in (int, float):
             raise TypeError("reconcile_interval_s must be float")
         if not math.isfinite(self.reconcile_interval_s):
@@ -226,7 +233,64 @@ class NativeCaptureStorageConfig:
             "clickhouse_request_timeout_s": float(self.clickhouse_request_timeout_s),
             "database": self.database,
             "table_prefix": self.table_prefix,
+            "uploader_max_in_flight_bytes": self.uploader_max_in_flight_bytes,
         }
+
+
+# What an empty pack needs besides one record's payload: the 64-byte header
+# and trailer, up to 63 bytes of payload alignment, and that record's footer
+# row (its metadata as JSON, well under a kilobyte for real identifiers).
+# Generous on purpose: undershooting it lets a record through that the pack
+# worker then counts as oversized and drops.
+PACK_FRAMING_RESERVE_BYTES = 64 * 1024
+
+
+def validate_capture_bounds(
+    sink_config: NativeSinkConfig,
+    max_record_bytes: int,
+    *,
+    storage_config: Optional[NativeCaptureStorageConfig] = None,
+) -> None:
+    """Refuse capture bounds under which a record or pack cannot be stored.
+
+    ``max_record_bytes`` is the largest single record (one captured row's
+    payload) the caller will emit. Checked here, at attach, these refusals
+    never reach the forward:
+
+    - ``max_queue_bytes`` below it: the sink refuses the record outright.
+    - ``max_pack_bytes`` below it plus ``PACK_FRAMING_RESERVE_BYTES``: the
+      sink admits the record and the pack worker then drops it as oversized.
+    - ``max_pack_bytes`` above ``uploader_max_in_flight_bytes``: a full pack
+      is staged and never uploaded.
+
+    Raises ``ConfigurationError`` naming the bound to raise.
+    """
+    if not isinstance(sink_config, NativeSinkConfig):
+        raise TypeError("sink_config must be a NativeSinkConfig")
+    if type(max_record_bytes) is not int or max_record_bytes <= 0:
+        raise ValueError("max_record_bytes must be a positive int")
+    from ..configuration.errors import ConfigurationError
+
+    if sink_config.max_queue_bytes < max_record_bytes:
+        raise ConfigurationError(
+            f"a {max_record_bytes}-byte record exceeds the sink's "
+            f"max_queue_bytes ({sink_config.max_queue_bytes}); raise "
+            "max_queue_bytes to at least the largest record")
+    needed = max_record_bytes + PACK_FRAMING_RESERVE_BYTES
+    if sink_config.max_pack_bytes < needed:
+        raise ConfigurationError(
+            f"a {max_record_bytes}-byte record does not fit an empty pack of "
+            f"max_pack_bytes ({sink_config.max_pack_bytes}); raise "
+            f"max_pack_bytes to at least {needed} (the record plus "
+            f"{PACK_FRAMING_RESERVE_BYTES} bytes of pack framing)")
+    if (storage_config is not None and sink_config.max_pack_bytes
+            > storage_config.uploader_max_in_flight_bytes):
+        raise ConfigurationError(
+            f"the sink's max_pack_bytes ({sink_config.max_pack_bytes}) "
+            "exceeds the storage service's uploader_max_in_flight_bytes "
+            f"({storage_config.uploader_max_in_flight_bytes}), so a full "
+            "pack would never be uploaded; lower max_pack_bytes or raise "
+            "uploader_max_in_flight_bytes")
 
 
 class NativeCaptureStorage:
@@ -476,6 +540,7 @@ class NativeCaptureReader:
 
 
 __all__ = [
+    "PACK_FRAMING_RESERVE_BYTES",
     "SINK_OVERLOAD_POLICIES",
     "NativeSinkConfig",
     "NativeCapture",
@@ -484,4 +549,5 @@ __all__ = [
     "NativeCaptureSelection",
     "NativeCaptureStorage",
     "NativeCaptureStorageConfig",
+    "validate_capture_bounds",
 ]

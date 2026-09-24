@@ -266,6 +266,30 @@ class MonitoringEngine:
         # lifecycle toggle; the next committed step recomputes it.
         transport.force_eager = False
 
+    def validate_capture_bounds(self, max_record_bytes: int) -> None:
+        """Refuse this engine's capture bounds if a record cannot be stored.
+
+        Adapters call it at attach with the largest record (one captured
+        row's payload) they will emit, so a bound too small for it is a
+        ``ConfigurationError`` there instead of a refusal on the record
+        worker, which latches the runtime, in the middle of a forward. See
+        :func:`dmi.storage.native_capture.validate_capture_bounds`.
+
+        Checks the persistent path's ``capture_sink_config`` (and
+        ``capture_storage_config``); with no sink config there is nothing
+        to check.
+        """
+        sink_config = self._capture_sink_config
+        if sink_config is None:
+            if type(max_record_bytes) is not int or max_record_bytes <= 0:
+                raise ValueError("max_record_bytes must be a positive int")
+            return
+        from .storage.native_capture import validate_capture_bounds
+
+        validate_capture_bounds(
+            sink_config, max_record_bytes,
+            storage_config=self._capture_storage_config)
+
     def _backend_label(self) -> str:
         """The storage backend as the caller wrote it, with its current name
         when that was a deprecated one: ``'native' (now 'in-memory')``."""
