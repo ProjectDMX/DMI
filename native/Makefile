@@ -199,12 +199,16 @@ OBJS += $(RING_OBJS)
 # without it fails here with the package named. Unconditional rather than
 # "when libcurl is found": skipping silently is the stranding again, reported
 # only at runtime by the loader. A build that wants the backend alone says so
-# with CAPTURE=0.
+# with CAPTURE=0. Only 0 and 1 are accepted: any other value -- CAPTURE=yes,
+# or an unrelated CAPTURE someone exported -- used to mean 0, and dropped
+# the extensions just as silently.
 CAPTURE ?= 1
-ifeq ($(CAPTURE),1)
+ifeq ($(strip $(CAPTURE)),1)
 all: $(FINAL_TARGET) capture
-else
+else ifeq ($(strip $(CAPTURE)),0)
 all: $(FINAL_TARGET)
+else
+$(error CAPTURE must be 0 or 1, not '$(CAPTURE)' (from the $(origin CAPTURE)): 1 builds the capture storage extensions with the default build, 0 leaves them out)
 endif
 
 # Every target that builds without CUDA, as ONE goal. CI's compile gate

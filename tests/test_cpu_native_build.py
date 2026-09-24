@@ -513,6 +513,36 @@ def test_capture_opt_out_leaves_the_default_build_to_the_backend():
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("overrides", "environment", "value"),
+    [
+        (("CAPTURE=yes",), {}, "yes"),
+        (("CAPTURE=true",), {}, "true"),
+        # Some unrelated tool's exported CAPTURE, which make reads as a
+        # variable like any other.
+        ((), {"CAPTURE": "/var/tmp/capture"}, "/var/tmp/capture"),
+    ],
+    ids=["yes", "true", "unrelated-environment-variable"],
+)
+def test_capture_accepts_only_zero_or_one(overrides, environment, value):
+    # Anything but exactly 1 used to mean CAPTURE=0: CAPTURE=yes built the
+    # backend without the capture extensions and said nothing.
+    result = _make("-n", "clean", *overrides, environment=environment)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert f"CAPTURE must be 0 or 1, not '{value}'" in output
+    assert "rm -rf" not in output
+
+
+@pytest.mark.cpu
+def test_capture_setting_ignores_surrounding_whitespace():
+    for value, captured in ((" 1 ", True), (" 0 ", False)):
+        result = _make("-p", "-n", "clean", f"CAPTURE={value}")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert ("capture" in _prerequisites(result.stdout, "all")) is captured
+
+
+@pytest.mark.cpu
 def test_clean_then_capture_build_recreates_what_clean_removed():
     result = _make("-B", "-n", "clean", "capture")
     output = result.stdout + result.stderr
