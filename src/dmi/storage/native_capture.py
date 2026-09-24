@@ -67,9 +67,12 @@ class NativeSinkConfig:
     captures is admitted here, into a bounded queue ahead of pack assembly.
     ``overload`` decides what a full queue does. ``"block"`` waits for room
     for up to ``admission_timeout_s`` (``None`` waits without bound) and
-    then refuses the record as timed out; ``"drop_newest"`` refuses it at
+    then refuses the record as timed out; the rows of one ring record (one
+    envelope) share that one deadline. ``"drop_newest"`` refuses it at
     once, and ``admission_timeout_s`` is not used. Either refusal latches
-    the record runtime (see ``create_record_runtime``'s failure policy).
+    the record runtime (see ``create_record_runtime``'s failure policy),
+    and so does a record lost after admission. A ``step_stall_budget_ms``
+    needs a bounded admission, so it is refused with block and no timeout.
 
     The default, block with 2 s, absorbs a burst larger than the queue at
     the cost of stalling the record worker, and so the ring, while the sink
