@@ -847,6 +847,55 @@ def test_a_catalog_cut_spanning_a_renewal_and_a_publish_recovers(
             assert captures[capture_id].payload == tensor.numpy().tobytes()
 
 
+def test_a_quarantined_service_leaves_new_packs_in_the_spool(
+        fake_s3, tmp_path):
+    """While quarantined the service cannot index, so it must not upload
+    either: an uploaded but unindexed pack is remembered only in memory, and
+    a crash then orphans it in the bucket when reconcile_on_start is off.
+    Before, a quarantined cycle with nothing owed uploaded the whole spool
+    into that in-memory list; now new packs stay in the durable spool until
+    the lease is back."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            reconcile_on_start=False, lease_ttl_s=3.0, publish_timeout_s=1)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            switch.cut()
+            # Nothing is owed: the renewal alone fails and quarantines.
+            _wait_for(lambda: service.snapshot()["lease_state"] == "quarantined",
+                      timeout_s=5.0)
+            assert service.snapshot()["pending_index"] == 0
+
+            tensors = _stage(spool_root, range(2))
+            assert len(_ready(spool_root)) == 1
+            # flush() drives cycles; none of them may upload.
+            with pytest.raises(TimeoutError):
+                service.flush(0.5)
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "quarantined", snapshot
+            assert snapshot["uploaded_packs"] == 0, snapshot
+            assert snapshot["pending_index"] == 0, snapshot
+            assert len(_ready(spool_root)) == 1
+
+            switch.restore()
+            service.flush(30.0)
+            service.rethrow_if_failed()
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+            switch.close()
+
+        assert snapshot["uploaded_packs"] == 1, snapshot
+        assert snapshot["indexed_packs"] == 1, snapshot
+        assert _ready(spool_root) == []
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert sorted(captures) == sorted(tensors)
+
+
 def _latch_lines(err: str) -> list[str]:
     return [line for line in err.splitlines() if "indexing stopped" in line]
 

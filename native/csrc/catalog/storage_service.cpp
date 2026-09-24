@@ -278,8 +278,8 @@ void CaptureStorageService::loop() {
 CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
   CycleOutcome outcome;
   // The catalog phase needs the lease. Without one -- quarantined after an
-  // unknown outcome, or refused by another holder -- the cycle still
-  // uploads as far as the owed-pack rule below allows, and owes the rest.
+  // unknown outcome, or refused by another holder -- the cycle uploads
+  // nothing either: whatever it uploaded it could only owe, in memory.
   bool catalog = false;
   {
     std::lock_guard<std::mutex> lease(lease_mutex_);
@@ -314,9 +314,15 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
       index_or_owe(std::move(owed));
     }
 
-    // 2. Upload everything the sink has staged.
+    // 2. Upload everything the sink has staged -- but only with the lease
+    //    and nothing owed. Without the lease an uploaded pack could only be
+    //    owed, and pending_index_ dies with the process: with
+    //    reconcile_on_start off, a crash would leave it in the bucket and
+    //    never in the catalog. Left in the spool it survives the crash.
     dmi_store::UploadBatchResult batch;
-    if (pending_index_.empty()) batch = uploader_->UploadPending(-1);
+    if (catalog && pending_index_.empty()) {
+      batch = uploader_->UploadPending(-1);
+    }
     std::vector<PackRefData> to_index;
     uint64_t uploaded_packs = 0;
     uint64_t uploaded_bytes = 0;
