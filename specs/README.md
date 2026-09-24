@@ -1,9 +1,10 @@
 # Formal specifications
 
-Machine-checked models of four pieces of DMI whose correctness arguments are
+Machine-checked models of five pieces of DMI whose correctness arguments are
 currently carried by prose: the catalog version allocator, the publisher lease
 and fenced publish protocol, the two-host clock-skew bound in the fence margin,
-and the payload ring's span arithmetic.
+the payload ring's span arithmetic, and the host-side capacity check that span
+arithmetic depends on.
 
 Nothing here is built, imported or executed by DMI. The specs are checked by
 hand with the commands below; none of them runs in CI.
@@ -23,8 +24,9 @@ specs/
 | `tla/PublisherLease.tla` | the lease claim/renew/release protocol and the fenced publish: `claim_with_rival`, `head()`, `fence()`, `fence_eval()`, `reject_live()`, and `publish_snapshot`'s manifest chunks and watermark INSERT | `native/csrc/catalog/lease_coordinator.cpp:83-247`, `native/csrc/catalog/catalog_writer.cpp:148-158,478-640`, `clickhouse_client.cpp:107`, `docs/catalog-descriptor-key.md:290-360,461-560`, `src/dmi/storage/capture/clickhouse_lease.py:83-92,198-210` |
 | `z3/clock_skew.py` | the two-host derivation behind the fence margin `publish_timeout_ns + clock_skew_ns` | the SQL at `docs/catalog-descriptor-key.md:352-362` (emitted by `catalog_writer.cpp:583`), the derivation at `:365-372`, the cap at `catalog_writer.cpp:519` |
 | `cbmc/payload_ring_span.cpp` | `payload_compute_spans` and its stated precondition | `native/csrc/ring/payload_ring.cuh:44-86` |
+| `tla/RingCapacity.tla` | who establishes that precondition: `prepare_step`, the eager safety net (`available_capacity`, `reserve_one`), `reserve_record` with reclaims, one async CUDA stream, the drain | `native/csrc/ring/ring_engine_py.cu:367-656`, `native/csrc/ring/drain_thread.cpp:253-600`, `native/csrc/ring/producer.cu`, `native/csrc/ring/task_ring.cuh:72-86`, `src/dmi/adapters/base.py:281-366`, `src/dmi/hooks/point.py:259-346`, `src/dmi/records.py:317-386` |
 
-Both TLA+ models are written against the **code**, not the prose. Where the two
+The TLA+ models are written against the **code**, not the prose. Where the two
 disagree, the spec follows the code and a comment in the `.tla` says so.
 
 ## Getting the tools
@@ -64,6 +66,12 @@ java -XX:+UseParallelGC -Xmx3g -cp /path/to/tla2tools.jar tlc2.TLC \
 `PublisherLease.cfg` is the base model — the protocol exactly as shipped, with
 the combined `AllSafety` invariant. Each `PublisherLease_*.cfg` turns a single
 knob away from it or swaps in a single invariant; its header comment says which.
+
+`RingCapacity.tla` follows the same convention with a `Ring_` prefix:
+`Ring_base.cfg` (adapter path) and `Ring_rec_base.cfg` (record path) are the
+shipped protocol, and each other `Ring_*.cfg` turns one knob or checks one
+invariant. `Ring_rec_taskover` and `Ring_rec_wide` are the largest, at ~14M
+distinct states and a few minutes each.
 
 The largest runs (`believers`, `holderssafe`, `overrun`, `PublisherLease.cfg`)
 generate ~20M states and take roughly 15-25 minutes on four workers with a 3 GB
@@ -221,7 +229,140 @@ every `head` up to `2^40` and every `nbytes`:
 
 Witness for the failures: `cap = 22`, `head = 15`, `tail = 0` — so seven bytes
 are free — and `n = 1152921504606846983`. The second span runs past the end of
-the buffer.
+the buffer. Who establishes the precondition is the subject of the next model.
+
+### Ring capacity (`RingCapacity.tla`)
+
+The CBMC harness proves the span arithmetic *given*
+`payload_free_bytes(head, tail, capacity) >= nbytes`. The kernel cannot check
+that — it never reads a tail — so the obligation sits entirely on the host's
+reservation paths. This model is those paths: `prepare_step`, the eager safety
+net's `available_capacity` / `reserve_one`, `reserve_record` with its
+upper-bound reservations and reclaims, a single asynchronous CUDA stream, and a
+drain thread that may release any staging-sized prefix of published tasks at
+any moment, or never.
+
+Two obligations are checked in every reachable state, for the producer at the
+head of the stream (it may run in any state, so a state where it does not fit
+is a reachable overrun):
+
+- `PayloadFits` — the CBMC precondition: `(gpuHead - tail) + alloc <= Cap`.
+- `TaskFits` — the same for publication slots. `task_publish` stores to slot
+  `seq % task_cap` unconditionally (`task_ring.cuh:78-85`); publishing into a
+  slot the drain has not cleared destroys an unread publication.
+
+Three supporting invariants state the argument the code comments make:
+`Covered` (the GPU never runs ahead of what the CPU reserved), `NoWrap` (the
+CPU's own accounting never claims more than the ring holds — if it does,
+`cap - (head - tail)` underflows in `uint64` and every later capacity check
+passes unconditionally) and `Exact` (every reservation is eventually consumed).
+
+Base constants: `Cap = 4`, `Staging = 4`, `TaskCap = 4`, `MaxBytes = 3`,
+`MaxHooks = 2`, `MaxSteps = 4`, in `PAYLOAD_ALIGN` units. Every quantity the
+protocol compares is a multiple of `PAYLOAD_ALIGN`, so the unit abstraction is
+exact.
+
+| Config | Differs from base | Invariants | Verdict | States |
+|---|---|---|---|---|
+| `base` | adapter path as shipped | `Safety` `Covered` `NoWrap` `Exact` | **holds** | 265,955 / 101,358 |
+| `wide` | `Cap 6`, `Staging 5`, `MaxSteps 5` | `Safety` `Covered` `NoWrap` `Exact` | **holds** | 1,707,055 / 543,119 |
+| `taskover` | `MaxHooks 3 > TaskCap 2` | `Safety` | `Safety` violated (8) | 79,575 / 50,754 |
+| `taskover_payload` | `MaxHooks 3 > TaskCap 2` | `PayloadFits` | **holds** | 5,036,539 / 1,825,901 |
+| `taskover_nowrap` | `MaxHooks 3 > TaskCap 2` | `NoWrap` | `NoWrap` violated (6) | 13,639 / 10,183 |
+| `eager` | `NeedsEager` | `Exact` | `Exact` violated (4) | 178 / 176 |
+| `eager_nowrap` | `NeedsEager` | `NoWrap` | `NoWrap` violated (4) | 211 / 208 |
+| `eager_payload` | `NeedsEager`, `MaxSteps 5` | `PayloadFits` | `PayloadFits` violated (8) | 4,730 / 3,614 |
+| `prefix` | `PrefixMismatch` | `PayloadFits` | `PayloadFits` violated (8) | 4,285 / 3,400 |
+| `rec_base` | record path as shipped | `Safety` `Covered` `NoWrap` `Exact` | **holds** | 9,795,483 / 2,957,562 |
+| `rec_wide` | record, `Cap 6`, `Staging 5` | `Safety` `Covered` `NoWrap` `Exact` | **holds** | 44,914,022 / 13,756,982 |
+| `rec_taskover` | record, `MaxHooks 3 > TaskCap 2` | `Safety` `Covered` `NoWrap` `Exact` | **holds** | 35,452,350 / 13,328,511 |
+| `rec_gate` | record, `GateMismatch` | `Exact` | `Exact` violated (5) | 3,343 / 3,340 |
+| `rec_gate_safety` | record, `GateMismatch`, `MaxSteps 5` | `Safety` | `Safety` violated (14) | 10,845,115 / 6,597,762 |
+
+**The shipped paths discharge the obligation.** On the adapter path with no
+knob turned, and on the generic-record path with reclaims, `PayloadFits`,
+`TaskFits`, `Covered`, `NoWrap` and `Exact` all hold. The CBMC precondition is
+established on every path the code takes — under the assumptions below, and
+with one exception.
+
+**Exception: more hooks per step than `task_cap` (`taskover`).** This needs no
+override and no broken contract. `prepare_step` returns `STEP_OVERSIZED` when
+`num_hooks > task_cap` (`ring_engine_py.cu:422-427`), which turns on the eager
+safety net. The safety net checks only *payload* space
+(`point.py:321-323`, `available_capacity()` at `ring_engine_py.cu:634-638`),
+then `reserve_one` claims one task entry each without checking the task ring
+(`ring_engine_py.cu:643-646`). Payload room is plentiful — the step was
+oversized by count, not bytes — so no hook flushes, and the stream carries more
+producers than there are publication slots. If the drain has not cleared the
+oldest slot when the `task_cap + 1`-th producer runs, that producer overwrites
+an unread publication. The payload obligation still holds on this path
+(`taskover_payload`); the task obligation does not, and the CPU's task
+accounting wraps (`taskover_nowrap`), after which the task-ring check in
+`prepare_step` passes unconditionally. `estimate.py:816-826` describes exactly
+this configuration as "capture keeps working". It does only while the drain
+keeps up. The default `task_cap` is 65,536 (`engine.py:102`), so reaching this
+takes a ring configured with fewer task entries or a very wide hook selection
+— both of which the estimator supports and reports on.
+
+**The obligation rests on three assumptions the code does not check.** Each
+was given a knob; each knob, turned alone, breaks `PayloadFits`.
+
+- *An adapter overriding `_spec_needs_eager` (`eager`).* `commit_step`
+  reserves the whole step through `prepare_step` and *then* sets
+  `force_eager`, so every hook also `reserve_one`s its own bytes. The step
+  reservation is never consumed. In the counterexample a single such step with
+  one 3-unit hook on a 4-unit ring reserves 3, finds 1 free, flushes, and
+  `reserve_one`s 3 more without re-checking: `cpuHead - tail = 6 > Cap`. The
+  next ordinary step's `cap - (head - tail)` underflows, the fast path passes,
+  and the GPU writes 5 units into a 4-unit ring — eight states in all. No
+  shipped adapter overrides `_spec_needs_eager` (`base.py:150-155` documents it
+  as the extension point for dynamic-shape backends), so this is latent.
+- *The device row count a prefix producer reads never exceeds the CPU
+  `actual_q_len` the step was sized with (`prefix`).* `plan_step` sizes a
+  strip-eligible hook from `ctx.actual_q_len` (`base.py:359-366`); the kernel
+  sizes its allocation from `*row_count_dev_ptr`, clamped only to
+  `nbytes_upper` (`producer.cu:234-252`). Any disagreement in the device's
+  favour writes past the reservation. The contract is stated in
+  `point.py:135-148`; nothing enforces it.
+- *A device gate never skips an occurrence the host reserved (`rec_gate`).*
+  `integration-api-v1.md:370-374` requires the integration to apply the gate
+  before reserving. If it does not, the reservation is never consumed or
+  reclaimed — a skipped producer publishes nothing for `account_record_task`
+  to see — and the leak compounds through `reserve_record`'s flushed branch
+  into the same underflow.
+
+**Every flushed branch reserves without re-checking.** `prepare_step`
+(`ring_engine_py.cu:440-446`), `reserve_record` (`:505-516`) and the safety
+net's middle branch (`point.py:326-329`) all flush and then reserve
+unconditionally. That is sound exactly when `Exact` holds, because a full flush
+then leaves `cpuHead - tail` at zero and the request is already known to fit
+the effective capacity. It is also why each assumption above fails as badly as
+it does: once any reservation leaks, a flushed branch can push the CPU's
+accounting past `Cap`, and the unsigned subtraction removes backpressure for
+the rest of the run instead of reporting the leak. A re-check after the flush
+that throws when the request still does not fit would turn the two leak-driven
+overruns (`eager`, `rec_gate`) into loud errors. It would not catch `prefix`:
+there the CPU's accounting is right and the device writes past it, so a fix has
+to bound the device's allocation by what was reserved. Today its only clamp is
+`nbytes_upper`, the padded tensor size — and under CUDA-graph capture that
+bound is baked into the graph, which is why this is not a one-line change.
+
+Vacuity probes, each refuted as intended at the base constants: the payload
+ring fills (`vac_full`), the task ring fills (`vac_tasks`), the flushed branch
+is taken (`vac_flushed`), `STEP_OVERSIZED` is returned (`vac_oversized`), the
+safety net reserves (`vac_eager`), and on the record path the ring fills, the
+flushed branch is taken and a reclaim is credited (`vac_rec_*`).
+
+| Config | Guard | Refuted at | States |
+|---|---|---|---|
+| `vac_full` | `NeverFull` | 7 states | 2,272 / 1,654 |
+| `vac_tasks` | `NeverTasksFull` | 15 states | 53,801 / 27,161 |
+| `vac_flushed` | `NeverFlushedPath` | 7 states | 699 / 540 |
+| `vac_oversized` | `NeverOversized` | 3 states | 71 / 68 |
+| `vac_eager` | `NeverEagerReserve` | 4 states | 234 / 231 |
+| `vac_rec_full` | `NeverFull` | 9 states | 32,184 / 23,015 |
+| `vac_rec_flushed` | `NeverFlushedPath` | 7 states | 4,321 / 3,340 |
+| `vac_rec_reclaim` | `NeverReclaims` | 5 states | 1,126 / 1,123 |
 
 ## Limitations
 
@@ -263,7 +404,22 @@ probe whether a specific bound hid behaviour; they do not turn a bounded check
 into a proof. CBMC's result is likewise bounded at capacity 64 and `head < 2^40`.
 Only the Z3 result is unbounded.
 
-**Two actors, not N.** Both TLA+ models run with two or three concurrent
+**The ring model trusts the kernel to be the arithmetic it is modelled as.**
+`RingCapacity.tla` treats a producer as one atomic step that allocates
+`align_up(actual)`, publishes, and advances both heads. The CUDA memory
+ordering that makes that true across blocks and to the host (the last-block
+join, the system-scope release at `task_ring.cuh:84`) is assumed, not checked;
+none of these tools reaches it. It also assumes one CUDA stream: a producer
+launched on a stream other than the one `flush_and_wait` synchronises would be
+outside what the flush waits for.
+
+**The drain in the ring model can stall forever.** That is deliberate: a drain
+held up by a full staging buffer or a slow sink is realistic, and the capacity
+check exists precisely so that correctness does not depend on the drain keeping
+up. It means a counterexample shows an overrun is *reachable*, not how often it
+occurs under a healthy drain.
+
+**Two actors, not N.** The catalog TLA+ models run with two or three concurrent
 processes. A protocol bug that needs four simultaneous claimants would not be
 found.
 
