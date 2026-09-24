@@ -13,7 +13,9 @@
 // verified, before anything indexes it, so the spool alone cannot say what is
 // still owed to the catalog. Two things cover the gap:
 //   - in-process, a pack whose indexing fails stays on a retry list, and
-//     flush() does not report drained until that list is empty;
+//     flush() does not report drained until that list is empty. Nothing new
+//     is uploaded while it is not, so an outage leaves new packs in the
+//     durable spool, not on a list only this process remembers;
 //   - across a crash, the reconciler lists the bucket, skips what the catalog
 //     already committed, and indexes the rest. It runs at start(), and
 //     periodically when reconcile_interval_ns is non-zero.

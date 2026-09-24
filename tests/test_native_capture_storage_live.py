@@ -388,6 +388,56 @@ def test_an_index_failure_keeps_the_pack_owed_until_it_lands(fake_s3, tmp_path):
         assert sorted(_read_all(direct)) == sorted(tensors)
 
 
+def _wait_for(predicate, timeout_s=10.0):
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.05)
+
+
+def test_no_new_upload_while_an_uploaded_pack_is_owed(fake_s3, tmp_path):
+    """An uploaded pack leaves the durable spool for an in-memory retry
+    list. With the catalog down, uploading kept moving packs there, and a
+    process that exited then lost them to everything but a reconcile --
+    which reconcile_on_start=False, the shared-bucket setting, never runs.
+    New packs now stay in the spool until the owed index lands."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        config = _storage_config(fake_s3, catalog.table_prefix,
+                                 clickhouse_port=switch.port,
+                                 reconcile_on_start=False)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            switch.cut()
+            tensors = _stage(spool_root, range(2))
+            _wait_for(lambda: service.snapshot()["pending_index"] == 1)
+            assert _ready(spool_root) == []
+
+            tensors.update(_stage(spool_root, range(2, 4)))
+            with pytest.raises(TimeoutError, match="1 uploaded but unindexed"):
+                service.flush(1.0)  # cycles, each retrying the owed index
+            snapshot = service.snapshot()
+            assert len(_ready(spool_root)) == 1, snapshot
+            assert snapshot["uploaded_packs"] == 1, snapshot
+            assert snapshot["pending_index"] == 1, snapshot
+
+            switch.restore()
+            service.flush(30.0)
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+            switch.close()
+
+        assert _ready(spool_root) == []
+        assert snapshot["uploaded_packs"] == 2, snapshot
+        assert snapshot["indexed_packs"] == 2, snapshot
+        assert snapshot["pending_index"] == 0, snapshot
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
 def test_a_pack_uploaded_but_never_indexed_is_reconciled_at_start(
         fake_s3, tmp_path):
     spool_root = tmp_path / "spool"

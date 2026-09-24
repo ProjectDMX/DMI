@@ -238,11 +238,35 @@ void CaptureStorageService::loop() {
 
 CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
   CycleOutcome outcome;
+  // Indexes refs, keeping whatever does not index owed: it is already gone
+  // from the spool, so pending_index_ is the only record of it in-process.
+  const auto index_or_owe = [this](std::vector<PackRefData> refs) {
+    std::vector<PackRefData> unindexed;
+    try {
+      if (!refs.empty()) index_bounded(std::move(refs), &unindexed);
+    } catch (...) {
+      pending_index_.insert(pending_index_.end(), unindexed.begin(),
+                            unindexed.end());
+      throw;
+    }
+    pending_index_.insert(pending_index_.end(), unindexed.begin(),
+                          unindexed.end());
+  };
   try {
-    // 1. Upload everything the sink has staged.
-    const dmi_store::UploadBatchResult batch = uploader_->UploadPending(-1);
+    // 1. Retry what earlier cycles uploaded but could not index. While any
+    //    of it is still owed, the catalog is down or refusing: upload
+    //    nothing new, so new packs stay in the durable spool rather than
+    //    joining a list that only this process remembers.
+    if (!pending_index_.empty()) {
+      std::vector<PackRefData> owed;
+      owed.swap(pending_index_);
+      index_or_owe(std::move(owed));
+    }
+
+    // 2. Upload everything the sink has staged.
+    dmi_store::UploadBatchResult batch;
+    if (pending_index_.empty()) batch = uploader_->UploadPending(-1);
     std::vector<PackRefData> to_index;
-    to_index.swap(pending_index_);  // earlier packs whose indexing failed
     uint64_t uploaded_packs = 0;
     uint64_t uploaded_bytes = 0;
     size_t upload_failures = 0;
@@ -269,22 +293,10 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
       state_.upload_failures += upload_failures;
     }
 
-    // 2. Index them. Whatever does not index stays owed: it is already gone
-    //    from the spool, so this list is the only record of it in-process.
-    std::vector<PackRefData> unindexed;
-    try {
-      if (!to_index.empty()) index_bounded(std::move(to_index), &unindexed);
-    } catch (...) {
-      pending_index_ = std::move(unindexed);
-      throw;
-    }
-    pending_index_ = std::move(unindexed);
-    {
-      std::lock_guard<std::mutex> lock(state_mutex_);
-      state_.pending_index = pending_index_.size();
-    }
+    // 3. Index them.
+    index_or_owe(std::move(to_index));
 
-    // 3. Reconcile on its interval. The lease thread keeps the lease alive.
+    // 4. Reconcile on its interval. The lease thread keeps the lease alive.
     if (config_.reconcile_interval_ns > 0 &&
         steady_ns() - last_reconcile_ns_ >= config_.reconcile_interval_ns) {
       reconcile();
@@ -296,10 +308,12 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
     // listed is drained as far as flush() is concerned -- its listing came
     // after the sink's flush -- so the spool is re-listed only when the batch
     // was empty, which UploadPending also returns when its listing FAILED.
-    // An empty spool lists for free; a backlog would be re-hashed.
+    // A cycle that already failed is not drained whatever the spool holds,
+    // so it skips the listing: an empty spool lists for free, but a backlog
+    // would be re-hashed on every cycle of an outage.
     outcome.failed = upload_failures != 0 || !pending_index_.empty();
     bool nothing_pending = !batch.refs.empty();
-    if (batch.refs.empty()) {
+    if (batch.refs.empty() && !outcome.failed) {
       std::vector<dmi_store::StagedPack> pending;
       std::string error;
       const bool listed =
@@ -323,6 +337,10 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
     }
   } catch (const std::exception& exc) {
     record_error(exc.what());
+  }
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_.pending_index = pending_index_.size();
   }
   failure_streak_ = outcome.failed ? std::min(failure_streak_ + 1, 32) : 0;
   return outcome;
