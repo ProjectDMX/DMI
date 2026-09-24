@@ -192,6 +192,110 @@ static void test_submit_failure_precedes_durable_idle() {
     EXPECT(timeouts.load(std::memory_order_relaxed) == 0);
 }
 
+template <typename Fn>
+static bool throws_runtime_error(Fn&& call) {
+    try {
+        call();
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+    return false;
+}
+
+static void test_raise_policy_is_the_default_and_raises_at_the_producer() {
+    std::printf("[ TEST ] raise_at_producer is the default and raises on push\n");
+    ring::RecordConsumer consumer(std::make_shared<FailingSink>());
+    EXPECT(consumer.snapshot().policy ==
+           ring::RecordFailurePolicy::kRaiseAtProducer);
+    consumer.push_descriptor(descriptor("raise", "record"));
+    EXPECT(throws_runtime_error(
+        [&] { consumer.consume_payload(byte_payload({1})); }));
+
+    EXPECT(throws_runtime_error(
+        [&] { consumer.push_descriptor(descriptor("raise", "later")); }));
+    const ring::RecordConsumerSnapshot snapshot = consumer.snapshot();
+    EXPECT(snapshot.failed);
+    EXPECT(snapshot.failure.find("injected sink failure") != std::string::npos);
+    EXPECT(snapshot.discarded_descriptors == 0);
+    EXPECT(snapshot.discarded_payloads == 0);
+}
+
+static void test_disable_capture_discards_after_a_latch_and_still_fails_flush() {
+    std::printf("[ TEST ] disable_capture discards after a latch; flush still fails\n");
+    ring::RecordConsumer consumer(
+        std::make_shared<FailingSink>(),
+        ring::RecordFailurePolicy::kDisableCapture);
+    // Three descriptors queued ahead of their payloads, as the forward
+    // publishes them before the drain delivers.
+    consumer.push_descriptors({
+        descriptor("disable", "first"),
+        descriptor("disable", "second"),
+        descriptor("disable", "third"),
+    });
+
+    // The sink refuses the first: the consumer latches without throwing at
+    // the p2p worker, and the two descriptors still queued can never be
+    // stored, so they are dropped with it.
+    EXPECT(!throws_runtime_error(
+        [&] { consumer.consume_payload(byte_payload({1})); }));
+    // The forward keeps publishing and the drain keeps delivering: neither
+    // raises, and every one is counted.
+    EXPECT(!throws_runtime_error(
+        [&] { consumer.push_descriptor(descriptor("disable", "after")); }));
+    EXPECT(!throws_runtime_error([&] {
+        consumer.push_descriptors({descriptor("disable", "after-1"),
+                                   descriptor("disable", "after-2")});
+    }));
+    for (int index = 0; index < 4; ++index) {
+        EXPECT(!throws_runtime_error(
+            [&] { consumer.consume_payload(byte_payload({2})); }));
+    }
+
+    const ring::RecordConsumerSnapshot snapshot = consumer.snapshot();
+    EXPECT(snapshot.policy == ring::RecordFailurePolicy::kDisableCapture);
+    EXPECT(snapshot.failed);
+    EXPECT(snapshot.failure.find("injected sink failure") != std::string::npos);
+    EXPECT(snapshot.discarded_descriptors == 5);
+    // The refused payload plus the four delivered after the latch.
+    EXPECT(snapshot.discarded_payloads == 5);
+    EXPECT(consumer.pending_descriptors() == 0);
+
+    // The failure still surfaces at every checked completion.
+    EXPECT(throws_runtime_error([&] { consumer.rethrow_if_failed(); }));
+    EXPECT(throws_runtime_error(
+        [&] { consumer.wait_until_idle(std::chrono::milliseconds(10)); }));
+    EXPECT(throws_runtime_error([&] { consumer.finish(); }));
+}
+
+static void test_disable_capture_latches_association_and_worker_failures() {
+    std::printf("[ TEST ] disable_capture latches association and worker failures\n");
+    auto sink = std::make_shared<CapturingSink>();
+    ring::RecordConsumer orphan(
+        sink, ring::RecordFailurePolicy::kDisableCapture);
+    EXPECT(!throws_runtime_error(
+        [&] { orphan.consume_payload(byte_payload({1})); }));
+    EXPECT(orphan.snapshot().failed);
+    EXPECT(orphan.snapshot().failure.find("without an encoded descriptor") !=
+           std::string::npos);
+    EXPECT(orphan.snapshot().discarded_payloads == 1);
+    EXPECT(throws_runtime_error([&] { orphan.finish(); }));
+
+    ring::RecordConsumer worker(
+        sink, ring::RecordFailurePolicy::kDisableCapture);
+    worker.push_descriptor(descriptor("worker", "queued"));
+    worker.record_failure(std::make_exception_ptr(
+        std::runtime_error("injected worker failure")));
+    worker.push_descriptor(descriptor("worker", "after"));
+    EXPECT(!throws_runtime_error(
+        [&] { worker.consume_payload(byte_payload({1})); }));
+    const ring::RecordConsumerSnapshot snapshot = worker.snapshot();
+    EXPECT(snapshot.failure == "injected worker failure");
+    EXPECT(snapshot.discarded_descriptors == 2);
+    EXPECT(snapshot.discarded_payloads == 1);
+    EXPECT(sink->submitted.empty());
+    EXPECT(throws_runtime_error([&] { worker.rethrow_if_failed(); }));
+}
+
 int main() {
     setbuf(stdout, nullptr);
     std::printf("test_record_consumer\n");
@@ -199,6 +303,9 @@ int main() {
     test_zero_row_descriptor_consumes_without_sink_submission();
     test_exact_association_failures();
     test_submit_failure_precedes_durable_idle();
+    test_raise_policy_is_the_default_and_raises_at_the_producer();
+    test_disable_capture_discards_after_a_latch_and_still_fails_flush();
+    test_disable_capture_latches_association_and_worker_failures();
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
