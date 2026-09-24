@@ -264,6 +264,37 @@ def test_generate_greedy_with_monitoring_refuses_capture_storage():
     _assert_untouched(model, engine)
 
 
+@pytest.mark.parametrize("entry", [
+    "hf_attach_model", "base_attach_model", "attach_config",
+    "generate_with_monitoring", "generate_greedy_with_monitoring"])
+def test_every_hf_entry_point_refuses_when_capture_is_off(entry):
+    """storage_backend="none" turns capture off, so there is no ring for the
+    hooks, and each entry point says so before touching the model."""
+    engine = _SpyEngine("none")
+    model = _TinyHookedLM(engine)
+    input_ids, attention_mask = _inputs()
+
+    with pytest.raises(ConfigurationError, match="capture is off"):
+        if entry == "hf_attach_model":
+            HuggingFaceAdapter(engine, "tiny").attach_model(model)
+        elif entry == "base_attach_model":
+            _StubAdapter(engine, "tiny").attach_model(model)
+        elif entry == "attach_config":
+            attach_config(_StubAdapter(engine, "tiny"), model, DMIConfig(
+                observations=ObservationConfig(hooks=["resid_pre"])))
+        elif entry == "generate_with_monitoring":
+            generate_with_monitoring(model, input_ids,
+                                     attention_mask=attention_mask)
+        else:
+            generate_greedy_with_monitoring(
+                model, input_ids, attention_mask,
+                max_new_tokens=2, monitoring=True)
+
+    assert model.generate_calls == 0
+    assert model.forward_calls == 0
+    _assert_untouched(model, engine)
+
+
 @pytest.mark.parametrize("backend", ["auto", "in-memory"])
 def test_other_storage_backends_still_attach(backend):
     """Only 'persistent' and 'none' are refused; the rest attach as before."""
@@ -416,8 +447,8 @@ def test_commit_step_refuses_capture_storage_when_attach_skipped_super(
         via_attach_config):
     """The reviewer's reproduction: with the base attach bypassed, the step
     reserved and published into a ring with no host, and commit_step
-    returned RESERVED under storage_backend="capture"."""
-    engine = _SpyEngine("capture")
+    returned RESERVED under storage_backend="persistent"."""
+    engine = _SpyEngine("persistent")
     model = _TinyHookedLM(engine)
     adapter = _NoSuperAttachAdapter(engine, "tiny")
     if via_attach_config:

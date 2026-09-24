@@ -589,7 +589,7 @@ This holds while capture is disabled too, so disabling capture never turns
 a record-mode step into `SKIPPED`: `set_capture_enabled(False)` leaves the
 installed `HookPoint`s armed, and on a record ring they would fail inside the
 model forward with a native error that names neither the adaptor nor the cause.
-Under `storage_backend="capture"` it raises `ConfigurationError`, also before
+Under `storage_backend="persistent"` it raises `ConfigurationError`, also before
 reserving anything, for the reason `attach_model()` does. The check is repeated
 here because a step need not come through the base `attach_model()`: an adaptor
 may override it without calling `super()`, or arm its hooks with
