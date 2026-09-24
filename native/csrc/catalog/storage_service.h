@@ -103,6 +103,7 @@ struct StorageServiceSnapshot {
   uint64_t reconcile_passes = 0;
   uint64_t reconciled_packs = 0;  // found in the bucket, missing from the catalog
   uint64_t reconcile_skipped_objects = 0;  // not a valid DMI pack
+  uint64_t reconcile_head_errors = 0;  // could not be read; retried next pass
   uint64_t lease_renewals = 0;
   uint64_t swept_on_start = 0;  // ready packs Recover() found at start
   uint64_t pending_index = 0;   // uploaded packs awaiting a retried index

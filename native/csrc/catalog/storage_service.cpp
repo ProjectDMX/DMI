@@ -453,6 +453,7 @@ void CaptureStorageService::reconcile() {
   std::string token;
   uint64_t found = 0;
   uint64_t skipped = 0;
+  uint64_t head_errors = 0;
   do {
     dmi_store::ListResult page;
     std::string error;
@@ -487,6 +488,15 @@ void CaptureStorageService::reconcile() {
       const dmi_store::ListedObject& object = *packs[i];
       std::string head_error;
       const dmi_store::ObjectHead head = s3_.HeadObject(object.key, &head_error);
+      if (!head_error.empty()) {
+        // Unread, not foreign: the object may well be a pack, so the pass
+        // reports it rather than counting it as skipped. The next pass
+        // retries it.
+        ++head_errors;
+        record_error("reconcile: HEAD failed for " + object.key + ": " +
+                     head_error);
+        continue;
+      }
       const auto meta = [&head](const char* name) -> std::string {
         const auto it = head.metadata.find(name);
         return it == head.metadata.end() ? "" : it->second;
@@ -520,6 +530,7 @@ void CaptureStorageService::reconcile() {
   ++state_.reconcile_passes;
   state_.reconciled_packs += found;
   state_.reconcile_skipped_objects += skipped;
+  state_.reconcile_head_errors += head_errors;
 }
 
 void CaptureStorageService::keep_lease() {

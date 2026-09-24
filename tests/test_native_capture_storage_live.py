@@ -35,7 +35,7 @@ import pytest
 
 # Module-level so the fake-S3 fixture registers in this module.
 from tests.test_native_s3_client import (  # noqa: E402
-    ACCESS, BUCKET, REGION, SECRET, fake_s3,
+    ACCESS, BUCKET, REGION, SECRET, STATE, fake_s3,
 )
 
 REPO = Path(__file__).resolve().parents[1]
@@ -482,6 +482,34 @@ def test_a_pack_uploaded_but_never_indexed_is_reconciled_at_start(
         assert snapshot["reconciled_packs"] == 1, snapshot
         assert snapshot["reconcile_skipped_objects"] == 1, snapshot
         assert sorted(_read_all(config)) == sorted(tensors)
+
+
+def test_a_failed_head_is_an_error_not_a_foreign_object(fake_s3, tmp_path):
+    """A pack whose HEAD failed was counted as a foreign object, skipped
+    silently: nothing said the pass had missed a pack it could not read."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    # The fake S3 answers 403 for anything under fault/forbidden/. The list
+    # is not faulted, so the reconciler finds the pack and cannot HEAD it.
+    key = f"fault/forbidden/{uuid.uuid4()}.dmi-pack"
+    with STATE.lock:
+        STATE.objects[key] = {"body": b"x", "meta": {}, "content_type": "",
+                              "etag": '"0"'}
+    with _catalog() as (_client, catalog):
+        native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
+        native.update(spool_root=str(tmp_path / "spool"), holder="head-test",
+                      reconcile_prefix="fault/", s3_max_attempts=1)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()  # reconciles once
+        try:
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+
+    assert snapshot["reconcile_passes"] == 1, snapshot
+    assert snapshot["reconcile_skipped_objects"] == 0, snapshot
+    assert snapshot["reconcile_head_errors"] == 1, snapshot
+    assert "HEAD" in snapshot["last_error"] and key in snapshot["last_error"]
 
 
 def test_one_publisher_per_catalog(fake_s3, tmp_path):

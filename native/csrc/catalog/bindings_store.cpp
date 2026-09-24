@@ -100,6 +100,7 @@ py::dict snapshot_dict(const dc::StorageServiceSnapshot& s) {
   out["reconcile_passes"] = s.reconcile_passes;
   out["reconciled_packs"] = s.reconciled_packs;
   out["reconcile_skipped_objects"] = s.reconcile_skipped_objects;
+  out["reconcile_head_errors"] = s.reconcile_head_errors;
   out["lease_renewals"] = s.lease_renewals;
   out["swept_on_start"] = s.swept_on_start;
   out["pending_index"] = s.pending_index;
