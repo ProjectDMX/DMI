@@ -598,6 +598,42 @@ def test_a_pack_too_big_to_index_is_set_aside_and_the_rest_still_index(
         assert sorted(_read_all(config)) == sorted(small)
 
 
+def test_a_batch_over_the_budget_splits_until_every_pack_indexes(
+        fake_s3, tmp_path):
+    """Packs that each fit the indexer's batch budget can still overflow it
+    together; the service halves such a batch until every half fits, and
+    sets nothing aside."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    tensors = _stage(spool_root, range(20), records_per_pack=2)
+    assert len(_ready(spool_root)) == 10
+    with _catalog() as (_client, catalog):
+        config = _storage_config(fake_s3, catalog.table_prefix)
+        native = config._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="split-test",
+            poll_interval_ns=50_000_000, reconcile_on_start=False,
+            # A two-record pack renders ~720 bytes: two fit, ten do not.
+            indexer_max_estimated_bytes=2000)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            assert service.flush(30.0)
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+
+        assert _ready(spool_root) == []
+        assert snapshot["uploaded_packs"] == 10, snapshot
+        assert snapshot["indexed_packs"] == 10, snapshot
+        assert snapshot["indexed_rows"] == 20, snapshot
+        assert snapshot["batch_splits"] > 0, snapshot
+        assert snapshot["rejected_packs"] == 0, snapshot
+        assert snapshot["pending_index"] == 0, snapshot
+        assert sorted(_read_all(config)) == sorted(tensors)
+
+
 def test_flush_returns_on_time_when_the_catalog_stops_answering(
         fake_s3, tmp_path):
     """flush(timeout) waited for the cycle lock with no deadline, and the
