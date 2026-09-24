@@ -146,9 +146,10 @@ setting them should expect `ValueError` rather than a silent choice.
 `capture_sink_config` is read only when `storage_backend` is `"capture"`; see
 `docs/capture-storage-design.md` for the writer it selects. With
 `capture_storage_config` as well, the engine runs the native storage service
-in-process: from `create_record_runtime` until `close`, a C++ thread uploads
-each pack the sink stages to the object store and indexes it into the
-ClickHouse catalog, and `flush_and_wait` returns only once every record
+in-process: from `create_record_runtime` until `close`, or until
+`enable_ring_transport` replaces the record ring (both seal the sink and drain
+the service before stopping it), a C++ thread uploads each pack the sink
+stages to the object store and indexes it into the ClickHouse catalog, and `flush_and_wait` returns only once every record
 captured before it is queryable there (`TimeoutError` otherwise, naming the
 last upload or index error). `NativeCaptureReader` reads it back. No adapter
 drives this path yet: the HF, vLLM and Megatron integrations never create a

@@ -84,6 +84,8 @@ The capture path never makes the hook wait on either durable write, and it
 never computes summaries. The two writes are not coordinated in one step: a
 pack is uploaded, then indexed, and a pack that is uploaded but not yet
 indexed is retried in-process and reconciled from the bucket after a crash.
+While such a pack is owed, the service uploads nothing new, so a catalog
+outage leaves later packs in the durable spool.
 Where the indexer runs is a deployment choice. With
 `MonitoringConfig.capture_storage_config` the capture process itself runs the
 native storage service (`dmi.storage.native_capture`), so it DOES run a
