@@ -431,3 +431,116 @@ def test_replacing_a_record_ring_drains_and_stops_the_service(
     engine.create_record_runtime(_record_format())
     assert len(services) == 2
     assert engine._capture_storage is not None
+
+
+# --- the publisher lease knobs -------------------------------------------------
+
+
+def test_lease_knobs_default_to_a_fifteen_second_lease():
+    config = _storage_config()
+    assert config.lease_ttl_s == 15.0
+    assert config.publish_timeout_s == 5.0
+    assert config.clock_skew_s == 0.0
+    # None waits out a predecessor for the TTL plus the publish timeout.
+    assert config.start_lease_wait_s is None
+
+
+@pytest.mark.parametrize("ttl, publish, skew", [
+    (5.0, 5.0, 0.0),    # no margin at all
+    (5.09, 5.0, 0.0),   # under the 0.1 s the renewed lease needs
+    (6.0, 5.0, 0.95),   # the skew bound spends the rest
+    (3.0, 4.0, 0.0),    # the statement cap outlives the lease
+])
+def test_the_lease_must_outlast_the_publish_fence(ttl, publish, skew):
+    # The native writer's rule, checked here so a bad pairing fails at
+    # construction rather than at start(): the TTL must exceed the publish
+    # timeout plus the skew bound by at least 0.1 s.
+    with pytest.raises(ValueError, match="lease_ttl_s"):
+        _storage_config(lease_ttl_s=ttl, publish_timeout_s=publish,
+                        clock_skew_s=skew)
+
+
+@pytest.mark.parametrize("ttl, publish, skew", [
+    (5.1, 5.0, 0.0), (3.0, 1.0, 0.0), (7.0, 5.0, 1.5), (2, 1, 0)])
+def test_a_lease_that_outlasts_the_fence_is_accepted(ttl, publish, skew):
+    config = _storage_config(lease_ttl_s=ttl, publish_timeout_s=publish,
+                             clock_skew_s=skew)
+    assert config.lease_ttl_s == ttl
+
+
+@pytest.mark.parametrize("publish", [1.5, 0.5, 4.999])
+def test_the_publish_timeout_is_whole_seconds(publish):
+    # The native writer sends it as max_execution_time in whole seconds; a
+    # fraction would truncate, and 0 is no limit at all.
+    with pytest.raises(ValueError, match="publish_timeout_s must be a whole"):
+        _storage_config(lease_ttl_s=30.0, publish_timeout_s=publish)
+
+
+@pytest.mark.parametrize("name, value", [
+    ("lease_ttl_s", 0.0), ("lease_ttl_s", -3.0), ("publish_timeout_s", 0),
+    ("publish_timeout_s", -1.0), ("clock_skew_s", -0.5),
+    ("start_lease_wait_s", -1.0)])
+def test_lease_knobs_refuse_out_of_range_values(name, value):
+    with pytest.raises(ValueError, match=name):
+        _storage_config(**{name: value})
+
+
+@pytest.mark.parametrize("name", [
+    "lease_ttl_s", "publish_timeout_s", "clock_skew_s", "start_lease_wait_s"])
+@pytest.mark.parametrize("value", [float("inf"), float("nan")])
+def test_lease_knobs_must_be_finite(name, value):
+    with pytest.raises(ValueError, match=f"{name} must be finite"):
+        _storage_config(**{name: value})
+
+
+def test_a_zero_start_wait_is_accepted():
+    assert _storage_config(start_lease_wait_s=0.0).start_lease_wait_s == 0.0
+
+
+def test_the_service_gets_the_lease_knobs_in_nanoseconds(monkeypatch, tmp_path):
+    engine, _events, services = _capture_engine(monkeypatch, tmp_path)
+
+    engine.create_record_runtime(_record_format())
+
+    config = services[0].config
+    assert config["lease_ttl_ns"] == 15_000_000_000
+    assert config["publish_timeout_ns"] == 5_000_000_000
+    assert config["clock_skew_ns"] == 0
+    assert config["start_lease_wait_ns"] == 20_000_000_000
+
+
+def test_explicit_lease_knobs_reach_the_service(monkeypatch, tmp_path):
+    engine, _events, services = _capture_engine(monkeypatch, tmp_path)
+    engine._capture_storage_config = _storage_config(
+        lease_ttl_s=3, publish_timeout_s=1.0, clock_skew_s=0.25,
+        start_lease_wait_s=0.5)
+
+    engine.create_record_runtime(_record_format())
+
+    config = services[0].config
+    assert config["lease_ttl_ns"] == 3_000_000_000
+    assert config["publish_timeout_ns"] == 1_000_000_000
+    assert config["clock_skew_ns"] == 250_000_000
+    assert config["start_lease_wait_ns"] == 500_000_000
+    for name in ("lease_ttl_ns", "publish_timeout_ns", "clock_skew_ns",
+                 "start_lease_wait_ns"):
+        assert type(config[name]) is int, name
+
+
+def test_the_reader_is_not_handed_the_lease_knobs(monkeypatch):
+    # A reader takes no lease; the knobs are the service's alone.
+    from dmi.storage import native_capture
+
+    seen = {}
+
+    class _Reader:
+        def __init__(self, config):
+            seen.update(config)
+
+    monkeypatch.setattr(
+        native_capture, "_load_native_store_extension",
+        lambda: SimpleNamespace(CaptureReader=_Reader, SEARCH_ITEM_COLUMNS=()))
+    native_capture.NativeCaptureReader(_storage_config(lease_ttl_s=3.0,
+                                                       publish_timeout_s=1))
+    assert not {"lease_ttl_ns", "publish_timeout_ns", "clock_skew_ns",
+                "start_lease_wait_ns"} & set(seen)
