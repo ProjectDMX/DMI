@@ -108,8 +108,12 @@ std::map<std::string, std::string> deciding_read() {
   return {{"select_sequential_consistency", "1"}};
 }
 
-ClickHouseClient::ClickHouseClient(std::string host, uint16_t port)
-    : host_(std::move(host)), port_(port) {
+ClickHouseClient::ClickHouseClient(std::string host, uint16_t port,
+                                   ClickHouseTimeouts timeouts)
+    : host_(std::move(host)), port_(port), timeouts_(timeouts) {
+  if (!(timeouts_.connect_s > 0) || !(timeouts_.request_s > 0)) {
+    throw ClickHouseError("clickhouse timeouts must be positive");
+  }
   // Process-lifetime, not per-object: the matching curl_global_cleanup used
   // to run in the destructor below, which tore libcurl down for the WHOLE
   // process while the uploader's worker threads were inside
@@ -151,6 +155,12 @@ std::vector<Row> ClickHouseClient::execute(
                    static_cast<curl_off_t>(statement.size()));
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+  // NOSIGNAL: timeouts must not use SIGALRM in a multi-threaded process.
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
+                   static_cast<long>(timeouts_.connect_s * 1000));
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
+                   static_cast<long>(timeouts_.request_s * 1000));
   const CURLcode code = curl_easy_perform(curl);
   long status = 0;
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);

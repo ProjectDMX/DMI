@@ -72,6 +72,11 @@ std::string filter_hash(const SearchFilters& filters);
 // until this declaration put it on the CPU gate.
 std::vector<std::string> parse_tsv_tuple(const std::string& text);
 
+// The column names of one SearchPage item, in item order: the five sort-key
+// columns, then the resolved columns in projection order. An item is not in
+// projection order, so a consumer naming its fields needs this.
+std::vector<std::string> search_item_columns();
+
 class NativeCaptureCatalog {
  public:
   NativeCaptureCatalog(std::shared_ptr<const ClickHouseClient> client,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import logging
+import time
 from typing import Any, Optional, Sequence, TYPE_CHECKING, TypeVar
 
 from .config import MonitoringConfig
@@ -14,6 +16,7 @@ if TYPE_CHECKING:
 
 MetadataT = TypeVar("MetadataT")
 
+_LOG = logging.getLogger(__name__)
 
 DEFAULT_DRAIN_FLUSH_TIMEOUT_US = 0
 
@@ -127,6 +130,18 @@ class MonitoringEngine:
             if not isinstance(self._capture_sink_config, NativeSinkConfig):
                 raise TypeError(
                     "config.capture_sink_config must be a NativeSinkConfig")
+        self._capture_storage_config = getattr(
+            config, "capture_storage_config", None)
+        if self._capture_storage_config is not None:
+            from .storage.native_capture import NativeCaptureStorageConfig
+
+            if not isinstance(
+                self._capture_storage_config, NativeCaptureStorageConfig
+            ):
+                raise TypeError("config.capture_storage_config must be a "
+                                "NativeCaptureStorageConfig")
+        # The running storage service, while a record runtime is attached.
+        self._capture_storage: Optional[Any] = None
         host_configured = host_engine is not None or db_config is not None
         if self._storage_backend == "native" and not host_configured:
             raise ValueError(
@@ -282,7 +297,7 @@ class MonitoringEngine:
         if self._record_mode:
             raise RuntimeError("A record runtime is already active")
 
-        from .records import RecordFormat, RecordRuntime, RecordSchema
+        from .records import RecordFormat, RecordSchema
 
         if not isinstance(record_format, RecordFormat):
             raise TypeError("record_format must implement RecordFormat")
@@ -290,6 +305,47 @@ class MonitoringEngine:
         if not isinstance(record_schema, RecordSchema):
             raise TypeError("record_format.schema must be a RecordSchema")
 
+        # The storage service starts BEFORE the sink it drains opens the
+        # spool: its start sweeps a crashed sink's stale .open files, which
+        # is safe only while nothing writes there. An explicit record_sink
+        # may already hold the spool open, so it is left unswept.
+        storage = self._start_capture_storage(sweep_spool=record_sink is None)
+        try:
+            runtime = self._attach_record_runtime(
+                record_format, record_schema, record_sink)
+        except BaseException:
+            if storage is not None:
+                self._capture_storage = None
+                storage.stop()
+            raise
+        return runtime
+
+    def _start_capture_storage(self, *, sweep_spool: bool) -> Optional[Any]:
+        config = self._capture_storage_config
+        if config is None or self._storage_backend != "capture":
+            return None
+        from .storage.native_capture import NativeCaptureStorage
+
+        sink_config = self._capture_sink_config
+        storage = NativeCaptureStorage(
+            config,
+            spool_root=sink_config.spool_root,
+            spool_max_bytes=sink_config.spool_max_bytes,
+            sweep_spool=sweep_spool,
+        )
+        storage.start()
+        self._capture_storage = storage
+        return storage
+
+    def _attach_record_runtime(
+        self,
+        record_format: "RecordFormat[MetadataT]",
+        record_schema: Any,
+        record_sink: Optional[Any],
+    ) -> "RecordRuntime[MetadataT]":
+        from .records import RecordRuntime
+
+        ring_config = self._ring_config
         # D4's flip: the capture backend's default writer is the native
         # pack sink, built from the config's bounds. An explicit
         # record_sink overrides it — the reference sink is the documented
@@ -381,7 +437,13 @@ class MonitoringEngine:
             raise RuntimeError("Ring transport is not enabled")
         if not self._record_mode:
             raise RuntimeError("Record runtime is not active")
+        deadline = time.monotonic() + float(timeout_s)
         transport.flush_records_and_wait(float(timeout_s))
+        # The sink's boundary is a staged pack; with the storage service it
+        # is a pack in the catalog. Its flush runs one cycle even at zero.
+        storage = self._capture_storage
+        if storage is not None:
+            storage.flush(max(0.0, deadline - time.monotonic()))
 
     @staticmethod
     def _make_default_ring_config(
@@ -431,6 +493,16 @@ class MonitoringEngine:
             # replacement starts capture-enabled without an extra startup sync.
             if not self.capture_enabled:
                 self.set_capture_enabled(True)
+            # Replacing a record ring ends the runtime the storage service
+            # drains, so retire it as close() does: seal the sink, then drain
+            # and stop the service. Left running, it would keep the catalog
+            # lease the next create_record_runtime's service must take.
+            storage = self._capture_storage if old_record_mode else None
+            drain_deadline = None if storage is None else (
+                time.monotonic()
+                + self._capture_storage_config.close_flush_timeout_s)
+            if storage is not None:
+                self._seal_capture_sink(drain_deadline)
             try:
                 ring_engine = getattr(self, "_ring_engine", None)
                 if ring_engine is not None:
@@ -446,6 +518,9 @@ class MonitoringEngine:
                 pass
             self._ring_transport = None
             self._ring_engine = None
+            self._record_mode = False
+            if storage is not None:
+                self._retire_capture_storage(storage, drain_deadline)
 
         # Pass the DMXHostEngine C++ object directly; RingEngine builds a
         # SubmitFn that calls submit_direct without touching Python/GIL.
@@ -485,9 +560,43 @@ class MonitoringEngine:
         self._auto_batch_group_id += 1
         return gid
 
+    def _seal_capture_sink(self, deadline: float) -> None:
+        """Flush the record sink before its ring stops.
+
+        Stopping the ring releases the sink WITHOUT flushing it, so the
+        records of its open pack would still be in memory while the service
+        drains a spool that does not hold them yet.
+        """
+        try:
+            self._ring_transport.flush_records_and_wait(
+                max(0.0, deadline - time.monotonic()))
+        except Exception as exc:
+            _LOG.warning("capture sink did not flush: %s", exc)
+
+    def _retire_capture_storage(self, storage: Any, deadline: float) -> None:
+        """Drain the storage service until ``deadline``, then stop it."""
+        if self._capture_storage is not storage:
+            return
+        self._capture_storage = None
+        # Best effort: once the sink is sealed, a pack that does not reach
+        # the catalog here is still in the spool or the bucket, and the next
+        # start uploads or reconciles it. flush_and_wait is the boundary
+        # that reports.
+        try:
+            storage.flush(max(0.0, deadline - time.monotonic()))
+        except Exception as exc:
+            _LOG.warning("capture storage did not drain: %s", exc)
+        finally:
+            storage.stop()
+
     def close(self) -> None:
         """Tear down backend resources."""
 
+        storage = self._capture_storage
+        # One budget for the whole capture drain: sealing the sink's open
+        # pack, then getting everything staged into the catalog.
+        drain_deadline = None if storage is None else (
+            time.monotonic() + self._capture_storage_config.close_flush_timeout_s)
         if self._ring_transport is not None:
             record_mode = self._record_mode
             stopped = False
@@ -499,6 +608,8 @@ class MonitoringEngine:
                     self.set_capture_enabled(True)
                 except Exception:
                     pass
+            if record_mode and storage is not None:
+                self._seal_capture_sink(drain_deadline)
             try:
                 ring_engine = getattr(self, "_ring_engine", None)
                 if ring_engine is not None:
@@ -518,6 +629,9 @@ class MonitoringEngine:
             self._ring_transport = None
             self._ring_engine = None
             self._record_mode = False
+
+        if storage is not None:
+            self._retire_capture_storage(storage, drain_deadline)
 
         if self._host_engine is not None:
             try:

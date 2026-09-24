@@ -134,14 +134,30 @@ schedule.should_capture_step(
 
 The predicates apply warmup, then offset, then stride. Step selection also
 honors `capture_prefill`/`capture_decode`; an unknown phase raises `ValueError`.
-`MonitoringConfig` carries this schedule plus two storage fields:
-`storage_backend` (`"auto" | "native" | "capture" | "none"`) and
-`capture_sink_config` (a `NativeSinkConfig`, or `None`). Both are acted on by
+`MonitoringConfig` carries this schedule plus three storage fields:
+`storage_backend` (`"auto" | "native" | "capture" | "none"`),
+`capture_sink_config` (a `NativeSinkConfig`, or `None`) and
+`capture_storage_config` (a `NativeCaptureStorageConfig` from
+`dmi.storage.native_capture`, or `None`). All are acted on by
 `MonitoringEngine`, and some combinations are refused at construction --
 `storage_backend="native"` without a host engine, or `"capture"`/`"none"` with
-one -- so a caller setting them should expect `ValueError` rather than a
-silent choice. `capture_sink_config` is read only when `storage_backend` is
-`"capture"`; see `docs/capture-storage-design.md` for the writer it selects.
+one, or `capture_storage_config` without `capture_sink_config` -- so a caller
+setting them should expect `ValueError` rather than a silent choice.
+`capture_sink_config` is read only when `storage_backend` is `"capture"`; see
+`docs/capture-storage-design.md` for the writer it selects. With
+`capture_storage_config` as well, the engine runs the native storage service
+in-process: from `create_record_runtime` until `close`, or until
+`enable_ring_transport` replaces the record ring (both seal the sink and drain
+the service before stopping it), a C++ thread uploads each pack the sink
+stages to the object store and indexes it into the ClickHouse catalog, and `flush_and_wait` returns only once every record
+captured before it is queryable there (`TimeoutError` otherwise, naming the
+last upload or index error). `NativeCaptureReader` reads it back. No adapter
+drives this path yet: the HF, vLLM and Megatron integrations never create a
+capture record runtime, so it is reached only by a caller that builds the
+record runtime and its hook points itself, as
+`tests/test_native_capture_storage_gpu_e2e.py` does. The catalog
+takes one publisher per `(database, table_prefix)`, so a second engine on the
+same catalog is refused at `create_record_runtime`.
 The schedule's default factory creates a distinct `CaptureSchedule` for each
 config instance.
 `MonitoringEngine` stores the config, while concrete adaptors decide whether

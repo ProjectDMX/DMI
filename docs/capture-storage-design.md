@@ -80,9 +80,19 @@ bounded slabs -> pack assembler -> direct upload or NVMe spool
        metadata-first query -> estimate -> selective range hydration
 ```
 
-The capture host does not run a ClickHouse client, compute summaries, or
-coordinate two durable writes. Object-created notifications reduce indexing
-latency, while periodic listing and reconciliation provide completeness.
+The capture path never makes the hook wait on either durable write, and it
+never computes summaries. The two writes are not coordinated in one step: a
+pack is uploaded, then indexed, and a pack that is uploaded but not yet
+indexed is retried in-process and reconciled from the bucket after a crash.
+While such a pack is owed, the service uploads nothing new, so a catalog
+outage leaves later packs in the durable spool.
+Where the indexer runs is a deployment choice. With
+`MonitoringConfig.capture_storage_config` the capture process itself runs the
+native storage service (`dmi.storage.native_capture`), so it DOES run a
+ClickHouse client, off the hook path, on a background thread. The catalog
+admits one publisher at a time per `(database, table_prefix)`, so that shape
+serves one capture process per catalog; multi-rank deployments need an
+upload-only role with a single publisher, which is planned but not built.
 
 ### The other sink, and how one is chosen
 

@@ -52,6 +52,8 @@ const char* error_kind(CatalogError::Kind kind) {
     case CatalogError::Kind::kQuarantined: return "WriterQuarantinedError";
     case CatalogError::Kind::kSchema: return "CatalogSchemaVersionError";
     case CatalogError::Kind::kValue: return "ValueError";
+    // The Python oracle raises ValueError for the same refusal.
+    case CatalogError::Kind::kBatchTooLarge: return "ValueError";
   }
   return "CatalogError";
 }
