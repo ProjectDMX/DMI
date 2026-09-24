@@ -195,14 +195,20 @@ static void test_ring_geometry_requires_payload_alignment() {
     EXPECT(staging.capacity() % ring::PAYLOAD_ALIGN == 0);
 }
 
-static void test_native_reservation_uses_transport_alignment() {
-    banner("native reservation accepts only aligned step totals");
+static ring_py::RingConfig make_py_config() {
     ring_py::RingConfig cfg;
     cfg.task_ring_entries = 16;
     cfg.payload_ring_bytes = 4096;
     cfg.pinned_staging_bytes = 4096;
     cfg.drain_poll_timeout_us = 100;
-    ring_py::RingEnginePy engine(cfg, std::shared_ptr<ring::RecordSink>{});
+    return cfg;
+}
+
+static void test_native_reservation_uses_transport_alignment() {
+    banner("native reservation accepts only aligned step totals");
+    // A legacy ring: prepare_step and reserve_one are its reservations, and
+    // a record ring refuses both (next test).
+    ring_py::RingEnginePy engine(make_py_config(), ring_py::SubmitFn{});
     engine.init();
 
     bool rejected = false;
@@ -216,6 +222,59 @@ static void test_native_reservation_uses_transport_alignment() {
     const uint64_t before = engine.available_capacity();
     engine.reserve_one(17);
     EXPECT(before - engine.available_capacity() == 32);
+}
+
+template <typename Fn>
+static bool refuses_as_legacy_on_record_ring(Fn&& call) {
+    try {
+        call();
+    } catch (const std::logic_error& error) {
+        return std::strstr(error.what(), "record ring") != nullptr;
+    }
+    return false;
+}
+
+static void test_record_ring_refuses_every_legacy_producer_entry() {
+    banner("record ring refuses legacy reservations, producers and CPU submits");
+    ring_py::RingEnginePy engine(
+        make_py_config(), std::shared_ptr<ring::RecordSink>{});
+    engine.init();
+    const uint64_t capacity = engine.available_capacity();
+
+    // A legacy reservation would advance the CPU heads with no record
+    // publication behind it: the space is never reclaimed, and every later
+    // reserve_record's reclaim sequence is off by the phantom task count.
+    EXPECT(refuses_as_legacy_on_record_ring(
+        [&] { (void)engine.prepare_step(32, 1); }));
+    EXPECT(refuses_as_legacy_on_record_ring([&] { engine.reserve_one(32); }));
+    EXPECT(engine.available_capacity() == capacity);
+
+    // A legacy producer publishes a payload with no record descriptor; the
+    // record consumer pairs it with the NEXT record's descriptor, or fails
+    // the ring when none is queued. Real device buffers, so that a missing
+    // guard shows up as a failed EXPECT rather than a faulting launch.
+    uint8_t* source = nullptr;
+    int64_t* counts = nullptr;
+    CUDA_CHECK(cudaMalloc(&source, 32));
+    CUDA_CHECK(cudaMalloc(&counts, 2 * sizeof(int64_t)));
+    const int64_t host_counts[2] = {1, 1};
+    CUDA_CHECK(cudaMemcpy(counts, host_counts, sizeof(host_counts),
+                          cudaMemcpyHostToDevice));
+    const auto src = reinterpret_cast<uint64_t>(source);
+    const auto cnt = reinterpret_cast<uint64_t>(counts);
+    EXPECT(refuses_as_legacy_on_record_ring(
+        [&] { engine.hook_no_notify(src, 32, 0, 0); }));
+    EXPECT(refuses_as_legacy_on_record_ring(
+        [&] { engine.hook_no_notify_prefix(src, 32, cnt, 16, 0, 0); }));
+    EXPECT(refuses_as_legacy_on_record_ring(
+        [&] { engine.hook_no_notify_chunked(src, 32, cnt, 2, 0, 0); }));
+    EXPECT(refuses_as_legacy_on_record_ring([&] {
+        engine.submit_cpu_direct(at::zeros({32}, at::kByte), 32);
+    }));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT(engine.available_capacity() == capacity);
+    CUDA_CHECK(cudaFree(counts));
+    CUDA_CHECK(cudaFree(source));
 }
 
 static void test_static_force_flush() {
@@ -725,6 +784,7 @@ int main() {
     std::printf("test_ring_engine (current drain pipeline)\n");
     test_ring_geometry_requires_payload_alignment();
     test_native_reservation_uses_transport_alignment();
+    test_record_ring_refuses_every_legacy_producer_entry();
     test_static_force_flush();
     test_prefix_force_flush();
     test_chunked_short_then_static_preserves_payload_offset();

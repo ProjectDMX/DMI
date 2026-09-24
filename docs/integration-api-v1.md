@@ -155,7 +155,9 @@ last upload or index error). `NativeCaptureReader` reads it back. No adapter
 drives this path yet: the HF, vLLM and Megatron integrations never create a
 capture record runtime, so it is reached only by a caller that builds the
 record runtime and its hook points itself, as
-`tests/test_native_capture_storage_gpu_e2e.py` does. The catalog
+`tests/test_native_capture_storage_gpu_e2e.py` does, and the HF adaptor
+refuses the capture backend with `ConfigurationError` rather than generating
+with nothing stored. The catalog
 takes one publisher per `(database, table_prefix)`, so a second engine on the
 same catalog is refused at `create_record_runtime`.
 The schedule's default factory creates a distinct `CaptureSchedule` for each
@@ -482,7 +484,12 @@ or non-owning PP/TP hooks, installs ring fields on remaining HookPoints, and
 publishes the selected inventory. It mutates HookPoints and is not
 transactional; call it before graph capture. An unknown
 selection raises `ValueError`, and an executable inventory containing
-`module=None` raises `RuntimeError`.
+`module=None` raises `RuntimeError`. Under `storage_backend="capture"` it raises
+`dmi.configuration.ConfigurationError`, as do the HF entry points built on it,
+`generate_with_monitoring()` and `generate_greedy_with_monitoring()`: no adaptor
+drives the capture storage path yet, and attaching would install hooks whose
+captures nothing stores. `ConfigurationError` is not a `ValueError`; catch it
+by name.
 
 One engine supports one active model inventory. Attaching a second adaptor
 invalidates the first inventory while the first model's HookPoints remain
@@ -492,8 +499,9 @@ and producers.
 #### `before_forward(*framework_state)`
 
 Call this once immediately before the corresponding model forward. It returns
-early when capture is disabled or `build_step_context()` returns `None`.
-Otherwise it:
+early when capture is disabled or `build_step_context()` returns `None`. On an
+engine in record mode it raises `RuntimeError` instead, even while capture is
+disabled, as `commit_step()` does. Otherwise it:
 
 1. builds a `StepContext`;
 2. calls `plan_step()` to compute each firing hook's shape and 16-byte-aligned
@@ -550,6 +558,20 @@ once. Its result is:
 | `RESERVED` | 0 | The step was reserved in current ring capacity. |
 | `FLUSHED` | 1 | Existing ring work was flushed before the step was reserved. |
 | `OVERSIZED` | 2 | The complete step cannot fit; per-hook eager fallback is active. |
+
+On an engine in record mode (after `create_record_runtime()`), `commit_step()`
+raises `RuntimeError` before reserving anything: a record ring cannot store
+the legacy step protocol, and an adaptor attached before the switch still
+holds the stopped legacy ring, which would otherwise accept the step silently.
+This holds while capture is disabled too, so disabling capture never turns
+a record-mode step into `SKIPPED`: `set_capture_enabled(False)` leaves the
+installed `HookPoint`s armed, and on a record ring they would fail inside the
+model forward with a native error that names neither the adaptor nor the cause.
+Under `storage_backend="capture"` it raises `ConfigurationError`, also before
+reserving anything, for the reason `attach_model()` does. The check is repeated
+here because a step need not come through the base `attach_model()`: an adaptor
+may override it without calling `super()`, or arm its hooks with
+`install_ring_hooks()` and commit steps directly.
 
 For `SKIPPED` caused only by zero computable hooks, `commit_step()` still
 publishes the step context; the metadata loop emits no hook records. A supplied
