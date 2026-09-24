@@ -147,6 +147,22 @@ dc::Selection selection_from(const py::dict& d) {
   return s;
 }
 
+// Destroys a StorageService without the GIL. The destructor stops the
+// service, joining a cycle that may be waiting on the catalog or the object
+// store; holding the GIL through that froze every other Python thread when
+// a running service was collected without stop().
+struct DeleteWithoutGil {
+  void operator()(dc::CaptureStorageService* service) const {
+    if (PyGILState_Check()) {
+      py::gil_scoped_release release;
+      delete service;
+    } else {
+      delete service;
+    }
+  }
+};
+using ServiceHolder = std::unique_ptr<dc::CaptureStorageService, DeleteWithoutGil>;
+
 // The catalog and store handles a reader needs, owned together.
 class CaptureReader {
  public:
@@ -235,9 +251,9 @@ PYBIND11_MODULE(_dmi_native_store, m) {
   m.doc() = "Native capture storage path: storage service and catalog reader.";
   m.attr("SEARCH_ITEM_COLUMNS") = py::tuple(py::cast(dc::search_item_columns()));
 
-  py::class_<dc::CaptureStorageService>(m, "StorageService")
+  py::class_<dc::CaptureStorageService, ServiceHolder>(m, "StorageService")
       .def(py::init([](const py::dict& d) {
-             return std::make_unique<dc::CaptureStorageService>(service_config(d));
+             return ServiceHolder(new dc::CaptureStorageService(service_config(d)));
            }),
            py::arg("config"))
       .def("start", &dc::CaptureStorageService::start,

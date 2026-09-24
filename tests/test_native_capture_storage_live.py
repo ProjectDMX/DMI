@@ -639,6 +639,56 @@ def test_flush_returns_on_time_when_the_catalog_stops_answering(
             service.stop()
 
 
+def test_dropping_a_running_service_does_not_hold_the_gil(fake_s3, tmp_path):
+    """A service collected without stop() stops itself in its destructor,
+    joining a cycle that may be waiting on the catalog. That ran with the
+    GIL held, so every other Python thread froze until the join returned."""
+    import gc
+
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    ticks = []
+    done = threading.Event()
+
+    def _tick():
+        while not done.is_set():
+            ticks.append(time.monotonic())
+            time.sleep(0.01)
+
+    with _catalog() as (_client, catalog):
+        native = _storage_config(
+            fake_s3, catalog.table_prefix,
+            clickhouse_port=switch.port)._native_dict()
+        native.update(spool_root=str(spool_root), holder="gil-test",
+                      poll_interval_ns=20_000_000, reconcile_on_start=False,
+                      clickhouse_request_timeout_s=2.0)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        ticker = threading.Thread(target=_tick, daemon=True)
+        try:
+            switch.stall()
+            _stage(spool_root, range(2))
+            time.sleep(0.5)  # the background cycle is now waiting on ClickHouse
+            ticker.start()
+            time.sleep(0.1)
+            before = len(ticks)
+            started = time.monotonic()
+            del service
+            gc.collect()
+            elapsed = time.monotonic() - started
+            during = len(ticks) - before
+        finally:
+            done.set()
+            ticker.join(timeout=10.0)
+            switch.close()
+
+    assert elapsed > 0.5, elapsed  # destruction really waited on the cycle
+    # A thread ticking every 10 ms, free to run, ticks dozens of times.
+    assert during >= 0.3 * elapsed / 0.01, (during, elapsed)
+
+
 def test_the_lease_holds_through_an_object_store_outage(tmp_path):
     """The lease was renewed only inside a cycle, and failed cycles back off
     up to max_backoff -- past the lease TTL. With the object store down and
