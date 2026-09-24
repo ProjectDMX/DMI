@@ -100,6 +100,14 @@ bool RingTypesRegistered() {
          py::detail::get_type_info(typeid(ring::RecordSinkLease)) != nullptr;
 }
 
+// RecordSink.admission_bound_s: the sink's admission bound in seconds, or
+// None when it has none.
+std::optional<double> AdmissionBoundSeconds(const ring::RecordSink& sink) {
+  const auto bound = sink.admission_bound();
+  if (!bound) return std::nullopt;
+  return std::chrono::duration<double>(*bound).count();
+}
+
 void EnsureRingTypes(py::module_& m) {
   if (RingTypesRegistered()) return;
   // The main backend lives beside the dmi package and is loaded from its
@@ -123,7 +131,8 @@ void EnsureRingTypes(py::module_& m) {
       .def("_acquire_engine",
            [](std::shared_ptr<ring::RecordSink> sink) {
              return ring::RecordSinkLease::acquire(std::move(sink));
-           });
+           })
+      .def_property_readonly("admission_bound_s", &AdmissionBoundSeconds);
   m.attr("RING_TYPES_ARE_STANDINS") = true;
 }
 

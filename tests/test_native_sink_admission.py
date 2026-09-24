@@ -192,3 +192,82 @@ def test_a_burst_four_times_the_queue_is_admitted_under_the_default(
     assert snapshot["timed_out_records"] == 0, snapshot
     assert snapshot["rejected_closed_records"] == 0, snapshot
     del lease
+
+
+# --- the admission bound a record ring reads ---------------------------------
+
+
+@pytest.mark.parametrize("fields, bound", [
+    ({}, 0.0),  # the C++ default, drop_newest: refused at once
+    ({"overload": "block", "admission_timeout_s": 0.25}, 0.25),
+    ({"overload": "block"}, None),  # waits without bound
+])
+def test_the_sink_reports_its_admission_bound(native_sink_module, tmp_path,
+                                              fields, bound):
+    """A record ring with a stall budget waits for one in-flight submit
+    after the budget is spent; it reads this bound to refuse a sink whose
+    admission has none."""
+    sink = native_sink_module.NativePackSink(
+        spool_root=str(tmp_path), layout=LAYOUT, **fields)
+    assert sink.admission_bound_s == bound
+
+
+# --- a record lost after admission -------------------------------------------
+
+
+def _one_row_envelope(index: int, nbytes: int):
+    import torch
+
+    mapping = _metadata(index)
+    mapping["shape"] = [nbytes // 4]
+    rows = [{"metadata_json": json.dumps(mapping), "offset": 0,
+             "length": nbytes, "dtype": 6, "shape": [nbytes // 4]}]
+    return rows, torch.zeros(nbytes // 4, dtype=torch.float32).view(
+        torch.uint8)
+
+
+def test_a_record_that_fits_no_pack_fails_the_flush(native_sink_module,
+                                                     tmp_path):
+    """max_pack_bytes = one 1 MiB record: admission screens the payload
+    alone, so the record is admitted, and the pack worker then drops it as
+    oversized (it fits no empty pack with its framing). The reference
+    adapter counts oversized_records as a loss and raises at flush and
+    rethrow; the native sink used to report success with nothing
+    persisted."""
+    from dmi.storage.capture.native_sink import create_native_pack_sink
+    from dmi.storage.native_capture import NativeSinkConfig
+
+    sink = create_native_pack_sink(NativeSinkConfig(
+        spool_root=str(tmp_path), max_pack_bytes=MiB,
+        max_queue_bytes=4 * MiB)).native_sink
+    lease = sink.attach()
+    rows, payload = _one_row_envelope(0, MiB)
+    sink.submit_envelope(LAYOUT, rows, payload)
+    with pytest.raises(RuntimeError, match="oversized_records"):
+        sink.flush_and_wait(30.0)
+    with pytest.raises(RuntimeError, match="oversized_records"):
+        sink.rethrow_if_failed()
+    snapshot = sink.snapshot()
+    assert (snapshot["admitted_records"], snapshot["persisted_records"],
+            snapshot["oversized_records"]) == (1, 0, 1), snapshot
+    # The next envelope is refused too: capture stops and says why, on the
+    # record worker, instead of losing records until someone flushes.
+    rows, payload = _one_row_envelope(1, 1024)
+    with pytest.raises(RuntimeError, match="oversized_records"):
+        sink.submit_envelope(LAYOUT, rows, payload)
+    del lease
+
+
+def test_a_stored_record_still_flushes_clean(native_sink_module, tmp_path):
+    from dmi.storage.capture.native_sink import create_native_pack_sink
+    from dmi.storage.native_capture import NativeSinkConfig
+
+    sink = create_native_pack_sink(
+        NativeSinkConfig(spool_root=str(tmp_path))).native_sink
+    lease = sink.attach()
+    rows, payload = _one_row_envelope(0, 1024)
+    sink.submit_envelope(LAYOUT, rows, payload)
+    assert sink.flush_and_wait(30.0)
+    sink.rethrow_if_failed()
+    assert sink.snapshot()["persisted_records"] == 1
+    del lease

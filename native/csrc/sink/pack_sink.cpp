@@ -160,8 +160,20 @@ size_t PackSink::RouteWorker(const std::string& tenant,
   return static_cast<size_t>(z % static_cast<uint64_t>(queues_.size()));
 }
 
+double PackSink::AdmissionDeadline() const {
+  return config_.admission_timeout_s < 0
+             ? -1.0
+             : NowS() + config_.admission_timeout_s;
+}
+
 Admission PackSink::Submit(dmi_pack::RecordMetadata metadata,
                            const uint8_t* payload, size_t n) {
+  return SubmitBy(std::move(metadata), payload, n, AdmissionDeadline());
+}
+
+Admission PackSink::SubmitBy(dmi_pack::RecordMetadata metadata,
+                             const uint8_t* payload, size_t n,
+                             double deadline) {
   size_t worker = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -193,10 +205,6 @@ Admission PackSink::Submit(dmi_pack::RecordMetadata metadata,
     return Admission::kTooLarge;
   }
   const bool block = config_.overload == Overload::kBlock;
-  const double deadline =
-      config_.admission_timeout_s < 0
-          ? -1.0
-          : NowS() + config_.admission_timeout_s;
   SinkRecord record;
   record.metadata = std::move(metadata);
   record.payload.assign(payload, payload + n);

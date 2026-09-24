@@ -142,6 +142,14 @@ class PackSink {
 
   Admission Submit(dmi_pack::RecordMetadata metadata,
                    const uint8_t* payload, size_t n);
+  // Submit against a deadline the caller took earlier from
+  // AdmissionDeadline(), so several records share one admission bound
+  // (EnvelopeAdmission). Submit() is SubmitBy(..., AdmissionDeadline()).
+  Admission SubmitBy(dmi_pack::RecordMetadata metadata,
+                     const uint8_t* payload, size_t n, double deadline_s);
+  // The kBlock admission deadline for a wait starting now, on the sink's
+  // steady clock in seconds; -1 when admission_timeout_s waits forever.
+  double AdmissionDeadline() const;
 
   // Persist everything admitted before this call. False on timeout; the
   // in-flight barrier is kept for the next call to reuse. timeout_s < 0

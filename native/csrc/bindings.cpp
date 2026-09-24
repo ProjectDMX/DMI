@@ -141,6 +141,14 @@ std::shared_ptr<dmx_host::ClickHouseRecordSink> MakeClickHouseRecordSink(
       [host] { host->raise_if_failed(); });
 }
 
+// RecordSink.admission_bound_s: the sink's admission bound in seconds, or
+// None when it has none.
+std::optional<double> AdmissionBoundSeconds(const ring::RecordSink& sink) {
+  const auto bound = sink.admission_bound();
+  if (!bound) return std::nullopt;
+  return std::chrono::duration<double>(*bound).count();
+}
+
 template <typename... Args>
 std::shared_ptr<ring_py::RingEnginePy> MakeRingEngine(Args&&... args) {
   // Ring destruction may join a worker that is completing a callback.  Never
@@ -646,7 +654,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("_acquire_engine",
            [](std::shared_ptr<ring::RecordSink> sink) {
              return ring::RecordSinkLease::acquire(std::move(sink));
-           });
+           })
+      .def_property_readonly("admission_bound_s", &AdmissionBoundSeconds);
   py::class_<dmx_host::ClickHouseRecordSink, ring::RecordSink,
              std::shared_ptr<dmx_host::ClickHouseRecordSink>>(
       m, "ClickHouseRecordSink")
@@ -657,12 +666,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<dmi_capture::ReferencePythonCaptureSink, ring::RecordSink,
              std::shared_ptr<dmi_capture::ReferencePythonCaptureSink>>(
       m, "ReferencePythonCaptureSink")
-      .def(py::init([](py::object target, std::string layout) {
+      .def(py::init([](py::object target, std::string layout,
+                       std::optional<double> admission_bound_s) {
+             std::optional<ring::RecordSink::Duration> bound;
+             if (admission_bound_s) {
+               if (!std::isfinite(*admission_bound_s) ||
+                   *admission_bound_s < 0) {
+                 throw py::value_error(
+                     "admission_bound_s must be None or a finite, "
+                     "non-negative number");
+               }
+               bound = std::chrono::ceil<ring::RecordSink::Duration>(
+                   std::chrono::duration<double>(*admission_bound_s));
+             }
              return std::make_shared<
                  dmi_capture::ReferencePythonCaptureSink>(
-                     target.ptr(), std::move(layout));
+                     target.ptr(), std::move(layout), bound);
            }),
-           py::arg("target"), py::arg("layout"))
+           py::arg("target"), py::arg("layout"),
+           py::arg("admission_bound_s") = py::none())
       .def_property_readonly(
           "attached", &dmi_capture::ReferencePythonCaptureSink::engine_owned);
 
