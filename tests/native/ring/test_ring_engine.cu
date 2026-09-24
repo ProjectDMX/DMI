@@ -927,8 +927,11 @@ static void test_raise_policy_skips_the_step_and_raises_at_the_next() {
     EXPECT(outcome.stall < std::chrono::milliseconds(50 + 400 + 250));
     EXPECT(outcome.status.failed);
     EXPECT(outcome.status.failure.find("stall budget") != std::string::npos);
+    EXPECT(outcome.status.failure.find("from any step") != std::string::npos);
     EXPECT(outcome.status.stall_budget_exhaustions == 1);
     EXPECT(outcome.status.skipped_steps == 1);
+    // One skip, but records 2-8 were still queued: steps 2-9 lost records.
+    EXPECT(outcome.status.steps_with_discards == 8);
     EXPECT(outcome.status.step_stall_budget_ms == 50);
     // The next step boundary raises it, outside the forward.
     EXPECT(outcome.next_step_threw);
@@ -957,6 +960,8 @@ static void test_disable_capture_skips_the_step_and_resumes() {
     EXPECT(!outcome.status.failed);
     EXPECT(outcome.status.stall_budget_exhaustions == 1);
     EXPECT(outcome.status.skipped_steps == 1);
+    // One skip, but records 2-8 were still queued: steps 2-9 lost records.
+    EXPECT(outcome.status.steps_with_discards == 8);
     EXPECT(outcome.status.max_step_wait_ns >= 50'000'000ull);
     // The next step captures again, without raising or stalling long.
     EXPECT(!outcome.next_step_threw);
@@ -965,9 +970,12 @@ static void test_disable_capture_skips_the_step_and_resumes() {
     // A skipped step is not a failure: the flush succeeds.
     EXPECT(!outcome.flush_threw);
     EXPECT(!outcome.flushed_status.failed);
-    // Records 2-8, still queued at the exhaustion, and the ninth.
+    // Records 2-8, still queued at the exhaustion from steps 2-8, and the
+    // ninth: one skipped step, eight steps with discards.
     EXPECT(outcome.flushed_status.discarded_descriptors == 8);
     EXPECT(outcome.flushed_status.discarded_payloads == 8);
+    EXPECT(outcome.flushed_status.skipped_steps == 1);
+    EXPECT(outcome.flushed_status.steps_with_discards == 8);
     // The record in the sink at the exhaustion, and the next step's.
     EXPECT(outcome.submissions == 2);
 }
@@ -1059,8 +1067,9 @@ static void test_a_stall_budget_needs_begin_record_step() {
 }
 
 static void test_a_sink_past_its_admission_bound_is_a_ring_failure() {
-    banner("a sink that holds the ring past its admission bound raises");
-    // Declares 10 ms, takes 2.5 s: past the bound and the drain grace.
+    banner("a ring not drained by the admission bound plus the grace raises");
+    // Declares 10 ms, takes 2.5 s: past the bound and the drain grace, which
+    // for this 4 KiB ring and 4 KiB staging is 2 s plus 8 us.
     ring_py::RecordRuntimeOptions options;
     options.failure_policy = ring::RecordFailurePolicy::kDisableCapture;
     options.step_stall_budget_ms = 50;
@@ -1084,6 +1093,7 @@ static void test_a_sink_past_its_admission_bound_is_a_ring_failure() {
         error = caught.what();
     }
     const auto stall = std::chrono::steady_clock::now() - started;
+    EXPECT(error.find("did not drain") != std::string::npos);
     EXPECT(error.find("admission bound") != std::string::npos);
     // Bounded by budget + declared bound + grace, not by the sink.
     EXPECT(stall < std::chrono::milliseconds(2400));

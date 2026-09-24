@@ -34,7 +34,7 @@ class _StatusRing(_FakeRingEngine):
             "failure_policy": "raise", "failed": False, "failure": "",
             "discarded_descriptors": 0, "discarded_payloads": 0,
             "step_stall_budget_ms": 0, "stall_budget_exhaustions": 0,
-            "skipped_steps": 0,
+            "skipped_steps": 0, "steps_with_discards": 0,
             "reserve_wait_ns": 0, "max_step_wait_ns": 0,
         }
         self.steps = 0
@@ -237,7 +237,7 @@ def test_capture_status_without_a_record_runtime():
         "failure_policy": None, "failure": None,
         "discarded_descriptors": 0, "discarded_payloads": 0,
         "step_stall_budget_ms": None, "stall_budget_exhaustions": 0,
-        "skipped_steps": 0,
+        "skipped_steps": 0, "steps_with_discards": 0,
         "reserve_wait_s": 0.0, "max_step_wait_s": 0.0,
         "sink": None, "storage": None,
     }
@@ -249,7 +249,7 @@ def test_capture_status_reports_a_disabled_capture(monkeypatch):
         "failure": "NativePackSink: sink refused durable admission: timed_out",
         "discarded_descriptors": 7, "discarded_payloads": 9,
         "step_stall_budget_ms": 2000, "stall_budget_exhaustions": 1,
-        "skipped_steps": 1,
+        "skipped_steps": 1, "steps_with_discards": 1,
         "reserve_wait_ns": 2_500_000_000, "max_step_wait_ns": 2_100_000_000,
     })
     engine, _runtime, _created = _record_engine(
@@ -262,7 +262,7 @@ def test_capture_status_reports_a_disabled_capture(monkeypatch):
         "failure": "NativePackSink: sink refused durable admission: timed_out",
         "discarded_descriptors": 7, "discarded_payloads": 9,
         "step_stall_budget_ms": 2000, "stall_budget_exhaustions": 1,
-        "skipped_steps": 1,
+        "skipped_steps": 1, "steps_with_discards": 1,
         "reserve_wait_s": 2.5, "max_step_wait_s": 2.1,
         "sink": None, "storage": None,
     }
@@ -276,7 +276,7 @@ def test_capture_status_reports_skipped_steps_with_capture_active(
         "failure_policy": "disable_capture", "failed": False, "failure": "",
         "discarded_descriptors": 8, "discarded_payloads": 8,
         "step_stall_budget_ms": 50, "stall_budget_exhaustions": 2,
-        "skipped_steps": 2,
+        "skipped_steps": 2, "steps_with_discards": 5,
         "reserve_wait_ns": 900_000_000, "max_step_wait_ns": 450_000_000,
     })
     engine, _runtime, _created = _record_engine(
@@ -287,6 +287,8 @@ def test_capture_status_reports_skipped_steps_with_capture_active(
     assert status["failure"] is None
     assert status["skipped_steps"] == 2
     assert status["stall_budget_exhaustions"] == 2
+    # Each skip also dropped records queued from earlier steps.
+    assert status["steps_with_discards"] == 5
 
 
 def test_capture_status_includes_the_sink_and_storage_snapshots(monkeypatch):
@@ -316,7 +318,7 @@ def test_close_reports_a_capture_that_stopped(monkeypatch, caplog):
         "failure": "NativePackSink: sink refused durable admission: dropped",
         "discarded_descriptors": 4, "discarded_payloads": 5,
         "step_stall_budget_ms": 50, "stall_budget_exhaustions": 0,
-        "skipped_steps": 0,
+        "skipped_steps": 0, "steps_with_discards": 0,
         "reserve_wait_ns": 0, "max_step_wait_ns": 0,
     })
     engine, _runtime, _created = _record_engine(
@@ -335,7 +337,7 @@ def test_close_reports_skipped_steps(monkeypatch, caplog):
         "failure_policy": "disable_capture", "failed": False, "failure": "",
         "discarded_descriptors": 8, "discarded_payloads": 8,
         "step_stall_budget_ms": 50, "stall_budget_exhaustions": 3,
-        "skipped_steps": 3,
+        "skipped_steps": 3, "steps_with_discards": 4,
         "reserve_wait_ns": 0, "max_step_wait_ns": 0,
     })
     engine, _runtime, _created = _record_engine(
@@ -345,4 +347,5 @@ def test_close_reports_skipped_steps(monkeypatch, caplog):
         engine.close()
     messages = [record.getMessage() for record in caplog.records]
     assert any("3 steps" in message and "stall budget" in message
+               and "4 steps lost records" in message
                for message in messages), messages

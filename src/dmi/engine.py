@@ -371,9 +371,10 @@ class MonitoringEngine:
         lies between two ``RecordRuntime.begin_step()`` calls; with a budget
         the integration must call it once per model step, and a reservation
         before the first call is refused. Past the budget the rest of that
-        step is skipped -- the records still queued for the sink and the
-        ones the step reserves afterwards are discarded and counted in
-        ``skipped_steps`` -- and capture resumes at the next step. Under
+        step is skipped: the step's remaining records and every record still
+        queued for the sink, from any step, are discarded (counted in
+        ``discarded_*``, ``skipped_steps`` and ``steps_with_discards``), and
+        capture resumes at the next step. Under
         ``"raise"`` the exhaustion is then raised at the next ``begin_step``
         and at ``flush_and_wait``, outside the forward. ``None`` waits
         without bound.
@@ -387,9 +388,11 @@ class MonitoringEngine:
         ``capture_sink_config`` with block and no timeout. With a bounded
         sink a step stalls the forward for at most the budget plus the
         sink's admission bound (``admission_timeout_s`` under block, zero
-        under drop_newest), plus the time to copy out what the ring holds;
-        a sink that holds the ring past its bound plus a 2 s drain grace
-        raises from the reservation under either policy.
+        under drop_newest), plus the time to move what the ring holds out
+        to the record worker. A ring that has not drained by the bound plus
+        a drain grace -- 2 s plus the payload ring and pinned staging bytes
+        at 1 GB/s, about 10.6 s with the default 4 GiB of each -- fails
+        from the reservation under either policy.
         """
 
         if getattr(self, "_storage_backend", "auto") == "none":
@@ -623,9 +626,12 @@ class MonitoringEngine:
         at the next step): under ``"disable_capture"`` the forward keeps
         running and ``failure`` says why capture stopped. ``skipped_steps``
         counts steps whose rest was skipped because the stall budget ran
-        out; under ``"disable_capture"`` capture stays active through them.
-        ``discarded_*`` count the records dropped by a skip or after a
-        latch. ``reserve_wait_s`` and ``max_step_wait_s`` are the time
+        out (always equal to ``stall_budget_exhaustions``); under
+        ``"disable_capture"`` capture stays active through them. A skip also
+        discards every record still queued for the sink, earlier steps'
+        too, so ``steps_with_discards`` -- the distinct steps that lost a
+        record to a skip -- can exceed ``skipped_steps``. ``discarded_*``
+        count the records dropped by a skip or after a latch. ``reserve_wait_s`` and ``max_step_wait_s`` are the time
         record reservations waited for the sink (in total, and in the
         worst step). ``sink`` and ``storage`` are the native pack sink's
         and storage service's snapshots, when the engine holds them.
@@ -636,7 +642,7 @@ class MonitoringEngine:
             "failure_policy": None, "failure": None,
             "discarded_descriptors": 0, "discarded_payloads": 0,
             "step_stall_budget_ms": None, "stall_budget_exhaustions": 0,
-            "skipped_steps": 0,
+            "skipped_steps": 0, "steps_with_discards": 0,
             "reserve_wait_s": 0.0, "max_step_wait_s": 0.0,
             "sink": None, "storage": None,
         }
@@ -654,6 +660,7 @@ class MonitoringEngine:
             step_stall_budget_ms=int(native["step_stall_budget_ms"]) or None,
             stall_budget_exhaustions=int(native["stall_budget_exhaustions"]),
             skipped_steps=int(native["skipped_steps"]),
+            steps_with_discards=int(native["steps_with_discards"]),
             reserve_wait_s=int(native["reserve_wait_ns"]) / 1e9,
             max_step_wait_s=int(native["max_step_wait_ns"]) / 1e9,
         )
@@ -677,9 +684,11 @@ class MonitoringEngine:
         if status["skipped_steps"]:
             _LOG.warning(
                 "record capture skipped the rest of %d steps whose stall "
-                "budget (%s ms) ran out; %d descriptors and %d payloads "
-                "discarded", status["skipped_steps"],
-                status["step_stall_budget_ms"],
+                "budget (%s ms) ran out, discarding with them the records "
+                "still queued for the sink: %d steps lost records; %d "
+                "descriptors and %d payloads discarded",
+                status["skipped_steps"], status["step_stall_budget_ms"],
+                status["steps_with_discards"],
                 status["discarded_descriptors"], status["discarded_payloads"])
         if status["capture_active"]:
             return

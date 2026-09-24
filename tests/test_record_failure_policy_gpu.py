@@ -195,6 +195,8 @@ def test_disable_capture_skips_stalled_steps_and_keeps_capturing(caplog):
     assert status["failure_policy"] == "disable_capture"
     assert status["skipped_steps"] >= 1
     assert status["stall_budget_exhaustions"] == status["skipped_steps"]
+    # A skip also drops the records still queued from earlier steps.
+    assert status["steps_with_discards"] >= status["skipped_steps"]
     assert status["step_stall_budget_ms"] == BUDGET_MS
     assert status["max_step_wait_s"] >= BUDGET_MS / 1000
     # Capture resumed after a skip, and every record was either stored or
