@@ -31,8 +31,10 @@
 // quarantines the writer: it drops its lease without a tombstone and refuses
 // to publish for one TTL (catalog_writer.cpp). That is recoverable, not
 // fatal: while the writer is quarantined or holds no lease the cycle skips
-// the catalog phase and keeps pending_index_, and once the window passes the
-// service acquires a FRESH lease_id, as the Python oracle's writer documents
+// the catalog phase, keeps pending_index_ and uploads nothing, so new packs
+// stay in the durable spool rather than in a list only this process
+// remembers. Once the window passes the service acquires a FRESH lease_id,
+// as the Python oracle's writer documents
 // (clickhouse_catalog.py, publish_snapshot). Only a foreign lease that stays
 // live for 2 x TTL is fatal: the service stops (snapshot().failed), writes
 // one line to stderr, and flush() rethrows the refusal naming the holder.
