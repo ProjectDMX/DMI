@@ -14,6 +14,12 @@ make -C native -j
 python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ```
 
+`make -C native` rebuilds the full backend and the capture storage
+extensions (`_dmi_native_sink`, `_dmi_native_store`), which `clean` also
+removes. The capture extensions need `libcurl4-openssl-dev`; see
+[core installation](install.md#5-build-native-dependencies). Pass
+`CAPTURE=0` to build the backend alone.
+
 The HuggingFace path uses that modified Transformers checkout and DMI's
 generation wrapper.
 

@@ -84,10 +84,12 @@ def _validate_archive(wheel: Path) -> None:
             "wheel contains legacy top-level paths: " + ", ".join(legacy)
         )
 
+    # Any extension, not only _native_backend: the native build installs
+    # _host_backend, _dmi_native_sink and _dmi_native_store into src/dmi too.
     native_members = sorted(
         member
         for member in members
-        if member.startswith("dmi/_native_backend") and member.endswith(".so")
+        if member.startswith("dmi/") and member.endswith(".so")
     )
     if native_members:
         raise RuntimeError(

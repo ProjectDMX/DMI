@@ -57,7 +57,9 @@ make
 ```
 
 The build keeps an intermediate copy under `native/` and writes the importable
-`_native_backend` shared library to `src/dmi/`. The native hook ABI in
+`_native_backend` shared library to `src/dmi/`, next to the capture storage
+extensions `_dmi_native_sink` and `_dmi_native_store` (make target `capture`,
+part of the default build; their intermediate copies are in `native/build/`). The native hook ABI in
 `native/csrc/ring/tensor_meta.h` is mirrored by `src/dmi/hooks/catalog.py`.
 
 ## Change checklist

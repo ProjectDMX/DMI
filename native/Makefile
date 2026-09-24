@@ -47,6 +47,7 @@ HOST_FINAL_TARGET := $(PROJECT_ROOT)/src/dmi/$(HOST_TARGET_SO)
 # against multiple libcudart major versions.
 CUDA_RESOLVER := $(CURDIR)/cuda_toolkit.py
 CUDA_CONFIG_STAMP := $(BUILD_DIR)/cuda-toolkit.config
+TORCH_EXT_STAMP := $(BUILD_DIR)/torch-extension.config
 CUDA_RESOLVE_REQUIRED := 1
 ifneq ($(strip $(MAKECMDGOALS)),)
 ifeq ($(strip $(filter-out clean host,$(MAKECMDGOALS))),)
@@ -57,7 +58,7 @@ endif
 # clean/host), skip CUDA resolution entirely.
 CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder build/bench_sink build/conformance_catalog build/_dmi_native_sink build/_dmi_native_store
 ifneq ($(strip $(MAKECMDGOALS)),)
-ifeq ($(strip $(filter-out clean host cpu-goals $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
+ifeq ($(strip $(filter-out clean host cpu-goals capture check-libcurl $(TORCH_EXT_STAMP) $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
 endif
 endif
@@ -189,9 +190,26 @@ RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))
 
 OBJS += $(RING_OBJS)
 
-.PHONY: all host clean cuda-info cpu-goals FORCE
+.PHONY: all host clean cuda-info cpu-goals capture check-libcurl FORCE
 
+# The default build includes the capture storage extensions, because `clean`
+# removes them with the rest of build/ and the documented rebuild is plain
+# `make`: left out, `make clean && make` deleted them and never rebuilt them.
+# They need libcurl's dev package, which the full backend does not, so a host
+# without it fails here with the package named. Unconditional rather than
+# "when libcurl is found": skipping silently is the stranding again, reported
+# only at runtime by the loader. A build that wants the backend alone says so
+# with CAPTURE=0. Only 0 and 1 are accepted: any other value -- CAPTURE=yes,
+# or an unrelated CAPTURE someone exported -- used to mean 0, and dropped
+# the extensions just as silently.
+CAPTURE ?= 1
+ifeq ($(strip $(CAPTURE)),1)
+all: $(FINAL_TARGET) capture
+else ifeq ($(strip $(CAPTURE)),0)
 all: $(FINAL_TARGET)
+else
+$(error CAPTURE must be 0 or 1, not '$(CAPTURE)' (from the $(origin CAPTURE)): 1 builds the capture storage extensions with the default build, 0 leaves them out)
+endif
 
 # Every target that builds without CUDA, as ONE goal. CI's compile gate
 # asks for this rather than listing the binaries: a list in the workflow
@@ -268,32 +286,96 @@ build/bench_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/rec
 	    csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp \
 	    -Icsrc/sink -Icsrc/pack -Icsrc/store -Icsrc/common -lcrypto -lpthread
 
+# ---- libcurl (the S3 client, the catalog's HTTP client) --------------------
+# Needed by build/conformance_store, build/conformance_catalog and
+# _dmi_native_store. CURL_INCDIR/CURL_LIBDIR resolve in this order (each
+# of the two on its own):
+#   1. set on the command line or in the environment -- CI passes the system
+#      paths, and this always wins;
+#   2. a CURL_SYSROOT set on the command line or in the environment: the
+#      packages extracted there, for a host without root. The dev package's
+#      libcurl.so links to a file in the runtime package, so both go in:
+#        apt-get download libcurl4-openssl-dev libcurl4
+#        for deb in libcurl4*.deb; do dpkg-deb -x "$deb" <sysroot>; done
+#      Ahead of pkg-config, because naming a sysroot is asking for it: behind
+#      it, a host that also has a libcurl.pc ignored the sysroot silently;
+#   3. `pkg-config libcurl`, which knows them wherever the dev package
+#      (libcurl4-openssl-dev on Debian/Ubuntu) is installed;
+#   4. the default sysroot, CURL_SYSROOT_DEFAULT, laid out as in 2 -- only
+#      when that directory exists and belongs to the user running make: an
+#      unowned directory under /tmp must not supply headers and a library to
+#      the build ahead of the system's. Its default, /tmp/opencode/sysroot,
+#      is where one development host keeps its extracted packages; anywhere
+#      else it does not exist and is skipped (docs/install.md says so);
+#   5. none at all: no -I/-L, and the compiler's default paths apply.
+# At runtime the store loads the OS's libcurl.so.4.
+PKG_CONFIG ?= pkg-config
+CURL_SYSROOT_EXPLICIT := $(if $(filter command line environment,$(origin CURL_SYSROOT)),$(strip $(CURL_SYSROOT)))
+ifneq ($(filter undefined,$(origin CURL_INCDIR) $(origin CURL_LIBDIR)),)
+ifeq ($(CURL_SYSROOT_EXPLICIT),)
+CURL_PKG_CONFIG_FOUND := $(shell $(PKG_CONFIG) --exists libcurl 2>/dev/null && echo yes)
+endif
+endif
+ifeq ($(CURL_PKG_CONFIG_FOUND),yes)
+ifeq ($(origin CURL_INCDIR),undefined)
+CURL_INCDIR := $(shell $(PKG_CONFIG) --variable=includedir libcurl)
+endif
+ifeq ($(origin CURL_LIBDIR),undefined)
+CURL_LIBDIR := $(shell $(PKG_CONFIG) --variable=libdir libcurl)
+endif
+endif
+CURL_SYSROOT_DEFAULT ?= /tmp/opencode/sysroot
+ifeq ($(origin CURL_SYSROOT),undefined)
+CURL_SYSROOT := $(shell test -d '$(CURL_SYSROOT_DEFAULT)' && test -O '$(CURL_SYSROOT_DEFAULT)' && echo '$(CURL_SYSROOT_DEFAULT)')
+endif
+ifneq ($(CURL_SYSROOT),)
+CURL_INCDIR ?= $(CURL_SYSROOT)/usr/include/x86_64-linux-gnu
+CURL_LIBDIR ?= $(CURL_SYSROOT)/usr/lib/x86_64-linux-gnu
+endif
+CURL_CPPFLAGS = $(if $(CURL_INCDIR),-I$(CURL_INCDIR))
+CURL_LDFLAGS = $(if $(CURL_LIBDIR),-L$(CURL_LIBDIR))
+CURL_SEARCHED = $(if $(CURL_INCDIR)$(CURL_LIBDIR),CURL_INCDIR=$(CURL_INCDIR)$(comma) CURL_LIBDIR=$(CURL_LIBDIR),the compiler's default paths)
+
+# Compile and link one libcurl call before any target that needs it, so a
+# missing dev package is one line naming it rather than a page of compiler
+# output from whichever source includes <curl/curl.h> first. An order-only
+# prerequisite of those targets: it runs, but never makes them out of date.
+# A dangling libcurl.so is named separately: it is the dev package extracted
+# without its runtime package, and ld would skip it for libcurl.a.
+check-libcurl:
+	@if [ -n "$(CURL_LIBDIR)" ] && [ -L "$(CURL_LIBDIR)/libcurl.so" ] && [ ! -e "$(CURL_LIBDIR)/libcurl.so" ]; then \
+	    echo "native/Makefile: $(CURL_LIBDIR)/libcurl.so links to a missing file." \
+	         "Extract the runtime package libcurl4 into the same sysroot as" \
+	         "libcurl4-openssl-dev -- see docs/install.md." >&2; \
+	    exit 1; \
+	fi
+	@printf '#include <curl/curl.h>\nint main() { return curl_global_init(CURL_GLOBAL_DEFAULT); }\n' \
+	    | $(CXX) -x c++ - -o /dev/null $(CURL_CPPFLAGS) $(CURL_LDFLAGS) -lcurl 2>/dev/null \
+	    || { echo "native/Makefile: cannot build against libcurl" \
+	              "($(CURL_SEARCHED))." \
+	              "Install libcurl4-openssl-dev (Debian/Ubuntu; libcurl-devel on" \
+	              "Fedora/RHEL), or pass CURL_INCDIR/CURL_LIBDIR -- see docs/install.md." \
+	              "To build without the capture storage extensions, which the" \
+	              "in-memory path does not need, pass CAPTURE=0." >&2; \
+	         exit 1; }
+
 # A2a SigV4 conformance driver: no torch/pybind/network; runs in any CI job.
-# libcurl headers come from CURL_INCDIR (dev .deb extract); the runtime
-# libcurl.so.4 ships with the OS. Override on machines with system curl-dev:
-#   make CURL_INCDIR=/usr/include/x86_64-linux-gnu ...
-CURL_INCDIR ?= /tmp/opencode/sysroot/usr/include/x86_64-linux-gnu
 build/conformance_sign: csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/store/s3_sign.h csrc/common/json.cpp csrc/common/json.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
 	    csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/common/json.cpp \
 	    -Icsrc/store -Icsrc/common -lcrypto
 
-# A2 store conformance driver + fault-matrix target. libcurl headers come from
-# the dev .deb extracted to a sysroot (no root needed):
-#   apt-get download libcurl4-openssl-dev && dpkg-deb -x <deb> <sysroot>
-# The link needs only -L; the runtime libcurl.so.4 ships with the OS. Override:
-#   make CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu ...
-CURL_LIBDIR ?= /tmp/opencode/sysroot/usr/lib/x86_64-linux-gnu
-build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h csrc/store/spool.h csrc/store/uploader.h csrc/common/json.cpp csrc/common/json.h csrc/common/curl_init.cpp csrc/common/curl_init.h
+# A2 store conformance driver + fault-matrix target. Needs libcurl (above).
+build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h csrc/store/spool.h csrc/store/uploader.h csrc/common/json.cpp csrc/common/json.h csrc/common/curl_init.cpp csrc/common/curl_init.h | check-libcurl
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
 	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/common/json.cpp csrc/common/curl_init.cpp \
-	    -Icsrc/store -Icsrc/common -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl -lpthread
+	    -Icsrc/store -Icsrc/common $(CURL_CPPFLAGS) $(CURL_LDFLAGS) -lcrypto -lcurl -lpthread
 
 # B1 catalog conformance driver: lease coordinator + version allocator over
 # ClickHouse's HTTP interface. No torch/pybind; needs libcurl like the store.
-build/conformance_catalog: csrc/catalog/clickhouse_client.cpp csrc/catalog/lease_coordinator.cpp csrc/catalog/version_allocator.cpp csrc/catalog/catalog_writer.cpp csrc/catalog/pack_index.cpp csrc/catalog/indexer.cpp csrc/catalog/schema.cpp csrc/catalog/reader.cpp csrc/catalog/hydration.cpp csrc/catalog/conformance_catalog.cpp csrc/common/json.cpp csrc/pack/pack_builder.cpp csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/catalog/clickhouse_client.h csrc/catalog/lease_coordinator.h csrc/catalog/version_allocator.h csrc/catalog/catalog_writer.h csrc/catalog/sql_escape.h csrc/catalog/pack_index.h csrc/catalog/indexer.h csrc/catalog/schema.h csrc/catalog/reader.h csrc/catalog/hydration.h csrc/common/json.h csrc/store/s3_client.h csrc/common/curl_init.cpp csrc/common/curl_init.h
+build/conformance_catalog: csrc/catalog/clickhouse_client.cpp csrc/catalog/lease_coordinator.cpp csrc/catalog/version_allocator.cpp csrc/catalog/catalog_writer.cpp csrc/catalog/pack_index.cpp csrc/catalog/indexer.cpp csrc/catalog/schema.cpp csrc/catalog/reader.cpp csrc/catalog/hydration.cpp csrc/catalog/conformance_catalog.cpp csrc/common/json.cpp csrc/pack/pack_builder.cpp csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/catalog/clickhouse_client.h csrc/catalog/lease_coordinator.h csrc/catalog/version_allocator.h csrc/catalog/catalog_writer.h csrc/catalog/sql_escape.h csrc/catalog/pack_index.h csrc/catalog/indexer.h csrc/catalog/schema.h csrc/catalog/reader.h csrc/catalog/hydration.h csrc/common/json.h csrc/store/s3_client.h csrc/common/curl_init.cpp csrc/common/curl_init.h | check-libcurl
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
 	    csrc/catalog/clickhouse_client.cpp csrc/catalog/lease_coordinator.cpp \
@@ -303,7 +385,7 @@ build/conformance_catalog: csrc/catalog/clickhouse_client.cpp csrc/catalog/lease
 	    csrc/common/json.cpp csrc/common/curl_init.cpp csrc/pack/pack_builder.cpp \
 	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp \
 	    -Icsrc/catalog -Icsrc/common -Icsrc/pack -Icsrc/store \
-	    -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl -lpthread
+	    $(CURL_CPPFLAGS) $(CURL_LDFLAGS) -lcrypto -lcurl -lpthread
 
 # A3a spool conformance driver: no network, no torch; runs in any CI job.
 build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/store/spool.h csrc/common/json.cpp csrc/common/json.h
@@ -312,27 +394,95 @@ build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp c
 	    csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/common/json.cpp \
 	    -Icsrc/store -Icsrc/common -lcrypto
 
+# ---- Capture storage extensions (`make capture`, part of `all`) -------------
+# _dmi_native_sink (the pack writer) and _dmi_native_store (the storage
+# service and reader). Each is linked in build/ and installed next to
+# _native_backend in src/dmi/, the first directory the loader
+# (dmi/transport/native.py) searches, so `clean` removes both names and the
+# default build puts both back. The build/ file stays because the torch
+# adapter suites import it from there directly. The src/dmi/ name is a
+# relative symlink to it, not a copy: the loader prefers src/dmi/, so a copy
+# went stale -- and shadowed the fresh build -- whenever something rebuilt
+# build/ alone, such as a branch whose `make build/_dmi_native_sink` writes
+# only there. A copy left by an earlier build is replaced even when it is
+# newer than build/. The targets are the files
+# themselves, so an up-to-date extension is not relinked on every `make`;
+# build/_dmi_native_sink and build/_dmi_native_store remain as the names CI
+# and the loaders' error messages use. PYTHON must be the venv interpreter:
+#   make capture PYTHON=/path/to/venv/bin/python
+#
+# No torch RUNPATH on the sink, unlike _host_backend: every route to it
+# imports torch first (dmi.storage.capture does, before the loader runs),
+# which is what maps libtorch into the process. Verified: a bare
+# `import _dmi_native_sink` without torch fails on libtorch_cpu.so, and the
+# loader route succeeds.
+SINK_EXT := _dmi_native_sink$(EXT_SUFFIX)
+STORE_EXT := _dmi_native_store$(EXT_SUFFIX)
+SINK_BUILT := $(BUILD_DIR)/$(SINK_EXT)
+STORE_BUILT := $(BUILD_DIR)/$(STORE_EXT)
+SINK_FINAL_TARGET := $(PROJECT_ROOT)/src/dmi/$(SINK_EXT)
+STORE_FINAL_TARGET := $(PROJECT_ROOT)/src/dmi/$(STORE_EXT)
+# Headers by directory rather than by name: a file target is only as fresh
+# as the prerequisites it lists, and a missed header means a stale .so.
+SINK_HEADERS := $(wildcard csrc/sink/*.h csrc/pack/*.h csrc/store/*.h csrc/common/*.h csrc/ring/*.h)
+STORE_HEADERS := $(wildcard csrc/catalog/*.h csrc/store/*.h csrc/pack/*.h csrc/common/*.h)
+
+# What the extensions are built against beyond their sources: torch
+# (libtorch for the sink, pybind11's headers for both), the C++ ABI it
+# expects and the Python it runs in, the compiler, and the libcurl
+# directories the store links against. A torch upgrade in the venv, or a
+# CURL_INCDIR pointed at another libcurl, changes no source file, so without
+# this record a file-named target stays "up to date" and keeps the old build.
+# Rewritten only when the record changes, like $(CUDA_CONFIG_STAMP), so an
+# unchanged configuration relinks nothing. One record for both extensions:
+# the sink, which links no libcurl, relinks on a libcurl change too, which
+# costs a few seconds and keeps this to one stamp.
+TORCH_EXT_RECORD_PY := import sys, sysconfig, torch; \
+    from torch.utils.cpp_extension import include_paths, library_paths; \
+    print("|".join([torch.__version__, str(torch.version.git_version), \
+        str(int(torch._C._GLIBCXX_USE_CXX11_ABI)), ";".join(include_paths()), \
+        ";".join(library_paths()), sysconfig.get_paths()["include"], \
+        sysconfig.get_config_var("EXT_SUFFIX")]))
+
+$(TORCH_EXT_STAMP): FORCE | $(BUILD_DIR)
+	record=$$($(PYTHON) -c '$(TORCH_EXT_RECORD_PY)') && \
+	    $(PYTHON) $(CUDA_RESOLVER) write-stamp --output $@ \
+	        --record "$$record|$(CXX)|$(CURL_CPPFLAGS)|$(CURL_LDFLAGS)"
+
+.PHONY: build/_dmi_native_sink build/_dmi_native_store
+capture: $(SINK_FINAL_TARGET) $(STORE_FINAL_TARGET)
+build/_dmi_native_sink: $(SINK_FINAL_TARGET)
+build/_dmi_native_store: $(STORE_FINAL_TARGET)
+
+# FORCE when the installed name is a regular file, i.e. a copy.
+installed_copy = $(if $(shell test -e '$(1)' && ! test -L '$(1)' && echo copy),FORCE)
+define install_link
+ln -sfn "$$($(PYTHON) -c 'import os, sys; print(os.path.relpath(*map(os.path.realpath, sys.argv[1:])))' '$(abspath $<)' '$(@D)')" $@
+endef
+
+$(SINK_FINAL_TARGET): $(SINK_BUILT) $(call installed_copy,$(SINK_FINAL_TARGET))
+	$(install_link)
+
+$(STORE_FINAL_TARGET): $(STORE_BUILT) $(call installed_copy,$(STORE_FINAL_TARGET))
+	$(install_link)
+
 # A5b torch-CPU adapter module: NativePackSink as an importable extension
 # with a synthetic-envelope entry point for tests. No CUDA, no ClickHouse,
 # no ring engine — torch CPU + libcrypto + spool/pack sources only.
-# PYTHON must point at the venv interpreter:
-#   make build/_dmi_native_sink... PYTHON=/path/to/venv/bin/python
-SINK_EXT := _dmi_native_sink$(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))" 2>/dev/null)
-STORE_EXT := _dmi_native_store$(EXT_SUFFIX)
 # C++20 because ATen demands it and its floor MOVES: torch 2.13 refuses
 # below C++17, torch 2.14 below C++20, and the CI pin `torch>=2.8,<3`
 # resolves to whatever is newest on the day. C++20 is the floor for every
 # target that includes torch's headers -- this sink, the backend and host
 # objects (CXXFLAGS, HOST_CXXFLAGS) and the ring's nvcc compiles (NVCCFLAGS).
 # C++17 stays only on the torch-free drivers.
-build/_dmi_native_sink: csrc/sink/native_pack_sink.cpp csrc/sink/record_row.cpp csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/bindings_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp
+$(SINK_BUILT): csrc/sink/native_pack_sink.cpp csrc/sink/record_row.cpp csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/bindings_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp $(SINK_HEADERS) $(TORCH_EXT_STAMP)
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++20 -O2 -fPIC -shared -DTORCH_EXTENSION_NAME=_dmi_native_sink \
 	    $(shell $(PYTHON) -c "from torch.utils.cpp_extension import include_paths; print(' '.join('-I'+p for p in include_paths()))") \
 	    $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); print('-I'+paths.get('include'))") \
 	    -Icsrc -Icsrc/sink -Icsrc/pack -Icsrc/store -Icsrc/common \
 	    -D_GLIBCXX_USE_CXX11_ABI=$(shell $(PYTHON) -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))") \
-	    -o $(BUILD_DIR)/$(SINK_EXT) \
+	    -o $@ \
 	    csrc/sink/native_pack_sink.cpp csrc/sink/record_row.cpp \
 	    csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp \
 	    csrc/sink/bindings_sink.cpp csrc/pack/pack_builder.cpp \
@@ -352,14 +502,17 @@ STORE_SOURCES := csrc/catalog/storage_service.cpp csrc/catalog/bindings_store.cp
     csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/uploader.cpp \
     csrc/store/spool.cpp csrc/pack/pack_builder.cpp \
     csrc/common/json.cpp csrc/common/curl_init.cpp
-build/_dmi_native_store: $(STORE_SOURCES) csrc/catalog/storage_service.h
+# C++20 like every compile that reads torch's include directory: pybind11's
+# headers come from there, and the guard in tests/test_cpu_native_build.py
+# holds every such compile to the ATen floor.
+$(STORE_BUILT): $(STORE_SOURCES) $(STORE_HEADERS) $(TORCH_EXT_STAMP) | check-libcurl
 	mkdir -p $(BUILD_DIR)
-	$(CXX) -std=c++17 -O2 -fPIC -shared -Wall -Wextra \
+	$(CXX) -std=c++20 -O2 -fPIC -shared -Wall -Wextra \
 	    -I$(shell $(PYTHON) -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'include'))") \
 	    $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); print('-I'+paths.get('include'))") \
-	    -Icsrc -Icsrc/catalog -Icsrc/common -Icsrc/pack -Icsrc/store -I$(CURL_INCDIR) \
-	    -o $(BUILD_DIR)/$(STORE_EXT) $(STORE_SOURCES) \
-	    -L$(CURL_LIBDIR) -lcurl -lcrypto -lpthread
+	    -Icsrc -Icsrc/catalog -Icsrc/common -Icsrc/pack -Icsrc/store $(CURL_CPPFLAGS) \
+	    -o $@ $(STORE_SOURCES) \
+	    $(CURL_LDFLAGS) -lcurl -lcrypto -lpthread
 # A3b sink conformance driver: queue + assembler + spool staging in one
 # process, driven over stdin/stdout. Needs only libcrypto + pthreads.
 build/conformance_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/record_row.cpp csrc/sink/conformance_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp csrc/sink/pack_sink.h csrc/sink/object_key.h csrc/sink/record_row.h
@@ -371,7 +524,8 @@ build/conformance_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/si
 
 clean:
 	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET) \
-		$(HOST_LOCAL_TARGET) $(HOST_FINAL_TARGET)
+		$(HOST_LOCAL_TARGET) $(HOST_FINAL_TARGET) \
+		$(SINK_FINAL_TARGET) $(STORE_FINAL_TARGET)
 
 # Overrides --------------------------------------------------------------
 ifeq ($(LTO),1)

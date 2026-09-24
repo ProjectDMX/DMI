@@ -15,8 +15,12 @@ system toolchains. On Debian/Ubuntu:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake git
+sudo apt-get install -y build-essential cmake git libcurl4-openssl-dev pkg-config
 ```
+
+`libcurl4-openssl-dev` is for the native capture storage path's extensions,
+which the default native build includes (step 5); `pkg-config` lets the build
+find it.
 
 Plus a complete CUDA toolkit whose major version matches the CUDA version used
 to build PyTorch (`torch.version.cuda`) and is supported by your driver. Install
@@ -203,12 +207,60 @@ For GPU capture and ring transport, build the full backend:
 ```bash
 make -C native -j
 # or simply: make
+# no libcurl dev package? add CAPTURE=0 to skip the capture extensions below
 ```
 
 Artifacts are emitted as `_native_backend.<EXT_SUFFIX>.so` inside `native/`
 and as the importable `src/dmi/_native_backend.<EXT_SUFFIX>.so`. Host exports
 prefer the full backend and fall back to `_host_backend`; ring exports always
 require the full backend.
+
+The same build also produces the two extensions of the native capture storage
+path (`storage_backend="capture"`): `_dmi_native_sink.<EXT_SUFFIX>.so` (the
+pack writer) and `_dmi_native_store.<EXT_SUFFIX>.so` (the storage service and
+reader). Each is linked in `native/build/` and made importable as a symlink of
+the same name in `src/dmi/`, so the file the loader finds first is always the
+latest build. Their make target is `capture`, which needs no CUDA and can be built on its
+own; `build/_dmi_native_sink` and `build/_dmi_native_store` build one each.
+
+```bash
+make -C native capture -j          # the capture extensions only, no CUDA
+make -C native -j CAPTURE=0        # the full backend without them
+```
+
+They link libcurl. Without root, extract the `libcurl4-openssl-dev` package
+together with the runtime package `libcurl4` (the dev package's `libcurl.so`
+links to a file that ships in `libcurl4`), and point the build at them:
+
+```bash
+apt-get download libcurl4-openssl-dev libcurl4
+for deb in libcurl4*.deb; do dpkg-deb -x "$deb" "$HOME/curl-sysroot"; done
+make -C native -j CURL_SYSROOT="$HOME/curl-sysroot"
+```
+
+The build picks libcurl's header directory (`CURL_INCDIR`) and library
+directory (`CURL_LIBDIR`) in this order, each of the two on its own; the first
+that applies wins:
+
+1. `CURL_INCDIR` / `CURL_LIBDIR` set on the command line or in the environment,
+   for example
+   `CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu`
+   (what CI passes).
+2. A non-empty `CURL_SYSROOT` set on the command line or in the environment:
+   `$CURL_SYSROOT/usr/include/x86_64-linux-gnu` and
+   `$CURL_SYSROOT/usr/lib/x86_64-linux-gnu`, the layout the extraction above
+   produces. `pkg-config` is not consulted.
+3. `pkg-config libcurl` (the binary named by `PKG_CONFIG`), which knows both
+   wherever `libcurl4-openssl-dev` is installed.
+4. The default sysroot `CURL_SYSROOT_DEFAULT`, laid out as in 2. It defaults to
+   `/tmp/opencode/sysroot`, where one development host keeps its extracted
+   packages, and is used only if that directory exists and is owned by the
+   user running `make`; on any other host it is skipped. Pass
+   `CURL_SYSROOT_DEFAULT=<dir>` to move it.
+5. Neither: no `-I`/`-L` is added, and the compiler's default paths apply.
+
+The extensions load the system's `libcurl.so.4` at runtime, so a sysroot is
+needed only to build.
 
 Smoke check the package and host backend:
 
@@ -217,10 +269,11 @@ python -c "import dmi; print(dmi.__file__)"
 python -c "from dmi.api.v1 import DMXHostEngine; print(DMXHostEngine.__module__)"
 ```
 
-After a full build, smoke check the ring backend:
+After a full build, smoke check the ring backend and the capture extensions:
 
 ```bash
 python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
+python -c "import torch; from dmi.transport import native; [print(native._load_named_extension(name).__file__) for name in ('_native_backend', '_dmi_native_sink', '_dmi_native_store')]"
 ```
 
 Run the dependency-free CPU gate without CUDA, ClickHouse, native artifacts,
@@ -261,6 +314,15 @@ checkout.
   used the active conda env.
 - **`ImportError` on `_host_backend`** — build with
   `make -C native host -j`; this target does not require CUDA or `nvcc`.
+- **`native/Makefile: cannot build against libcurl`** — install
+  `libcurl4-openssl-dev` (`libcurl-devel` on Fedora/RHEL), or pass
+  `CURL_SYSROOT`, or `CURL_INCDIR` and `CURL_LIBDIR`, as in step 5. To build
+  without the capture extensions, pass `CAPTURE=0`.
+- **`native/Makefile: .../libcurl.so links to a missing file`** — the sysroot
+  has `libcurl4-openssl-dev` without `libcurl4`; extract both, as in step 5.
+- **`ImportError` on `_dmi_native_sink` or `_dmi_native_store`** — rebuild
+  with `make -C native capture -j`; `make -C native clean` removes them along
+  with the full backend.
 - **Linker errors against `libclickhouse-cpp-lib`** — rerun step 5 and confirm
   `third_party/clickhouse-cpp/build/clickhouse/` exists.
 - **`Connection refused` to ClickHouse** — check

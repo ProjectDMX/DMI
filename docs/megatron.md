@@ -17,6 +17,8 @@ make -C native clean
 make -C native -j
 ```
 
+This rebuilds the capture storage extensions (`_dmi_native_sink`, `_dmi_native_store`) with the backend; they need `libcurl4-openssl-dev`, and `CAPTURE=0` leaves them out. See the [core installation](install.md#5-build-native-dependencies).
+
 ## Enable DMI in a training run
 
 Use the pinned fork's `pretrain_gpt.py` with the normal Megatron model, data, optimizer, and parallelism arguments. Enable DMI by appending its existing CLI options to that command:
