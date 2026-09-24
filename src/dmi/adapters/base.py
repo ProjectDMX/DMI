@@ -336,6 +336,14 @@ class BackendAdapter(abc.ABC):
                 "which a record ring cannot store. Capture records through "
                 "the RecordRuntime, or monitor on an engine without one."
             )
+        # attach_model refuses the capture config, but not every step comes
+        # through it: an adapter may override attach_model without calling
+        # super() (attach_config allows that), and a v1 integration may arm
+        # its hooks with install_ring_hooks and commit steps directly. Either
+        # would reserve and publish into a legacy ring with no host.
+        _refuse_unwired_capture_storage(
+            self.engine, f"{type(self).__name__}.commit_step()",
+            type(self).__name__)
         if plan is None:
             plan = self.plan_step(ctx)
 

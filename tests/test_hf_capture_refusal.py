@@ -33,15 +33,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from dmi.adapters.base import BackendAdapter
+from dmi.adapters.base import BackendAdapter, StepPlan
 from dmi.adapters.huggingface.adapter import HuggingFaceAdapter
 from dmi.adapters.huggingface.generation import (
     generate_greedy_with_monitoring,
     generate_with_monitoring,
 )
+from dmi.adapters.types import StepContext
 from dmi.configuration import DMIConfig, ObservationConfig
 from dmi.configuration.compiler import attach_config
 from dmi.configuration.errors import ConfigurationError
+from dmi.hooks.dispatch import install_ring_hooks
 from dmi.hooks.point import HookPoint
 from dmi.hooks.specs import HOOK_TYPE_RESID_PRE, HookSpec, ModelShapeConfig
 from dmi.transport.ring import RingTransport
@@ -303,9 +305,10 @@ def test_record_ring_failure_propagates_out_of_generate_with_monitoring():
 
 
 def test_capture_mode_failure_propagates_out_of_the_prepare_wrapper():
-    """Capture mode re-raises too, even for an adapter attached earlier."""
-    engine = _SpyEngine("auto", ring_engine=_SpyRingEngine(
-        prepare_step_error=RuntimeError("reservation failed")))
+    """Capture mode re-raises too, even for an adapter attached earlier.
+    commit_step refuses the capture config itself, so the failure the
+    wrapper sees is that refusal, raised before anything is reserved."""
+    engine = _SpyEngine("auto")
     model = _TinyHookedLM(engine)
     adapter = HuggingFaceAdapter(engine, "tiny")
     adapter.attach_model(model)
@@ -313,11 +316,16 @@ def test_capture_mode_failure_propagates_out_of_the_prepare_wrapper():
     input_ids, attention_mask = _inputs()
 
     try:
-        with pytest.raises(RuntimeError, match="reservation failed"):
+        with pytest.raises(ConfigurationError,
+                           match=r"HuggingFaceAdapter\.commit_step\(\).*"
+                                 "capture storage is not wired"):
             model.prepare_inputs_for_generation(
                 input_ids, attention_mask=attention_mask)
     finally:
         adapter.detach_model(model)
+
+    assert engine._ring_engine.prepare_step_calls == []
+    assert engine._ring_engine.push_all_metas_calls == 0
 
 
 def test_legacy_driver_failure_is_logged_once_not_swallowed(caplog):
@@ -373,3 +381,56 @@ def test_adapter_attached_before_create_record_runtime_refuses_the_step():
     for ring in (stale_ring, engine._ring_engine):
         assert ring.prepare_step_calls == []
         assert ring.push_all_metas_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# The step itself refuses the capture config, whatever attach path ran
+# ---------------------------------------------------------------------------
+
+
+class _NoSuperAttachAdapter(_StubAdapter):
+    """An adapter whose attach_model skips super(), as attach_config allows:
+    it arms its HookPoints through the exported install_ring_hooks, so the
+    base attach refusal never runs."""
+
+    def attach_model(self, model, hook_selection=None):
+        self.model_cfg = self.detect_model_shape(model)
+        self.transport.set_model_cfg(self.model_cfg)
+        specs = model.get_hook_specs()
+        install_ring_hooks(specs, ring_payload=self.transport._ring_payload)
+        self.active_specs = specs
+        self.transport._active_specs = specs
+
+
+def _step_context():
+    return StepContext(
+        model_id="tiny", flattened=False, req_ids=["1:0"],
+        token_ranges=[(0, 3)], dim0_offsets=[0], kv_offsets=[0],
+        batch=1, q_len=3)
+
+
+@pytest.mark.parametrize("via_attach_config", [False, True],
+                         ids=["attach_model", "attach_config"])
+def test_commit_step_refuses_capture_storage_when_attach_skipped_super(
+        via_attach_config):
+    """The reviewer's reproduction: with the base attach bypassed, the step
+    reserved and published into a ring with no host, and commit_step
+    returned RESERVED under storage_backend="capture"."""
+    engine = _SpyEngine("capture")
+    model = _TinyHookedLM(engine)
+    adapter = _NoSuperAttachAdapter(engine, "tiny")
+    if via_attach_config:
+        attach_config(adapter, model, DMIConfig(
+            observations=ObservationConfig(hooks=["resid_pre"])))
+    else:
+        adapter.attach_model(model)
+    plan = StepPlan(total_bytes=64, hook_count=1, needs_eager=False)
+
+    with pytest.raises(ConfigurationError,
+                       match=r"_NoSuperAttachAdapter\.commit_step\(\).*"
+                             "capture storage is not wired to "
+                             "_NoSuperAttachAdapter"):
+        adapter.commit_step(_step_context(), plan)
+
+    assert engine._ring_engine.prepare_step_calls == []
+    assert engine._ring_engine.push_all_metas_calls == 0

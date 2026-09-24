@@ -562,6 +562,11 @@ On an engine in record mode (after `create_record_runtime()`), `commit_step()`
 raises `RuntimeError` before reserving anything: a record ring cannot store
 the legacy step protocol, and an adaptor attached before the switch still
 holds the stopped legacy ring, which would otherwise accept the step silently.
+Under `storage_backend="capture"` it raises `ConfigurationError`, also before
+reserving anything, for the reason `attach_model()` does. The check is repeated
+here because a step need not come through the base `attach_model()`: an adaptor
+may override it without calling `super()`, or arm its hooks with
+`install_ring_hooks()` and commit steps directly.
 
 For `SKIPPED` caused only by zero computable hooks, `commit_step()` still
 publishes the step context; the metadata loop emits no hook records. A supplied
