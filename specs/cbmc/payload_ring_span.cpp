@@ -48,5 +48,23 @@ int main() {
     assert(s.off2 + s.len2 <= cap);                   // P3 span 2 stays in the buffer
     assert(s.len2 == 0 || s.off2 + s.len2 <= s.off1); // P4 the two spans are disjoint
 
+    // P5 no byte the spans cover lies in the unconsumed region [tail, head).
+    // Pick any byte i of the reservation and any unconsumed position j; the
+    // buffer offset the spans give byte i is not the one j occupies. j's
+    // offset is found by stepping back head - j (1..cap, by the ring
+    // invariant) from head's own offset, taken as s.off1: both branches of
+    // payload_compute_spans set off1 = head % capacity on their first line.
+    // Recomputing head % cap here instead would ask the solver to prove two
+    // 64-bit dividers equal, which does not finish; P5 therefore checks the
+    // lengths and the wrap point, and trusts that one assignment.
+    uint64_t i, j;
+    __CPROVER_assume(i < n);
+    __CPROVER_assume(tail <= j && j < head);
+    const uint64_t back = head - j;                   // 1..cap
+    const uint64_t j_off = back <= s.off1 ? s.off1 - back
+                                          : s.off1 + cap - back;
+    const uint64_t written = i < s.len1 ? s.off1 + i : s.off2 + (i - s.len1);
+    assert(written != j_off);                         // P5 spans avoid unconsumed bytes
+
     return 0;
 }
