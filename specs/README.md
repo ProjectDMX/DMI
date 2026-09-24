@@ -259,17 +259,21 @@ integers. Most configs run one service with `TTL = 6`.
 `storage_service.cpp:631-632` — *"which leaves two more tries"*. Exactly **four**
 lease-thread wakes fall between the instant the renewal falls due
 (`last_renew + ttl/3`) and the instant the row dies (`last_renew + ttl`), at
-every phase offset: three fit, four fit, five do not. The comment is correct
-and conservative. `FiveTriesFit` is refuted at the constant level — the
+every phase offset: three fit, four fit, five do not. The arithmetic is
+correct and conservative. `FiveTriesFit` is refuted at the constant level — the
 arithmetic is decided before any state is explored, so TLC reports no state
 count.
 
 Two caveats on that comment, neither a model result:
 
-* The retry budget applies only to **refusals**. A transport error takes the
+* The four wakes are room for a renewal that runs **late**, not for one that
+  **fails**: a failed renewal costs the lease at once, whatever the cause. A
+  refusal drops it in the coordinator (`reject_live`,
+  `lease_coordinator.cpp:226`, or the failed read-back at `:128`). A transport
+  error, timeout or parse error is a `ClickHouseError` and takes the
   `std::exception` path at `catalog_writer.cpp:285-292`, which quarantines on
-  the *first* one, so it absorbs zero retries. `O1_absorb` is that, refuted as
-  expected.
+  the *first* one. No renewal failure is retried under the same lease.
+  `O1_absorb` is that, refuted as expected.
 * `O1_skip` is a real defect, not a modelling artefact. See below.
 
 **`O1_skip` — a lease can lapse under a service that still believes it holds
