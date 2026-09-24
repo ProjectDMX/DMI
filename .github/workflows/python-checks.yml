@@ -46,6 +46,23 @@ jobs:
           python -m pip install "boto3>=1.40,<2"
           python -m pip install --no-deps -e .
 
+      - name: Fail on an undefined name in src/dmi
+        # An undefined name is a NameError that waits for its line to run,
+        # and nothing here would see it first: `make check`'s compile stage
+        # is `python -m compileall`, which accepts any name, and a branch
+        # the tests do not reach never raises. ruff's F821 finds it
+        # statically. That one rule only, not a style gate.
+        #
+        # Enabling it found 14, none of them a NameError today, and each is
+        # handled in the source where a reviewer sees it rather than
+        # excluded here: config.py's string annotations now import their
+        # types under TYPE_CHECKING, and hooks/specs.py's HOOK_TYPE_* names,
+        # bound by a globals() loop no linter can follow, carry a per-line
+        # noqa saying so. Pinned, so a ruff release cannot move the gate.
+        run: |
+          python -m pip install "ruff==0.16.5"
+          ruff check --select F821 --no-cache --output-format=github src/dmi
+
       - name: Compile every CPU-only native target
         # The C++ was compiled NOWHERE in CI until this step. `make check`'s
         # compile stage is `python -m compileall` -- Python only -- and the
@@ -143,10 +160,11 @@ jobs:
         # It runs HERE, in the cpu job, and not in the live job, because it
         # has to collect the WHOLE tree and only this job's environment can
         # import the whole tree: `make -C native cpu-goals` above builds
-        # CPU_ONLY_GOALS, which includes build/_dmi_native_sink, while the
-        # live job builds only the four conformance drivers and so hits a
-        # module-level skip in the two suites that import that .so. Doing the
-        # tree walk in the live job is precisely the regression this replaces.
+        # CPU_ONLY_GOALS, while the live job builds only what its suites
+        # drive; when this step was written that was the four conformance
+        # drivers, and the tree walk there hit a module-level skip in the two
+        # suites that import build/_dmi_native_sink. Doing the tree walk in
+        # the live job is precisely the regression this replaces.
         # This job already collects the same tree (`make check` -> `pytest -m
         # cpu`, no path), so the walk costs seconds and adds no new imports.
         #
@@ -323,6 +341,15 @@ jobs:
         # test_native_capture_storage_live.py drives in-process. It takes
         # only pybind11's headers from the torch this job installs and links
         # nothing from it.
+        #
+        # And _dmi_native_sink, the torch-facing NativePackSink the ring
+        # hands envelopes to. Every other suite here stages packs through
+        # the conformance_sink DRIVER, JSON and base64 in, so the real
+        # adapter never reached a catalog in CI;
+        # test_native_capture_chain_live.py drives it with torch CPU tensors
+        # through the service into ClickHouse and reads the bytes back. It
+        # links torch_cpu from the wheel this job installs (C++20, which the
+        # Makefile already passes for this one target).
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libcurl4-openssl-dev
@@ -332,6 +359,7 @@ jobs:
             build/conformance_sink \
             build/conformance_spool \
             build/_dmi_native_store \
+            build/_dmi_native_sink \
             CURL_INCDIR=/usr/include/x86_64-linux-gnu \
             CURL_LIBDIR=/usr/lib/x86_64-linux-gnu
 
@@ -354,7 +382,10 @@ jobs:
         # collection skip lands in the JUnit as `<skipped/>`, and the gate
         # below then fails the job -- correctly, by its own doctrine -- over
         # two files this suite does not even want. Measured in CI: `201
-        # collected, 2 skipped`.
+        # collected, 2 skipped`. (This job has since started building the
+        # sink, for the capture-chain suite, so those two import here now.
+        # The glob stays: the argument is about any module that imports an
+        # artifact this job does not build, not about those two.)
         #
         # So the RUN stays scoped to the files it needs to import. The hole
         # a glob leaves -- a `manual`/`clickhouse` test named outside the
@@ -401,3 +432,201 @@ jobs:
                           print(f"  skipped: {case.get('name')}: {mark.get('message')}")
               sys.exit(f"{skipped} live test(s) skipped; a skip is not a pass")
           EOF
+
+  native-backend-compile:
+    # The full ring backend, _native_backend, which nothing in CI compiled:
+    # the cpu job builds CPU_ONLY_GOALS, and the one build test there
+    # (tests/test_cpu_native_build.py) dry-runs `host`. So the .cu sources,
+    # bindings.cpp and the torch/CUDA link could break on any PR and stay
+    # broken until someone built on a GPU host -- which is how the C++20
+    # floor torch 2.14 imposes went unnoticed (#138). This job compiles and
+    # links `make -C native all`, imports the result, checks that the capture
+    # sink built beside it derives from its RecordSink, and builds the ring
+    # test binaries, running the two that need no device.
+    #
+    # No GPU is needed to COMPILE, only the toolkit, and this runner has
+    # none: everything that needs a device stays with the GPU job (D0).
+    #
+    # On the runner, not in an nvidia/cuda:*-devel container. A container
+    # job pulls its image before the first step runs, so nothing can free
+    # disk first, and the image is 3.68 GiB COMPRESSED
+    # (nvidia/cuda:13.0.1-devel-ubuntu24.04, amd64, per its registry
+    # manifest) -- several times that unpacked -- before the ~4.4 GB that
+    # torch 2.14+cu130 and its nvidia-* wheels take installed (measured in a
+    # cu130 venv). The free disk on a hosted runner is the image's to
+    # decide, not this repository's, so the job keeps its footprint small
+    # rather than depend on it. Installing only the packages the build
+    # reads is ~2.7 GB:
+    # the header set comes from the -MMD dependency files of a real build,
+    # mapped to packages with dpkg -S on a host whose toolkit came from the
+    # same apt repository, and the sizes are those packages' Installed-Size.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Explicit, so the Makefile's resolver takes this toolkit rather than
+      # searching; it still checks the major against torch.version.cuda.
+      CUDA_HOME: /usr/local/cuda-13.0
+      # Explicit because `native`, the default, asks the GPU this runner does
+      # not have. Ada, the architecture the GPU hosts build for.
+      SM_ARCH: sm_89
+
+    steps:
+      - name: Free runner disk
+        # A precaution, not a measured need. On run 35933626430 of this job
+        # the runner had 87 GB free before this step, 103 GB after it, and
+        # still 94 GB once the CUDA toolkit and torch were installed, so the
+        # job fits without it today. It stays because that figure belongs to
+        # the runner image and can shrink between runs, and it removes only
+        # the two largest preinstalled trees this job never uses (the Android
+        # SDK and .NET). It cost about two minutes on that run. `df` either
+        # side, so a disk failure can be read from the log.
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Fetch the clickhouse-cpp submodule
+        # Only this one. `make all` links clickhouse-cpp and needs none of the
+        # framework submodules, and `recursive` would also clone
+        # DMI-Megatron-Integration's nested Megatron-LM onto a disk this job
+        # is rationing. clickhouse-cpp has no submodules of its own.
+        run: git submodule update --init third_party/clickhouse-cpp
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # No pip cache: the torch CUDA wheel set is gigabytes, and caching
+          # it would spend the repository's cache quota to save a download.
+
+      - name: Install the CUDA 13.0 compiler and the headers torch includes
+        # NVIDIA's apt repository, and only what the build reads: nvcc
+        # (pulling cccl, crt and nvvm), cudart-dev (pulling driver-dev, whose
+        # stubs/libcuda.so satisfies the backend's -lcuda with no driver
+        # installed), and cublas, cusparse and cusolver for their headers,
+        # which ATen's CUDA context includes. 13.0 because torch 2.14's CUDA
+        # build here is cu130 and the resolver requires the same major.
+        run: |
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            cuda-nvcc-13-0 cuda-cudart-dev-13-0 \
+            libcublas-dev-13-0 libcusparse-dev-13-0 libcusolver-dev-13-0
+          "$CUDA_HOME/bin/nvcc" --version
+          df -h /
+
+      - name: Install the CUDA build of torch
+        # 2.14, the release the GPU hosts run (the plan's pin), from the cu130
+        # index. A CUDA build is required, not the CPU wheel the other jobs
+        # use: the Makefile reads torch.version.cuda to pick the toolkit and
+        # links libtorch_cuda and libc10_cuda.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir "torch==2.14.*" \
+            --index-url https://download.pytorch.org/whl/cu130
+          python -c "import torch; print(torch.__version__, torch.version.cuda)"
+          df -h /
+
+      - name: Build the ClickHouse C++ client
+        # docs/install.md step 5, verbatim.
+        run: |
+          cmake -S third_party/clickhouse-cpp -B third_party/clickhouse-cpp/build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          cmake --build third_party/clickhouse-cpp/build -j"$(nproc)"
+
+      - name: Compile the full native build
+        # `all` is the documented build: the backend plus the capture
+        # extensions (#144), and the store needs libcurl's headers. With the
+        # dev package installed, the Makefile finds it through pkg-config --
+        # its default lookup, so no CURL_* override here: this job builds
+        # exactly what docs/install.md tells a user to run.
+        #
+        # LIBRARY_PATH puts the toolkit's libcuda stub where the linker finds
+        # -lcuda; the result does not end up NEEDing libcuda (checked with
+        # readelf on a local build: the link is --as-needed and nothing calls
+        # the driver API), so check-link's ldd has no driver to find either.
+        env:
+          LIBRARY_PATH: /usr/local/cuda-13.0/targets/x86_64-linux/lib/stubs
+        run: |
+          sudo apt-get install -y -q libcurl4-openssl-dev pkg-config
+          make -C native -j"$(nproc)" all PYTHON=python
+          ls -l src/dmi/_native_backend*.so src/dmi/_dmi_native_sink*.so src/dmi/_dmi_native_store*.so
+
+      - name: Import the backend
+        # A shared library links with undefined symbols; only loading it
+        # proves the link. No device is needed to load it.
+        run: |
+          PYTHONPATH=src python -c "
+          from dmi.transport import native
+          module = native._load_extension()
+          print(module.__file__)
+          assert hasattr(module, 'RecordSink'), 'no RecordSink in the backend'
+          "
+
+      - name: Build the capture sink beside the backend
+        # _dmi_native_sink decides its RecordSink base once, when it loads:
+        # it derives NativePackSink from _native_backend's registration when
+        # that backend is loadable, and registers module-local stand-ins of
+        # its own when it is not. Only the first is attachable --
+        # create_record_runtime checks isinstance against the BACKEND's
+        # RecordSink -- yet the cpu and live jobs build the sink with no
+        # backend, so the stand-in branch was the only one CI ever took.
+        # This is the one job that has a backend to bind to. `all` above has
+        # already built it; the step stays so the dependency is explicit.
+        run: make -C native build/_dmi_native_sink PYTHON=python
+
+      - name: Check the sink binds the backend's RecordSink
+        # Two import orders, one process each, because the binding is fixed
+        # for the process by whichever order ran. Through dmi's loaders, the
+        # order the engine uses: backend first, then the sink. And the bare
+        # `import _dmi_native_sink` the adapter suite does, where the module
+        # has to find the backend itself through dmi.transport.native. Both
+        # assert the stand-ins were NOT taken, which is what the pytest run
+        # after them cannot: its test passes on either branch by design, so
+        # on its own it would stay green with the binding broken. It still
+        # runs, because here it takes the test's backend branch, which no
+        # other job reaches; the grep refuses a skip as a pass.
+        run: |
+          PYTHONPATH=src python -c "
+          from dmi.storage.capture.native_sink import _load_native_sink_extension
+          from dmi.transport import native
+          backend = native._load_extension()
+          sink = _load_native_sink_extension()
+          assert not sink.RING_TYPES_ARE_STANDINS, 'the sink bound stand-ins'
+          assert issubclass(sink.NativePackSink, backend.RecordSink), sink.NativePackSink.__mro__
+          assert not hasattr(sink, 'RecordSink'), 'the sink registered a second RecordSink'
+          print('loaders:', sink.NativePackSink.__mro__)
+          "
+          PYTHONPATH=src:native/build python -c "
+          import torch  # first, as the suite does: the .so has no rpath to libtorch_cpu
+          import _dmi_native_sink as sink
+          from dmi.transport import native
+          assert not sink.RING_TYPES_ARE_STANDINS, 'the sink bound stand-ins'
+          assert issubclass(sink.NativePackSink, native._load_extension().RecordSink), sink.NativePackSink.__mro__
+          print('bare import:', sink.NativePackSink.__mro__)
+          "
+          python -m pip install pytest
+          python -m pytest -q -p no:cacheprovider \
+            "tests/test_native_adapter_torch.py::test_the_sink_derives_from_the_engines_record_sink" \
+            > sink-test.out || { cat sink-test.out; exit 1; }
+          cat sink-test.out
+          # "1 passed in ..." or "1 passed, N warnings in ..." -- a warning
+          # (torch's NumPy one appears here) is not a failure; a skip is.
+          grep -Eq '^1 passed(,| in )' sink-test.out
+          ! grep -Eq '[0-9]+ skipped' sink-test.out
+
+      - name: Build the ring tests and run the host-only ones
+        # All six binaries are compiled, so a .cu test that no longer builds
+        # fails here. Only test_record_consumer and
+        # test_clickhouse_record_sink RUN: they use ATen CPU tensors and no
+        # CUDA call, and pass with no device visible (14 and 21 checks,
+        # measured with CUDA_VISIBLE_DEVICES empty). The other four launch
+        # kernels and belong to the GPU job. CXX_STD because this Makefile's
+        # default is c++17, which torch 2.14's headers refuse.
+        run: |
+          make -C tests/native/ring -j"$(nproc)" all CXX_STD=c++20 PYTHON=python
+          tests/native/ring/build/test_record_consumer
+          tests/native/ring/build/test_clickhouse_record_sink
