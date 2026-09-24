@@ -1,6 +1,6 @@
 """The native capture storage path after the spool, and its query side.
 
-Under ``storage_backend="capture"`` the native pack sink stages immutable
+Under ``storage_backend="persistent"`` the native pack sink stages immutable
 packs in a local spool (``capture_sink_config``). Setting
 ``capture_storage_config`` as well makes the engine run a
 :class:`NativeCaptureStorage` in-process: one C++ thread that uploads each

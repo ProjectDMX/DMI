@@ -119,7 +119,17 @@ class MonitoringEngine:
         if host_engine is not None and db_config is not None:
             raise ValueError("Provide either host_engine or db_config, not both")
 
-        self._storage_backend = getattr(config, "storage_backend", "auto")
+        # The canonical name: a deprecated one ("native", "capture") is
+        # replaced here, for a MonitoringConfig and any config-like object
+        # alike, so everything below reads only the current three choices
+        # and "auto".
+        from .config import canonical_storage_backend
+
+        # What the caller wrote, kept only to quote it back in a refusal.
+        self._storage_backend_requested = getattr(
+            config, "storage_backend", "auto")
+        self._storage_backend: str = canonical_storage_backend(
+            self._storage_backend_requested)
         # A None config is the ctor's documented no-configuration mode;
         # say so here rather than behind a getattr default.
         self._capture_sink_config = (
@@ -143,15 +153,23 @@ class MonitoringEngine:
         # The running storage service, while a record runtime is attached.
         self._capture_storage: Optional[Any] = None
         host_configured = host_engine is not None or db_config is not None
-        if self._storage_backend == "native" and not host_configured:
+        if self._storage_backend == "in-memory" and not host_configured:
             raise ValueError(
-                "config.storage_backend='native' selects the C++ "
-                "ClickHouseRecordSink, which needs a host engine: pass "
-                "host_engine= or db_config="
+                f"config.storage_backend={self._backend_label()} delivers "
+                "records through "
+                "the C++ ClickHouseRecordSink until its consumer interface "
+                "exists, which needs a host engine: pass host_engine= or "
+                "db_config="
             )
-        if self._storage_backend in ("capture", "none") and host_configured:
+        if self._storage_backend == "none" and ring_config is not None:
             raise ValueError(
-                f"config.storage_backend={self._storage_backend!r} does not "
+                "config.storage_backend='none' turns capture off, so the "
+                "engine allocates no ring, but a ring_config was given. Pick "
+                "'in-memory' or 'persistent' to capture, or drop ring_config"
+            )
+        if self._storage_backend in ("persistent", "none") and host_configured:
+            raise ValueError(
+                f"config.storage_backend={self._backend_label()} does not "
                 "use the C++ ClickHouse host, but host_engine/db_config was "
                 "given. Configured together, the host engine starts, connects "
                 "and is then never fed, because a record runtime is handed "
@@ -185,6 +203,10 @@ class MonitoringEngine:
                 except Exception as exc:
                     raise RuntimeError("Failed to start host_engine") from exc
 
+        # Capture off means no ring at all: none of its pinned staging and
+        # payload memory is allocated.
+        if self._storage_backend == "none":
+            enable_ring_transport = False
         if enable_ring_transport or ring_config is not None:
             if ring_config is None:
                 ring_config = self._make_default_ring_config(
@@ -244,6 +266,15 @@ class MonitoringEngine:
         # lifecycle toggle; the next committed step recomputes it.
         transport.force_eager = False
 
+    def _backend_label(self) -> str:
+        """The storage backend as the caller wrote it, with its current name
+        when that was a deprecated one: ``'native' (now 'in-memory')``."""
+        requested = getattr(self, "_storage_backend_requested",
+                            self._storage_backend)
+        if requested == self._storage_backend:
+            return repr(self._storage_backend)
+        return f"{requested!r} (now {self._storage_backend!r})"
+
     def _reject_a_sink_the_config_did_not_ask_for(
         self, record_sink: Optional[Any]
     ) -> None:
@@ -262,17 +293,19 @@ class MonitoringEngine:
         backend = getattr(self, "_storage_backend", "auto")
         if backend == "auto":
             return
-        if backend == "capture" and record_sink is None:
+        if backend == "persistent" and record_sink is None:
             raise ValueError(
-                "config.storage_backend='capture' selects the object-store "
+                f"config.storage_backend={self._backend_label()} selects the "
+                "object-store "
                 "path, whose default writer is the native pack sink — pass "
                 "capture_sink_config=NativeSinkConfig(...) in the config, or "
                 "a record_sink explicitly (the reference sink is the "
                 "documented rollback)"
             )
-        if backend in ("native", "none") and record_sink is not None:
+        if backend in ("in-memory", "none") and record_sink is not None:
             raise ValueError(
-                f"config.storage_backend={backend!r} does not use an explicit "
+                f"config.storage_backend={self._backend_label()} does not use "
+                "an explicit "
                 "record_sink; passing one would send records to a backend the "
                 "configuration did not select"
             )
@@ -290,6 +323,12 @@ class MonitoringEngine:
         runtime; the two paths are never active at the same time.
         """
 
+        if getattr(self, "_storage_backend", "auto") == "none":
+            raise RuntimeError(
+                "config.storage_backend='none' turns capture off: this engine "
+                "has no ring and creates no record runtime. Pick 'in-memory' "
+                "or 'persistent' to capture"
+            )
         transport = self._ring_transport
         ring_config = self._ring_config
         if transport is None or ring_config is None:
@@ -322,7 +361,7 @@ class MonitoringEngine:
 
     def _start_capture_storage(self, *, sweep_spool: bool) -> Optional[Any]:
         config = self._capture_storage_config
-        if config is None or self._storage_backend != "capture":
+        if config is None or self._storage_backend != "persistent":
             return None
         from .storage.native_capture import NativeCaptureStorage
 
@@ -346,13 +385,13 @@ class MonitoringEngine:
         from .records import RecordRuntime
 
         ring_config = self._ring_config
-        # D4's flip: the capture backend's default writer is the native
+        # D4's flip: the persistent backend's default writer is the native
         # pack sink, built from the config's bounds. An explicit
         # record_sink overrides it — the reference sink is the documented
         # rollback — and the ClickHouse host path is untouched.
         if (
             record_sink is None
-            and self._storage_backend == "capture"
+            and self._storage_backend == "persistent"
             and self._capture_sink_config is not None
         ):
             from .storage.capture.native_sink import create_native_pack_sink
@@ -467,6 +506,8 @@ class MonitoringEngine:
     ) -> Any:
         """Switch to ring-based D2H transport.
 
+        Refused under ``storage_backend="none"``, which turns capture off.
+
         Creates a RingEngine with the C++ host engine as the submit target so
         tensor reconstruction, slicing, and DB submission all happen in C++
         without the GIL.
@@ -483,6 +524,11 @@ class MonitoringEngine:
             ``self._ring_transport``).  Returned so adapters can hold a
             direct reference instead of reaching through the engine.
         """
+        if getattr(self, "_storage_backend", "auto") == "none":
+            raise RuntimeError(
+                "config.storage_backend='none' turns capture off: this engine "
+                "allocates no ring. Pick 'in-memory' or 'persistent' to capture"
+            )
         _rt = _ring_module()
         _native_engine = _native_module()
 

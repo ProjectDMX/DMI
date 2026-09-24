@@ -3,10 +3,53 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import sys
+import warnings
 from typing import Literal, Optional, get_args
 
 
-StorageBackend = Literal["auto", "native", "capture", "none"]
+StorageBackend = Literal[
+    "in-memory", "persistent", "none", "auto", "native", "capture"]
+
+# The names the engine acts on: a deprecated name is replaced before anything
+# compares against these.
+CanonicalStorageBackend = Literal["in-memory", "persistent", "none", "auto"]
+
+# What a user chooses; the configurator emits exactly one of these. "auto" is
+# the unset default, and "native"/"capture" are the deprecated earlier names.
+USER_STORAGE_CHOICES = ("in-memory", "persistent", "none")
+
+_DEPRECATED_STORAGE_BACKENDS = {"native": "in-memory", "capture": "persistent"}
+
+
+def canonical_storage_backend(name: str) -> CanonicalStorageBackend:
+    """``name`` with a deprecated storage backend replaced by its new one.
+
+    Unknown names are refused here as well as in ``MonitoringConfig``, so an
+    engine handed any config-like object acts only on the current names.
+    """
+    if name not in get_args(StorageBackend):
+        raise ValueError(
+            "storage_backend must be one of "
+            + ", ".join(repr(choice) for choice in USER_STORAGE_CHOICES)
+            + f" (or left unset); got {name!r}"
+        )
+    return _DEPRECATED_STORAGE_BACKENDS.get(name, name)  # type: ignore[return-value]
+
+
+def _caller_stacklevel() -> int:
+    """The ``stacklevel`` that points a warning raised in ``__post_init__``
+    at user code: past the dataclass-generated ``__init__`` and, for a copy,
+    past ``dataclasses.replace``."""
+    frame = sys._getframe(1)  # __post_init__
+    level = 1
+    while frame is not None and (
+        frame.f_code.co_filename in (__file__, "<string>")
+        or frame.f_code.co_filename.endswith("dataclasses.py")
+    ):
+        frame = frame.f_back
+        level += 1
+    return level
 
 
 @dataclass
@@ -71,29 +114,36 @@ class MonitoringConfig:
 
     schedule: CaptureSchedule = field(default_factory=CaptureSchedule)
 
-    # Which of the two storage paths this engine is for. They are mutually
-    # exclusive per record runtime and share nothing but the record envelope:
+    # Where captured records go. The user's choice is one of three:
     #
-    #   "native"  -- the C++ ``ClickHouseRecordSink``: one ClickHouse row per
-    #                record with the tensor bytes inline, into its own table.
-    #                Requires ``host_engine`` or ``db_config`` on the engine,
-    #                and refuses an explicit ``record_sink``.
-    #   "capture" -- the capture path: immutable packs in object storage
-    #                with the catalog as an index over them. Defaults to the
-    #                native pack writer (built from ``capture_sink_config``);
-    #                an explicit ``record_sink`` overrides it — pass the
-    #                reference sink to roll back. Refuses a host engine,
-    #                which would otherwise sit started, connected and unused.
-    #   "none"    -- capture and transport with no persistence at all.
-    #   "auto"    -- infer from what was passed, which is what every caller
-    #                did before this field existed and remains the default.
+    #   "in-memory"  -- records are delivered in memory. Until its consumer
+    #                   interface exists this is the C++
+    #                   ``ClickHouseRecordSink``: one ClickHouse row per record
+    #                   with the tensor bytes inline. Requires ``host_engine``
+    #                   or ``db_config`` on the engine, and refuses an explicit
+    #                   ``record_sink``.
+    #   "persistent" -- the native capture storage path: immutable packs in
+    #                   object storage with the ClickHouse catalog as an index
+    #                   over them. Defaults to the native pack writer (built
+    #                   from ``capture_sink_config``); an explicit
+    #                   ``record_sink`` overrides it -- pass the reference sink
+    #                   to roll back. Refuses a host engine, which would
+    #                   otherwise sit started, connected and unused.
+    #   "none"       -- capture off entirely: the engine allocates no ring, and
+    #                   refuses a record runtime, a host engine and adapter
+    #                   attachment.
+    #
+    # "auto", the default, is not a choice but its absence: infer from what
+    # was passed, which is what every caller did before this field existed.
+    # "native" and "capture" are the earlier names of "in-memory" and
+    # "persistent"; they still work and warn.
     #
     # The point of declaring it is that a mismatch becomes an error instead of
     # a silent choice: passing a ``record_sink`` while a host engine is
     # configured writes packs and leaves a ClickHouse insert pipeline running
     # that nothing feeds, and "auto" cannot tell that apart from intent.
-    # The capture backend's default writer bounds, when ``storage_backend``
-    # is "capture" and the caller passes no ``record_sink``. Typed, not
+    # The persistent path's default writer bounds, when ``storage_backend``
+    # is "persistent" and the caller passes no ``record_sink``. Typed, not
     # Any: the engine validates it at the boundary, and the type is the
     # contract's documentation. The native pack
     # sink is the default writer (D4's flip, post-Checkpoint-B); passing a
@@ -106,51 +156,56 @@ class MonitoringConfig:
     # the sink stages to the object store and indexes it into the ClickHouse
     # catalog, and ``flush_and_wait`` returns only once they are queryable.
     # Unset, packs stay in the spool for something else to drain. Needs
-    # ``storage_backend="capture"`` and ``capture_sink_config``, whose spool
-    # it drains.
+    # ``storage_backend="persistent"`` and ``capture_sink_config``, whose
+    # spool it drains.
     capture_storage_config: Optional["NativeCaptureStorageConfig"] = None
 
     storage_backend: StorageBackend = "auto"
 
+    @property
+    def canonical_storage_backend(self) -> CanonicalStorageBackend:
+        """``storage_backend`` with a deprecated name replaced by its new one."""
+        return canonical_storage_backend(self.storage_backend)
+
     def __post_init__(self) -> None:
-        backends = get_args(StorageBackend)
-        if self.storage_backend not in backends:
-            raise ValueError(
-                "storage_backend must be one of "
-                + ", ".join(repr(name) for name in backends)
-                + f"; got {self.storage_backend!r}"
+        canonical_storage_backend(self.storage_backend)  # refuses unknowns
+        replacement = _DEPRECATED_STORAGE_BACKENDS.get(self.storage_backend)
+        if replacement is not None:
+            warnings.warn(
+                f"storage_backend={self.storage_backend!r} is deprecated; use "
+                f"{replacement!r}, which means the same",
+                DeprecationWarning,
+                stacklevel=_caller_stacklevel(),
             )
+        backend = self.canonical_storage_backend
         # ``capture_sink_config`` is read in exactly one place -- the
-        # engine's default-writer branch, which tests ``storage_backend ==
-        # "capture"`` literally. Nothing RESOLVES "auto" into "capture":
-        # "auto" is the pre-field behaviour, and it reaches that branch as
-        # "auto" and falls straight through. So under any other backend a
-        # configured sink is not merely unused, it is unreachable, and the
-        # engine's type check at the boundary passes a config that then
-        # writes no packs at all -- the silent no-op this field's own design
-        # note ("a mismatch becomes an error instead of a silent choice")
-        # exists to prevent.
+        # engine's default-writer branch, which tests for "persistent"
+        # literally. Nothing RESOLVES "auto" into "persistent": "auto" is the
+        # pre-field behaviour, and it reaches that branch as "auto" and falls
+        # straight through. So under any other backend a configured sink is
+        # not merely unused, it is unreachable, and the engine's type check
+        # at the boundary passes a config that then writes no packs at all --
+        # the silent no-op this field's own design note ("a mismatch becomes
+        # an error instead of a silent choice") exists to prevent.
         #
         # Deliberate behaviour change: a caller who passes the sink config
-        # with a non-capture backend gets a startup error where they used to
-        # get silence. That is the trade the note asks for -- the alternative
-        # is a run that captures nothing and says so nowhere.
-        if self.capture_sink_config is not None and (
-            self.storage_backend != "capture"
-        ):
+        # with a non-persistent backend gets a startup error where they used
+        # to get silence. That is the trade the note asks for -- the
+        # alternative is a run that captures nothing and says so nowhere.
+        if self.capture_sink_config is not None and backend != "persistent":
             raise ValueError(
-                "capture_sink_config configures the capture backend's "
+                "capture_sink_config configures the persistent path's "
                 "default pack writer and is read only when "
-                "storage_backend='capture'; got storage_backend="
+                "storage_backend='persistent'; got storage_backend="
                 f"{self.storage_backend!r}, under which it would be silently "
                 "ignored and nothing would be written. Set "
-                "storage_backend='capture', or drop capture_sink_config"
+                "storage_backend='persistent', or drop capture_sink_config"
             )
         if self.capture_storage_config is not None and (
             self.capture_sink_config is None
         ):
             raise ValueError(
                 "capture_storage_config drains the spool capture_sink_config "
-                "stages into; set storage_backend='capture' and "
+                "stages into; set storage_backend='persistent' and "
                 "capture_sink_config=NativeSinkConfig(...) with it"
             )

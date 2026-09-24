@@ -38,7 +38,7 @@ def test_storage_config_needs_the_sink_config_whose_spool_it_drains():
     from dmi.config import MonitoringConfig
 
     with pytest.raises(ValueError, match="capture_sink_config"):
-        MonitoringConfig(storage_backend="capture",
+        MonitoringConfig(storage_backend="persistent",
                          capture_storage_config=_storage_config())
 
 
@@ -48,7 +48,7 @@ def test_storage_config_is_accepted_beside_a_sink_config(tmp_path):
 
     storage = _storage_config()
     config = MonitoringConfig(
-        storage_backend="capture",
+        storage_backend="persistent",
         capture_sink_config=NativeSinkConfig(spool_root=str(tmp_path)),
         capture_storage_config=storage,
     )
@@ -158,7 +158,7 @@ def test_read_accepts_a_zero_byte_limit(monkeypatch):
 
 
 def test_engine_refuses_a_storage_config_of_the_wrong_type():
-    config = SimpleNamespace(storage_backend="capture", capture_sink_config=None,
+    config = SimpleNamespace(storage_backend="persistent", capture_sink_config=None,
                              capture_storage_config={"s3_bucket": "b"})
     with pytest.raises(TypeError, match="NativeCaptureStorageConfig"):
         MonitoringEngine(config=config, enable_ring_transport=False)
@@ -197,7 +197,7 @@ class _FakeService:
 
 
 def _capture_engine(monkeypatch, tmp_path, *, fail_ring=False):
-    """An engine under storage_backend="capture" with both native modules
+    """An engine under storage_backend="persistent" with both native modules
     faked. Returns (engine, events, services)."""
     from dmi.storage.capture.native_sink import NativeSinkConfig
 
@@ -207,7 +207,7 @@ def _capture_engine(monkeypatch, tmp_path, *, fail_ring=False):
                                              force_eager=False)
     engine._ring_engine = SimpleNamespace(stop=lambda: None)
     engine._ring_config = object()
-    engine._storage_backend = "capture"
+    engine._storage_backend = "persistent"
     engine._capture_sink_config = NativeSinkConfig(
         spool_root=str(tmp_path / "spool"), spool_max_bytes=1 << 30)
     engine._capture_storage_config = _storage_config()

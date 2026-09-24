@@ -1,7 +1,7 @@
 """GPU -> Ring -> NativePackSink -> storage service -> catalog -> reader.
 
 The whole native capture storage path on a real engine, selected by config
-alone: ``storage_backend="capture"`` with ``capture_sink_config`` and
+alone: ``storage_backend="persistent"`` with ``capture_sink_config`` and
 ``capture_storage_config``. ``flush_and_wait`` returning is the promise under
 test -- every record captured before it is queryable in the catalog and reads
 back byte-identical to the CUDA tensor it came from -- with no Python between
@@ -119,7 +119,7 @@ def test_flush_and_wait_means_queryable_and_byte_identical(fake_s3, tmp_path):
         poll_interval_s=0.05,
     )
     config = MonitoringConfig(
-        storage_backend="capture",
+        storage_backend="persistent",
         capture_sink_config=NativeSinkConfig(
             spool_root=str(tmp_path / "spool"), max_pack_records=2,
             max_linger_ns=60_000_000_000),
@@ -201,7 +201,7 @@ def test_close_alone_delivers_the_tail_to_the_catalog(fake_s3, tmp_path):
         poll_interval_s=0.05,
     )
     config = MonitoringConfig(
-        storage_backend="capture",
+        storage_backend="persistent",
         capture_sink_config=NativeSinkConfig(
             spool_root=str(tmp_path / "spool"), max_pack_records=2,
             max_linger_ns=60_000_000_000),

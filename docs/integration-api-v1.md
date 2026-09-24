@@ -135,15 +135,36 @@ schedule.should_capture_step(
 The predicates apply warmup, then offset, then stride. Step selection also
 honors `capture_prefill`/`capture_decode`; an unknown phase raises `ValueError`.
 `MonitoringConfig` carries this schedule plus three storage fields:
-`storage_backend` (`"auto" | "native" | "capture" | "none"`),
-`capture_sink_config` (a `NativeSinkConfig`, or `None`) and
+`storage_backend`, `capture_sink_config` (a `NativeSinkConfig`, or `None`) and
 `capture_storage_config` (a `NativeCaptureStorageConfig` from
-`dmi.storage.native_capture`, or `None`). All are acted on by
-`MonitoringEngine`, and some combinations are refused at construction --
-`storage_backend="native"` without a host engine, or `"capture"`/`"none"` with
-one, or `capture_storage_config` without `capture_sink_config` -- so a caller
-setting them should expect `ValueError` rather than a silent choice.
-`capture_sink_config` is read only when `storage_backend` is `"capture"`; see
+`dmi.storage.native_capture`, or `None`).
+
+`storage_backend` is the user's storage choice, one of
+`dmi.config.USER_STORAGE_CHOICES`:
+
+- `"in-memory"`: records are delivered in memory. Until its consumer interface
+  exists, this runs the C++ `ClickHouseRecordSink` and needs a host engine.
+- `"persistent"`: the native capture storage path (object store + catalog +
+  ClickHouse).
+- `"none"`: capture off entirely. The engine allocates no ring, and a record
+  runtime, a host engine, a `ring_config` and adapter attachment are refused.
+
+Left unset, it is `"auto"`, which infers the path from what was passed, as every
+caller did before the field existed. The earlier names `"native"` and
+`"capture"` still work, with a `DeprecationWarning`, and mean `"in-memory"` and
+`"persistent"`. `MonitoringConfig.canonical_storage_backend` gives the current
+name.
+
+All three fields are acted on by `MonitoringEngine`, and a mismatch is an error
+rather than a silent choice:
+
+- At construction, `ValueError`: `"in-memory"` without a host engine,
+  `"persistent"` or `"none"` with one, `"none"` with a `ring_config`, or
+  `capture_storage_config` without `capture_sink_config`.
+- Under `"none"`, `RuntimeError` from `create_record_runtime()` and
+  `enable_ring_transport()`, and `ConfigurationError` from an adaptor's
+  `attach_model()`.
+`capture_sink_config` is read only when `storage_backend` is `"persistent"`; see
 `docs/capture-storage-design.md` for the writer it selects. With
 `capture_storage_config` as well, the engine runs the native storage service
 in-process: from `create_record_runtime` until `close`, or until
@@ -156,7 +177,7 @@ drives this path yet: the HF, vLLM and Megatron integrations never create a
 capture record runtime, so it is reached only by a caller that builds the
 record runtime and its hook points itself, as
 `tests/test_native_capture_storage_gpu_e2e.py` does, and the HF adaptor
-refuses the capture backend with `ConfigurationError` rather than generating
+refuses the persistent backend with `ConfigurationError` rather than generating
 with nothing stored. The catalog
 takes one publisher per `(database, table_prefix)`, so a second engine on the
 same catalog is refused at `create_record_runtime`.
@@ -484,7 +505,8 @@ or non-owning PP/TP hooks, installs ring fields on remaining HookPoints, and
 publishes the selected inventory. It mutates HookPoints and is not
 transactional; call it before graph capture. An unknown
 selection raises `ValueError`, and an executable inventory containing
-`module=None` raises `RuntimeError`. Under `storage_backend="capture"` it raises
+`module=None` raises `RuntimeError`. Under `storage_backend="persistent"`, and
+under `"none"`, which turns capture off, it raises
 `dmi.configuration.ConfigurationError`, as do the HF entry points built on it,
 `generate_with_monitoring()` and `generate_greedy_with_monitoring()`: no adaptor
 drives the capture storage path yet, and attaching would install hooks whose
@@ -567,7 +589,7 @@ This holds while capture is disabled too, so disabling capture never turns
 a record-mode step into `SKIPPED`: `set_capture_enabled(False)` leaves the
 installed `HookPoint`s armed, and on a record ring they would fail inside the
 model forward with a native error that names neither the adaptor nor the cause.
-Under `storage_backend="capture"` it raises `ConfigurationError`, also before
+Under `storage_backend="persistent"` it raises `ConfigurationError`, also before
 reserving anything, for the reason `attach_model()` does. The check is repeated
 here because a step need not come through the base `attach_model()`: an adaptor
 may override it without calling `super()`, or arm its hooks with
