@@ -537,42 +537,23 @@ jobs:
                 -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           cmake --build third_party/clickhouse-cpp/build -j"$(nproc)"
 
-      - name: "Compile the torch-including targets as C++20 until #138 lands"
-        # torch 2.14's headers open with `#error C++20 or later compatible
-        # compiler is required` (reproduced: the stock flags stop at
-        # bindings.cpp with exactly that). #138 moves CXXFLAGS, HOST_CXXFLAGS
-        # and NVCCFLAGS to -std=c++20; until it merges, this makes the same
-        # three edits to the checkout -- they are the lines #138 changes and
-        # nothing else. Once it has merged, the sed matches nothing, the diff
-        # below is empty, and this step should be deleted. The Makefile's
-        # variables are `:=` assignments, so a command-line override would
-        # replace the whole flag set rather than the standard; hence sed.
+      - name: Compile the full native build
+        # `all` is the documented build: the backend plus the capture
+        # extensions (#144), and the store needs libcurl's headers. With the
+        # dev package installed, the Makefile finds it through pkg-config --
+        # its default lookup, so no CURL_* override here: this job builds
+        # exactly what docs/install.md tells a user to run.
         #
-        # The count check alone cannot say that: with #138 merged the three
-        # lines already read c++20, so it still counts 3 and the step passes
-        # having done nothing. An unchanged Makefile is that state and only
-        # that state -- before #138 the sed always rewrites all three -- so
-        # it raises a warning on the run summary rather than failing the job.
-        run: |
-          sed -i \
-            -e '/^CXXFLAGS :=/s/-std=c++17/-std=c++20/' \
-            -e '/^HOST_CXXFLAGS :=/s/-std=c++17/-std=c++20/' \
-            -e '/^NVCCFLAGS :=/,/-std=/s/-std=c++17/-std=c++20/' \
-            native/Makefile
-          if git diff --quiet native/Makefile; then
-            echo "::warning title=Delete the C++20 sed step::native/Makefile already compiles as C++20, so #138 has landed and this step changed nothing. Delete it from python-checks.yml."
-          fi
-          git diff native/Makefile
-          test "$(grep -cE '^(HOST_)?CXXFLAGS := -std=c\+\+20|^    -std=c\+\+20 \\$' native/Makefile)" = 3
-
-      - name: Compile the full native backend
         # LIBRARY_PATH puts the toolkit's libcuda stub where the linker finds
         # -lcuda; the result does not end up NEEDing libcuda (checked with
         # readelf on a local build: the link is --as-needed and nothing calls
         # the driver API), so check-link's ldd has no driver to find either.
         env:
           LIBRARY_PATH: /usr/local/cuda-13.0/targets/x86_64-linux/lib/stubs
-        run: make -C native -j"$(nproc)" all PYTHON=python
+        run: |
+          sudo apt-get install -y -q libcurl4-openssl-dev pkg-config
+          make -C native -j"$(nproc)" all PYTHON=python
+          ls -l src/dmi/_native_backend*.so src/dmi/_dmi_native_sink*.so src/dmi/_dmi_native_store*.so
 
       - name: Import the backend
         # A shared library links with undefined symbols; only loading it
@@ -593,8 +574,8 @@ jobs:
         # create_record_runtime checks isinstance against the BACKEND's
         # RecordSink -- yet the cpu and live jobs build the sink with no
         # backend, so the stand-in branch was the only one CI ever took.
-        # This is the one job that has a backend to bind to. Same torch and
-        # PYTHON as the backend build above.
+        # This is the one job that has a backend to bind to. `all` above has
+        # already built it; the step stays so the dependency is explicit.
         run: make -C native build/_dmi_native_sink PYTHON=python
 
       - name: Check the sink binds the backend's RecordSink
