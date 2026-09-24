@@ -494,8 +494,10 @@ jobs:
     # (nvidia/cuda:13.0.1-devel-ubuntu24.04, amd64, per its registry
     # manifest) -- several times that unpacked -- before the ~4.4 GB that
     # torch 2.14+cu130 and its nvidia-* wheels take installed (measured in a
-    # cu130 venv). That does not reliably fit the ~14 GB a hosted runner
-    # guarantees. Installing only the packages the build reads is ~2.7 GB:
+    # cu130 venv). The free disk on a hosted runner is the image's to
+    # decide, not this repository's, so the job keeps its footprint small
+    # rather than depend on it. Installing only the packages the build
+    # reads is ~2.7 GB:
     # the header set comes from the -MMD dependency files of a real build,
     # mapped to packages with dpkg -S on a host whose toolkit came from the
     # same apt repository, and the sizes are those packages' Installed-Size.
@@ -511,9 +513,14 @@ jobs:
 
     steps:
       - name: Free runner disk
-        # The two largest preinstalled trees this job never uses (the
-        # Android SDK and .NET); `df` either side so a disk failure is
-        # readable from the log.
+        # A precaution, not a measured need. On run 35933626430 of this job
+        # the runner had 87 GB free before this step, 103 GB after it, and
+        # still 94 GB once the CUDA toolkit and torch were installed, so the
+        # job fits without it today. It stays because that figure belongs to
+        # the runner image and can shrink between runs, and it removes only
+        # the two largest preinstalled trees this job never uses (the Android
+        # SDK and .NET). It cost about two minutes on that run. `df` either
+        # side, so a disk failure can be read from the log.
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet
