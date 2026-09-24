@@ -427,10 +427,14 @@ STORE_HEADERS := $(wildcard csrc/catalog/*.h csrc/store/*.h csrc/pack/*.h csrc/c
 
 # What the extensions are built against beyond their sources: torch
 # (libtorch for the sink, pybind11's headers for both), the C++ ABI it
-# expects and the Python it runs in. A torch upgrade in the venv changes no
-# source file, so without this record a file-named target stays "up to date"
-# and keeps the old build. Rewritten only when the record changes, like
-# $(CUDA_CONFIG_STAMP), so an unchanged venv relinks nothing.
+# expects and the Python it runs in, the compiler, and the libcurl
+# directories the store links against. A torch upgrade in the venv, or a
+# CURL_INCDIR pointed at another libcurl, changes no source file, so without
+# this record a file-named target stays "up to date" and keeps the old build.
+# Rewritten only when the record changes, like $(CUDA_CONFIG_STAMP), so an
+# unchanged configuration relinks nothing. One record for both extensions:
+# the sink, which links no libcurl, relinks on a libcurl change too, which
+# costs a few seconds and keeps this to one stamp.
 TORCH_EXT_RECORD_PY := import sys, sysconfig, torch; \
     from torch.utils.cpp_extension import include_paths, library_paths; \
     print("|".join([torch.__version__, str(torch.version.git_version), \
@@ -440,7 +444,8 @@ TORCH_EXT_RECORD_PY := import sys, sysconfig, torch; \
 
 $(TORCH_EXT_STAMP): FORCE | $(BUILD_DIR)
 	record=$$($(PYTHON) -c '$(TORCH_EXT_RECORD_PY)') && \
-	    $(PYTHON) $(CUDA_RESOLVER) write-stamp --output $@ --record "$$record"
+	    $(PYTHON) $(CUDA_RESOLVER) write-stamp --output $@ \
+	        --record "$$record|$(CXX)|$(CURL_CPPFLAGS)|$(CURL_LDFLAGS)"
 
 .PHONY: build/_dmi_native_sink build/_dmi_native_store
 capture: $(SINK_FINAL_TARGET) $(STORE_FINAL_TARGET)

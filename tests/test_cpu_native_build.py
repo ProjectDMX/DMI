@@ -778,3 +778,53 @@ def test_capture_extensions_relink_when_torch_changes(tmp_path):
     written.write_text(record.replace(torch.__version__, "0.0.0"))
     assert _make(*goal).returncode == 0
     assert written.read_text() == record
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("change", ["CURL_INCDIR", "CXX"])
+def test_capture_extensions_relink_when_compiler_or_libcurl_changes(
+    tmp_path, change
+):
+    # The stamp is the extensions' only record of how they were built, so
+    # it has to hold the compiler and the libcurl directories too: pointed
+    # at another libcurl, or built with another compiler, an up-to-date
+    # _dmi_native_store otherwise kept the old link. Real runs with a
+    # compiler that logs its link lines and writes an empty output, so
+    # nothing is compiled; the stand-in checkout keeps the installed link
+    # out of this one's src/dmi.
+    log = tmp_path / "links.log"
+    compilers = []
+    for name in ("c++", "other-c++"):
+        compiler = tmp_path / name
+        compiler.write_text(
+            "#!/bin/sh\n"
+            'out=""; prev=""\n'
+            'for arg in "$@"; do [ "$prev" = -o ] && out="$arg"; prev="$arg"; done\n'
+            '[ "$out" = /dev/null ] && exit 0\n'
+            f'echo "$0 $*" >> {log}\n'
+            ': > "$out"\n'
+        )
+        compiler.chmod(0o755)
+        compilers.append(compiler)
+    (tmp_path / "checkout" / "src" / "dmi").mkdir(parents=True)
+    build_dir = tmp_path / "build"
+    built = f"{build_dir}/_dmi_native_store{_EXT_SUFFIX}"
+    settings = {"CXX": str(compilers[0]), "CURL_INCDIR": "/curl/a/include",
+                "CURL_LIBDIR": "/curl/a/lib"}
+
+    def build(**changed: str) -> list[str]:
+        before = log.read_text().splitlines() if log.exists() else []
+        result = _make(f"PROJECT_ROOT={tmp_path / 'checkout'}",
+                       f"BUILD_DIR={build_dir}", "build/_dmi_native_store",
+                       *(f"{key}={value}" for key, value
+                         in {**settings, **changed}.items()))
+        assert result.returncode == 0, result.stdout + result.stderr
+        return [line for line in log.read_text().splitlines()[len(before):]
+                if f"-o {built}" in line]
+
+    assert build(), "the first build linked nothing"
+    assert build() == [], "an unchanged configuration relinked"
+    other = {"CXX": str(compilers[1]), "CURL_INCDIR": "/curl/b/include"}[change]
+    relinked = build(**{change: other})
+    assert len(relinked) == 1, f"changing {change} did not relink the store"
+    assert other in relinked[0]
