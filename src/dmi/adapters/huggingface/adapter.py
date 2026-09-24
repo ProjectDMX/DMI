@@ -310,7 +310,14 @@ class HuggingFaceAdapter(BackendAdapter):
 
             @functools.wraps(orig_prepare)
             def _prepare_wrapper(*args: Any, **kwargs: Any) -> Any:
-                if adaptor_self.transport is None or adaptor_self.transport.null_offload:
+                transport = adaptor_self.transport
+                # Null mode skips the driver, except in record mode: there
+                # before_forward refuses the step, and skipping it would
+                # leave the armed HookPoints to fail inside the forward.
+                if transport is None or (
+                        transport.null_offload
+                        and not getattr(adaptor_self.engine,
+                                        "_record_mode", False)):
                     return orig_prepare(*args, **kwargs)
                 if _profile:
                     _t0 = time.perf_counter()

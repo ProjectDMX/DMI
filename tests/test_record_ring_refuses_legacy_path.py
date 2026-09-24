@@ -42,7 +42,8 @@ pytestmark = [
 ]
 
 REFUSED = "cannot be used on a record ring"
-RECORD_MODE_REFUSAL = r"commit_step\(\): the engine is in record mode"
+RECORD_MODE_REFUSAL = (
+    r"(before_forward|commit_step)\(\): the engine is in record mode")
 
 
 def _ring_config():

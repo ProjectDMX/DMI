@@ -287,9 +287,37 @@ class BackendAdapter(abc.ABC):
             return False
         return (effective - schedule.step_offset) % schedule.step_stride == 0
 
+    def _refuse_record_mode(self, entry_point: str) -> None:
+        """Refuse the legacy step protocol on an engine in record mode.
+
+        A record ring refuses the legacy step protocol natively, but an
+        adapter attached before ``create_record_runtime`` still holds the
+        stopped legacy ring, which accepts it: the step would reserve and
+        publish into a ring nobody drains. So the refusal is here, whichever
+        ring the adapter holds.
+
+        It also comes before the null-mode early return. Disabling capture
+        (``set_capture_enabled(False)``) leaves the HookPoints armed, and on
+        a record ring they then fail inside the model forward with the
+        native "legacy producer cannot be used on a record ring", which
+        names neither the adapter nor the fix.
+        """
+        if getattr(self.engine, "_record_mode", False):
+            raise RuntimeError(
+                f"{entry_point}: the engine is in record mode "
+                "(create_record_runtime replaced its legacy ring), and "
+                f"{type(self).__name__} drives the legacy step protocol, "
+                "which a record ring cannot store. Capture records through "
+                "the RecordRuntime, or monitor on an engine without one."
+            )
+
     def before_forward(self, *raw) -> None:
         """Canonical per-step driver.  See module docstring for the flow."""
-        if self.transport is None or self.transport.null_offload:
+        if self.transport is None:
+            return
+        # Before the null-mode return: see _refuse_record_mode.
+        self._refuse_record_mode("before_forward()")
+        if self.transport.null_offload:
             return
         # Disarm the hooks FIRST: skipping plan/commit is not enough, because
         # the model's HookPoints still fire during this step's forward and
@@ -322,20 +350,12 @@ class BackendAdapter(abc.ABC):
         the real layout is known, without exposing the transport or native
         ring engine.
         """
-        if self.transport is None or self.transport.null_offload:
+        if self.transport is None:
             return StepReservation.SKIPPED
-        if getattr(self.engine, "_record_mode", False):
-            # A record ring refuses the legacy step protocol natively, but an
-            # adapter attached before create_record_runtime still holds the
-            # stopped legacy ring, which accepts it: the step would reserve
-            # and publish into a ring nobody drains. Refuse either way.
-            raise RuntimeError(
-                "commit_step(): the engine is in record mode "
-                "(create_record_runtime replaced its legacy ring), and "
-                f"{type(self).__name__} drives the legacy step protocol, "
-                "which a record ring cannot store. Capture records through "
-                "the RecordRuntime, or monitor on an engine without one."
-            )
+        # Before the null-mode return: see _refuse_record_mode.
+        self._refuse_record_mode("commit_step()")
+        if self.transport.null_offload:
+            return StepReservation.SKIPPED
         # attach_model refuses the capture config, but not every step comes
         # through it: an adapter may override attach_model without calling
         # super() (attach_config allows that), and a v1 integration may arm

@@ -33,7 +33,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from dmi.adapters.base import BackendAdapter, StepPlan
+from dmi.adapters.base import BackendAdapter, StepPlan, StepReservation
 from dmi.adapters.huggingface.adapter import HuggingFaceAdapter
 from dmi.adapters.huggingface.generation import (
     generate_greedy_with_monitoring,
@@ -52,7 +52,8 @@ pytestmark = pytest.mark.cpu
 
 ADAPTER_LOGGER = "dmi.adapters.huggingface.adapter"
 RECORD_RING_ERROR = "legacy metadata cannot be pushed to a record ring"
-RECORD_MODE_REFUSAL = r"commit_step\(\): the engine is in record mode"
+RECORD_MODE_REFUSAL = (
+    r"(before_forward|commit_step)\(\): the engine is in record mode")
 
 
 # ---------------------------------------------------------------------------
@@ -434,3 +435,76 @@ def test_commit_step_refuses_capture_storage_when_attach_skipped_super(
 
     assert engine._ring_engine.prepare_step_calls == []
     assert engine._ring_engine.push_all_metas_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Record mode is refused even while capture is disabled
+# ---------------------------------------------------------------------------
+
+
+def _record_engine_with_capture_disabled():
+    """Record mode after set_capture_enabled(False): the transport is in null
+    mode, but the HookPoints stay armed and still dispatch into the record
+    ring, whose native guard then raises from inside the model forward."""
+    engine = _SpyEngine("auto", record_mode=True)
+    engine._ring_transport.null_offload = True
+    return engine
+
+
+def test_commit_step_refuses_record_mode_while_capture_is_disabled():
+    engine = _record_engine_with_capture_disabled()
+    adapter = _NoSuperAttachAdapter(engine, "tiny")
+    adapter.attach_model(_TinyHookedLM(engine))
+    plan = StepPlan(total_bytes=64, hook_count=1, needs_eager=False)
+
+    with pytest.raises(RuntimeError, match=RECORD_MODE_REFUSAL):
+        adapter.commit_step(_step_context(), plan)
+
+    assert engine._ring_engine.prepare_step_calls == []
+    assert engine._ring_engine.push_all_metas_calls == 0
+
+
+def test_before_forward_refuses_record_mode_while_capture_is_disabled():
+    engine = _record_engine_with_capture_disabled()
+    adapter = _NoSuperAttachAdapter(engine, "tiny")
+    adapter.attach_model(_TinyHookedLM(engine))
+
+    with pytest.raises(RuntimeError, match=RECORD_MODE_REFUSAL):
+        adapter.before_forward(None)
+
+    assert engine._ring_engine.prepare_step_calls == []
+    assert engine._ring_engine.push_all_metas_calls == 0
+
+
+def test_generate_with_monitoring_refuses_record_mode_while_capture_is_disabled():
+    """The HF prepare wrapper also skipped the driver in null mode, so the
+    first thing to fail was a HookPoint inside the forward."""
+    engine = _record_engine_with_capture_disabled()
+    model = _TinyHookedLM(engine)
+    input_ids, attention_mask = _inputs()
+
+    with pytest.raises(RuntimeError, match=RECORD_MODE_REFUSAL):
+        generate_with_monitoring(model, input_ids,
+                                 attention_mask=attention_mask)
+
+    assert engine._ring_engine.prepare_step_calls == []
+    assert engine._ring_engine.push_all_metas_calls == 0
+    assert model._monitoring_orig_prepare is None
+    assert model.hook_resid_pre._ring_hook_type is None
+
+
+@pytest.mark.parametrize("entry", ["before_forward", "commit_step"])
+def test_capture_disabled_outside_record_mode_still_skips(entry):
+    """Null mode on the legacy ring is a legitimate pause: it still skips."""
+    engine = _SpyEngine("auto")
+    engine._ring_transport.null_offload = True
+    adapter = _NoSuperAttachAdapter(engine, "tiny")
+    adapter.attach_model(_TinyHookedLM(engine))
+
+    if entry == "before_forward":
+        assert adapter.before_forward(None) is None
+    else:
+        plan = StepPlan(total_bytes=64, hook_count=1, needs_eager=False)
+        assert adapter.commit_step(_step_context(), plan) is (
+            StepReservation.SKIPPED)
+    assert engine._ring_engine.prepare_step_calls == []

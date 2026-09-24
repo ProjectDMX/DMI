@@ -499,8 +499,9 @@ and producers.
 #### `before_forward(*framework_state)`
 
 Call this once immediately before the corresponding model forward. It returns
-early when capture is disabled or `build_step_context()` returns `None`.
-Otherwise it:
+early when capture is disabled or `build_step_context()` returns `None`. On an
+engine in record mode it raises `RuntimeError` instead, even while capture is
+disabled, as `commit_step()` does. Otherwise it:
 
 1. builds a `StepContext`;
 2. calls `plan_step()` to compute each firing hook's shape and 16-byte-aligned
@@ -562,6 +563,10 @@ On an engine in record mode (after `create_record_runtime()`), `commit_step()`
 raises `RuntimeError` before reserving anything: a record ring cannot store
 the legacy step protocol, and an adaptor attached before the switch still
 holds the stopped legacy ring, which would otherwise accept the step silently.
+This holds while capture is disabled too, so disabling capture never turns
+a record-mode step into `SKIPPED`: `set_capture_enabled(False)` leaves the
+installed `HookPoint`s armed, and on a record ring they would fail inside the
+model forward with a native error that names neither the adaptor nor the cause.
 Under `storage_backend="capture"` it raises `ConfigurationError`, also before
 reserving anything, for the reason `attach_model()` does. The check is repeated
 here because a step need not come through the base `attach_model()`: an adaptor
