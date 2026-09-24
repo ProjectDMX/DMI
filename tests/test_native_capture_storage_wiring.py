@@ -76,6 +76,87 @@ def test_required_text_fields_refuse_empty(name):
         _storage_config(**{name: ""})
 
 
+def test_a_poll_interval_below_a_millisecond_is_refused():
+    # int(poll_interval_s * 1e9) is the native wait; a value that rounds to
+    # a zero wait would spin the service thread.
+    with pytest.raises(ValueError, match="poll_interval_s"):
+        _storage_config(poll_interval_s=1e-10)
+    with pytest.raises(ValueError, match="poll_interval_s"):
+        _storage_config(poll_interval_s=0.0009)
+    assert _storage_config(poll_interval_s=0.001).poll_interval_s == 0.001
+
+
+@pytest.mark.parametrize("name", [
+    "poll_interval_s", "reconcile_interval_s", "close_flush_timeout_s",
+    "clickhouse_connect_timeout_s", "clickhouse_request_timeout_s"])
+@pytest.mark.parametrize("value", [float("inf"), float("nan")])
+def test_intervals_and_timeouts_must_be_finite(name, value):
+    with pytest.raises(ValueError, match=f"{name} must be finite"):
+        _storage_config(**{name: value})
+
+
+@pytest.mark.parametrize("endpoint", [
+    "s3.example.test", "127.0.0.1:3900", "ftp://s3.example.test",
+    "HTTPS://s3.example.test"])
+def test_the_endpoint_needs_an_http_or_https_scheme(endpoint):
+    # The native client treats a scheme-less endpoint as plain HTTP, then
+    # refuses it at every request as insecure.
+    with pytest.raises(ValueError, match="http:// or https://"):
+        _storage_config(s3_endpoint=endpoint)
+
+
+def test_https_with_the_insecure_flag_is_refused():
+    # The native client refuses every request of that pairing: the flag
+    # admits plain http:// endpoints and never downgrades TLS.
+    with pytest.raises(ValueError, match="s3_allow_insecure_http"):
+        _storage_config(s3_endpoint="https://s3.example.test",
+                        s3_allow_insecure_http=True)
+
+
+def _fake_reader(monkeypatch):
+    from dmi.storage import native_capture
+
+    calls = []
+
+    class _Reader:
+        def __init__(self, config):
+            pass
+
+        def resolve(self, selection):
+            calls.append("resolve")
+            return []
+
+        def hydrate(self, selection, byte_limit, request_limit):
+            calls.append("hydrate")
+            return []
+
+    monkeypatch.setattr(
+        native_capture, "_load_native_store_extension",
+        lambda: SimpleNamespace(CaptureReader=_Reader, SEARCH_ITEM_COLUMNS=()))
+    selection = native_capture.NativeCaptureSelection(
+        selection_id="s", capture_ids=(), catalog_watermark="w",
+        filter_hash="f", tenant_id="t")
+    return native_capture.NativeCaptureReader(_storage_config()), selection, calls
+
+
+@pytest.mark.parametrize("limits, match", [
+    (dict(byte_limit=-1), "byte_limit"),
+    (dict(byte_limit=1 << 20, request_limit=0), "request_limit"),
+    (dict(byte_limit=1 << 20, request_limit=-3), "request_limit"),
+])
+def test_read_refuses_bad_limits_before_any_request(monkeypatch, limits, match):
+    reader, selection, calls = _fake_reader(monkeypatch)
+    with pytest.raises(ValueError, match=match):
+        reader.read(selection, **limits)
+    assert calls == []
+
+
+def test_read_accepts_a_zero_byte_limit(monkeypatch):
+    reader, selection, calls = _fake_reader(monkeypatch)
+    assert reader.read(selection, byte_limit=0) == ()
+    assert calls == ["resolve", "hydrate"]
+
+
 def test_engine_refuses_a_storage_config_of_the_wrong_type():
     config = SimpleNamespace(storage_backend="capture", capture_sink_config=None,
                              capture_storage_config={"s3_bucket": "b"})

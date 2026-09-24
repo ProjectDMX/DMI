@@ -220,6 +220,15 @@ def test_staged_packs_reach_the_catalog_and_read_back_exactly(fake_s3, tmp_path)
         assert [item["capture_id"] for item in page.items] == [
             "svc-0001", "svc-0003"]
 
+        # The binding refuses bad limits itself, not only through the
+        # Python wrapper: a negative byte_limit must never pass as unsigned.
+        reader = _reader(config)
+        native = reader.select(tenant_id="t")._native_dict()
+        with pytest.raises(ValueError, match="byte_limit"):
+            reader._reader.hydrate(native, -1, 1024)
+        with pytest.raises(ValueError, match="request_limit"):
+            reader._reader.hydrate(native, 1 << 24, 0)
+
 
 def test_the_reference_reader_sees_the_same_captures(fake_s3, tmp_path):
     from dmi.storage.capture import CaptureReader

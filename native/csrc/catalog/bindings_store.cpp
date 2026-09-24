@@ -203,12 +203,17 @@ class CaptureReader {
 
   // Payload bytes in selection order, as `bytes` -- never `str`, which would
   // UTF-8-decode tensor data.
-  py::list hydrate(const py::dict& selection, int64_t byte_limit, int request_limit) {
+  py::list hydrate(const py::dict& selection, int64_t byte_limit,
+                   int64_t request_limit) {
+    // Checked here as well as in the reader core, and passed through as
+    // int64: an unsigned cast of a negative limit reads as no limit at all.
+    if (byte_limit < 0) throw py::value_error("byte_limit must be non-negative");
+    if (request_limit <= 0) throw py::value_error("request_limit must be positive");
     const dc::Selection s = selection_from(selection);
     std::vector<std::string> payloads;
     {
       py::gil_scoped_release release;
-      payloads = reader_.hydrate(s, static_cast<uint64_t>(byte_limit), request_limit);
+      payloads = reader_.hydrate(s, byte_limit, request_limit);
     }
     py::list out;
     for (const std::string& p : payloads) out.append(py::bytes(p));

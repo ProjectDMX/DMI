@@ -58,6 +58,9 @@ def _load_native_store_extension() -> Any:
 def _positive(name: str, value: Any, kind: type) -> None:
     if type(value) is not kind and not (kind is float and type(value) is int):
         raise TypeError(f"{name} must be {kind.__name__}")
+    # NaN passes every comparison, and inf overflows the native nanoseconds.
+    if kind is float and not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
     if value <= 0:
         raise ValueError(f"{name} must be positive")
 
@@ -113,18 +116,36 @@ class NativeCaptureStorageConfig:
             value = getattr(self, name)
             if type(value) is not str or not value:
                 raise ValueError(f"{name} must be a non-empty string")
-        if self.s3_endpoint.startswith("http://") and not self.s3_allow_insecure_http:
-            raise ValueError(
-                "s3_endpoint is plain HTTP; set s3_allow_insecure_http=True "
-                "to send credentials over it")
+        # The native client reads a scheme-less endpoint as plain HTTP, and
+        # refuses https with the insecure flag, at every request rather than
+        # here -- so both are refused here.
+        if self.s3_endpoint.startswith("http://"):
+            if not self.s3_allow_insecure_http:
+                raise ValueError(
+                    "s3_endpoint is plain HTTP; set s3_allow_insecure_http=True "
+                    "to send credentials over it")
+        elif self.s3_endpoint.startswith("https://"):
+            if self.s3_allow_insecure_http:
+                raise ValueError(
+                    "s3_allow_insecure_http admits plain http:// endpoints and "
+                    "never downgrades TLS; leave it False for https://")
+        else:
+            raise ValueError("s3_endpoint must start with http:// or https://")
         if type(self.clickhouse_port) is not int or not 0 < self.clickhouse_port < 65536:
             raise ValueError("clickhouse_port must be in 1..65535")
         _positive("poll_interval_s", self.poll_interval_s, float)
+        # The native wait is int(poll_interval_s * 1e9) ns; a zero wait spins.
+        if self.poll_interval_s < 0.001:
+            raise ValueError("poll_interval_s must be at least 0.001")
         _positive("clickhouse_connect_timeout_s",
                   self.clickhouse_connect_timeout_s, float)
         _positive("clickhouse_request_timeout_s",
                   self.clickhouse_request_timeout_s, float)
         _positive("close_flush_timeout_s", self.close_flush_timeout_s, float)
+        if type(self.reconcile_interval_s) not in (int, float):
+            raise TypeError("reconcile_interval_s must be float")
+        if not math.isfinite(self.reconcile_interval_s):
+            raise ValueError("reconcile_interval_s must be finite")
         if self.reconcile_interval_s < 0:
             raise ValueError("reconcile_interval_s must be non-negative")
 
@@ -372,6 +393,15 @@ class NativeCaptureReader:
         """
         if not isinstance(selection, NativeCaptureSelection):
             raise TypeError("selection must be a NativeCaptureSelection")
+        # Refused before resolve's catalog query rather than after it.
+        for name, value in (("byte_limit", byte_limit),
+                            ("request_limit", request_limit)):
+            if type(value) is not int:
+                raise TypeError(f"{name} must be int")
+        if byte_limit < 0:
+            raise ValueError("byte_limit must be non-negative")
+        if request_limit <= 0:
+            raise ValueError("request_limit must be positive")
         native = selection._native_dict()
         rows = self._reader.resolve(native)
         payloads = self._reader.hydrate(native, byte_limit, request_limit)
