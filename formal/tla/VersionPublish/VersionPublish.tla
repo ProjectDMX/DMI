@@ -40,7 +40,17 @@ CONSTANTS
     OCCUPANCY_READBACK,   \* read-back asks "any row at V?" (count() > 0)
     SKIP_REWRITE,         \* retry does not rewrite descriptors at the new version
     SKIP_CLAIM_READBACK,  \* allocator returns its candidate without the read-back
-    UNSAFE_TAKEOVER       \* lease may move while the holder's statement is in flight
+    UNSAFE_TAKEOVER,      \* lease may move while the holder's statement is in flight
+    \* ---- reader ranking (all FALSE = main at a987dfe) --------------------
+    RANK_BY_MEMBERSHIP,   \* PR #156: the reader ranks a pack by its paired
+                          \*   manifest version <= W, not by descriptor versions
+    RANK_MIN,             \* with RANK_BY_MEMBERSHIP: TRUE ranks a pack by its
+                          \*   FIRST paired publish <= W, min(index_version)
+                          \*   (PR #156 as merged); FALSE by its newest publish
+                          \*   <= W, max(index_version) (the alternative)
+    \* ---- environment ---------------------------------------------------
+    MERGES                \* ReplacingMergeTree may collapse a pack's descriptor
+                          \*   rows to its highest version at any time
 
 (* WriterOf[i]: the ClickHouseCatalogWriter indexer i uses (threads sharing  *)
 (* one writer share its _serial lock and its lease).  PackOf[i]: the pack    *)
@@ -100,6 +110,7 @@ vars == <<claims, wm, manifest, descr, committed, inflight, lag, holder,
 -----------------------------------------------------------------------------
 (* Helpers *)
 MaxV(S) == IF S = {} THEN 0 ELSE CHOOSE x \in S : \A y \in S : y <= x
+MinV(S) == IF S = {} THEN 0 ELSE CHOOSE x \in S : \A y \in S : x <= y
 Min(a, b) == IF a < b THEN a ELSE b
 LexLe(a, b) == a[1] < b[1] \/ (a[1] = b[1] /\ a[2] <= b[2])
 W(i) == WriterOf[i]
@@ -133,18 +144,35 @@ Pid(r)      == <<r.by, r.n>>
 Paired(wmS, manS, Wm) ==
     {m \in manS : m.v <= Wm /\ \E r \in wmS : r.v <= Wm /\ r.v = m.v /\ Pid(r) = Pid(m)}
 Members(wmS, manS, Wm) == {m.pack : m \in Paired(wmS, manS, Wm)}
+\* The pack a snapshot SHOULD resolve to: the member whose publish is newest.
+PubV(wmS, manS, Wm, p) == MaxV({m.v : m \in {x \in Paired(wmS, manS, Wm) : x.pack = p}})
+\* A pack's FIRST paired publish <= W (member_version under PR #156).
+FirstV(wmS, manS, Wm, p) == MinV({m.v : m \in {x \in Paired(wmS, manS, Wm) : x.pack = p}})
+\* The rank a candidate descriptor row carries: its own index_version (main
+\* as written), or its pack's paired manifest version <= W (PR #156): the
+\* first one (RANK_MIN) or the newest one.
+Rank(wmS, manS, Wm, d) ==
+    IF ~RANK_BY_MEMBERSHIP THEN d.v
+    ELSE IF RANK_MIN THEN FirstV(wmS, manS, Wm, d.pack)
+    ELSE PubV(wmS, manS, Wm, d.pack)
 Resolve(wmS, manS, dS, Wm) ==
     LET M == Members(wmS, manS, Wm)
         D == {d \in dS : d.pack \in M}
     IN  IF D = {} THEN 0
-        ELSE (CHOOSE d \in D : \A e \in D : LexLe(<<e.v, e.pack>>, <<d.v, d.pack>>)).pack
-\* The pack a snapshot SHOULD resolve to: the member whose publish is newest.
-PubV(wmS, manS, Wm, p) == MaxV({m.v : m \in {x \in Paired(wmS, manS, Wm) : x.pack = p}})
+        ELSE (CHOOSE d \in D : \A e \in D :
+                 LexLe(<<Rank(wmS, manS, Wm, e), e.pack>>,
+                       <<Rank(wmS, manS, Wm, d), d.pack>>)).pack
 Newest(wmS, manS, Wm) ==
     LET M == Members(wmS, manS, Wm)
     IN  IF M = {} THEN 0
         ELSE CHOOSE p \in M : \A q \in M :
                  LexLe(<<PubV(wmS, manS, Wm, q), q>>, <<PubV(wmS, manS, Wm, p), p>>)
+\* The member whose FIRST publish is newest (the semantics of PR #156).
+NewestFirst(wmS, manS, Wm) ==
+    LET M == Members(wmS, manS, Wm)
+    IN  IF M = {} THEN 0
+        ELSE CHOOSE p \in M : \A q \in M :
+                 LexLe(<<FirstV(wmS, manS, Wm, q), q>>, <<FirstV(wmS, manS, Wm, p), p>>)
 Snap(wmS, manS, dS, Wm) ==
     [mem |-> Members(wmS, manS, Wm), res |-> Resolve(wmS, manS, dS, Wm)]
 PubHead == MaxV({r.v : r \in wm})
@@ -435,6 +463,18 @@ Takeover ==
                    quarantined, lock, pc, ver, att, aatt, fl, cand, cn, cache,
                    crashes, allocated, refused, pins>>
 
+(* A background merge collapses one pack's descriptor rows (same sort key, *)
+(* pack identity included) to the highest version.                        *)
+Merge ==
+    /\ MERGES
+    /\ \E p \in Packs :
+          LET rows == {d \in descr : d.pack = p}
+          IN  /\ Cardinality(rows) > 1
+              /\ descr' = (descr \ rows) \cup {[v |-> MaxV({d.v : d \in rows}), pack |-> p]}
+    /\ UNCHANGED <<claims, wm, manifest, committed, inflight, lag, holder,
+                   everHeld, hasLease, quarantined, lock, pc, ver, att, aatt, fl,
+                   cand, cn, cache, takeovers, crashes, allocated, refused, pins>>
+
 (* Per-table replication catches up on one row.                            *)
 Replicate ==
     /\ STALE_READS
@@ -473,7 +513,7 @@ Finished == AllDone /\ inflight = {} /\ UNCHANGED vars
 
 Next ==
     \/ \E i \in Indexers : Proc(i) \/ Crash(i)
-    \/ Land \/ Abort \/ Takeover \/ Replicate
+    \/ Land \/ Abort \/ Takeover \/ Replicate \/ Merge
     \/ Finished
 
 Fairness == /\ \A i \in Indexers : WF_vars(Proc(i))
@@ -516,9 +556,28 @@ PinnedStable ==
 
 \* Supersession: a snapshot resolves the capture to the member pack whose
 \* publish is newest -- never to a superseded pack's locator (catalog.py:520-531).
+\* This is the PRE-FIX intent (main at a987dfe: newest publish wins).  Under
+\* PR #156's first-publish ranking it is expected to fail on the replay
+\* layouts; check ResolvesFirstPublished / NoSupersededComeback there.
 ResolvesNewest ==
     \A Wm \in DOMAIN pins :
         Resolve(wm, manifest, descr, Wm) = Newest(wm, manifest, Wm)
+
+\* PR #156's supersession: every head resolves the capture to the member
+\* whose FIRST publish is newest, so republishing a superseded pack (a
+\* replay) never wins.  ResolvesNewest above encodes the pre-fix intent
+\* (newest publish wins), under which a replay's republish is the winner.
+ResolvesFirstPublished ==
+    \A Wm \in DOMAIN pins :
+        Resolve(wm, manifest, descr, Wm) = NewestFirst(wm, manifest, Wm)
+
+\* The same claim stated over history, independent of min/max: a pack that
+\* was a member but lost at some head never wins at any later head.
+NoSupersededComeback ==
+    \A W1, W2 \in DOMAIN pins :
+        LET p == Resolve(wm, manifest, descr, W2)
+        IN  (W1 < W2 /\ p \in Members(wm, manifest, W1))
+                => Resolve(wm, manifest, descr, W1) = p
 
 \* The same, for a reader on a lagging replica (consistent_snapshot_reads off;
 \* only meaningful with STALE_READS).  Lag may OMIT the capture (a short page,

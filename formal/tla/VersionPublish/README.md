@@ -12,8 +12,14 @@ checked. The lease itself is abstracted to "the fence admits the head holder".
 `formal/tla/PublisherLease` models it in detail.
 
 One module, `VersionPublish.tla`, backs every config. The configs differ only in
-constants: `Layout`, the bounds, the consistency flag and the mutation flags.
-`gen_cfgs.sh` regenerates every `.cfg`.
+constants: `Layout`, the bounds, the consistency flag, the mutation flags and
+the reader-ranking flags. `gen_cfgs.sh` regenerates every `.cfg`.
+
+**Status of the replay finding: fixed by PR #156** (first-publish ranking).
+With `RANK_BY_MEMBERSHIP = FALSE` the module is main at `a987dfe` and the
+`Replay*` configs still fail, as the bug witness. With
+`RANK_BY_MEMBERSHIP = TRUE, RANK_MIN = TRUE` it is PR #156 as merged, and the
+`FixMin*` configs pass. See [PR #156](#pr-156-first-publish-ranking-expected-to-pass).
 
 ## What is modelled
 
@@ -63,12 +69,19 @@ Layouts (`WriterOf`, `PackOf` in the module):
 | `Abort`: `max_execution_time` caps an orphaned statement | clickhouse_catalog.py:66-72 | none |
 | `Takeover`: abstract lease move | clickhouse_lease.py:192-211 | none |
 | `Replicate`: per-table replication catches up | clickhouse_catalog.py:95-118 | none |
+| `Merge` (`MERGES` only): ReplacingMergeTree collapses one pack's descriptor rows to its highest version | ReplacingMergeTree on the descriptor table | none |
 
 The reader is modelled at clickhouse_reader.py:145, 417-448 and 521, and at
 clickhouse_sql.py:131-139. Membership is manifest rows paired with a watermark row
 on `(index_version, publish_id)`, both at or below W. Resolution is `argMax` over
-`(index_version, pack)` across ALL descriptor rows of the member packs. The
-descriptor rows are not bounded by W.
+`(rank, pack)` across ALL descriptor rows of the member packs. The descriptor
+rows are not bounded by W. The rank (`Rank` in the module) is:
+
+| Flags | Rank of a pack's row | Models |
+|---|---|---|
+| `RANK_BY_MEMBERSHIP = FALSE` | the row's own `index_version` | main at `a987dfe` (the bug) |
+| `RANK_BY_MEMBERSHIP = TRUE, RANK_MIN = TRUE` | the pack's FIRST paired publish <= W, `min(index_version)` | PR #156 as merged |
+| `RANK_BY_MEMBERSHIP = TRUE, RANK_MIN = FALSE` | the pack's NEWEST paired publish <= W, `max(index_version)` | the alternative (kept selectable; it fails, see below) |
 
 ### What is atomic and why
 
@@ -137,7 +150,9 @@ from `0..min(8*attempt, MaxSkip)`.
 | `CommittedVisible` | Every pack in the replay inventory is a member at the head (catalog.py:410-416). |
 | `DoneIsPublished` | An indexer that returned success has its pack paired at its version. |
 | `PinnedStable` | A pinned W keeps its members and its resolved pack for as long as it lives (clickhouse_reader.py:3, 36-39). |
-| `ResolvesNewest` | For every W that was a head, the capture resolves to the member pack whose publish is newest, never to a superseded pack (catalog.py:520-531). |
+| `ResolvesNewest` | For every W that was a head, the capture resolves to the member pack whose publish is newest, never to a superseded pack (catalog.py:520-531). This encodes the **pre-fix** intent (newest publish wins). Under it, a replay that republishes a superseded pack at a newer version is *supposed* to win, so it is expected to fail under PR #156's ranking on the replay layouts and is not checked by the `FixMin*` configs. |
+| `ResolvesFirstPublished` | PR #156's supersession: for every W that was a head, the capture resolves to the member whose FIRST publish is newest, so republishing a superseded pack never wins. |
+| `NoSupersededComeback` | The same claim over history, independent of min vs max: a pack that was a member at some head W1 but did not win there never wins at a later head W2. |
 | `ReaderLagNoSuperseded` | The same as `ResolvesNewest` on the lagging replica. Omitting the capture is allowed, because it is documented as a short page. |
 | `NeverConflict` | `SnapshotPublishConflictError` is unreachable when the lease holds. |
 | `Termination` (liveness) | Under weak fairness of every indexer and of `Land`, every indexer reaches a terminal state. |
@@ -176,13 +191,50 @@ In the takeover (T) and crash (C) columns, a `-` means 0.
 | ReplayRest | replay, T=- C=- | everything except PinnedStable and ResolvesNewest, + Termination | **PASS** | 24,433 / 17,228, depth 60 | 7 s |
 | SkipClaimReadbackRest | pair, T=1 C=1, allocator read-back removed | everything except AllocUnique, + Termination | **PASS** | 5,138 / 2,275, depth 38 | 3 s |
 
-### Finding (the faithful protocol, with a replayed pack)
+### Finding (main at `a987dfe`, with a replayed pack; expected to fail)
 
 | Config | Layout | Violated | Trace | Wall |
 |---|---|---|---|---|
 | Replay | replay (concurrent passes) | ResolvesNewest | 31 states | 3 s |
 | ReplayCrash | replaycrash, C=1 (replay only after a crash) | ResolvesNewest | 32 states | 3 s |
 | ReplayCrashPinned | replaycrash, C=1 | PinnedStable | 33 states | 4 s |
+
+### PR #156, first-publish ranking (expected to pass)
+
+`RANK_BY_MEMBERSHIP = TRUE, RANK_MIN = TRUE`. Each config has a `FixMinMerge_*`
+twin that adds `MERGES = TRUE` (background merges collapse a pack's descriptor
+rows to its highest version at any point). The `*_Faithful` numbers come from
+runs of this model before it was merged into this module, with identical
+constants. The short configs were re-run on this module and match exactly.
+
+| Config | Layout | Checks | Result | States generated / distinct, depth | Wall |
+|---|---|---|---|---|---|
+| FixMin_Faithful | shared, T=1 C=1 | ResolvesFirstPublished, NoSupersededComeback, all safety except ResolvesNewest, NeverConflict, MonotonicLanding, Termination | **PASS** | 5,239,843 / 2,110,944, depth 76 | 395 s |
+| FixMin_Replay | replay | ResolvesFirstPublished, NoSupersededComeback, all safety except ResolvesNewest, MonotonicLanding | **PASS** | 23,767 / 16,724, depth 60 | 4 s |
+| FixMin_ReplayRest | replay | ResolvesFirstPublished, NoSupersededComeback, everything except PinnedStable and ResolvesNewest, MonotonicLanding, Termination | **PASS** | 23,767 / 16,724, depth 60 | 5 s |
+| FixMin_ReplayCrash | replaycrash, C=1 | ResolvesFirstPublished, NoSupersededComeback, PinnedStable | **PASS** | 5,821 / 4,119, depth 60 | 2 s |
+| FixMin_ReplayCrashPinned | replaycrash, C=1 | PinnedStable | **PASS** | 5,821 / 4,119, depth 60 | 1 s |
+| FixMinMerge_Faithful | shared, T=1 C=1, merges | as FixMin_Faithful | **PASS** | 8,523,437 / 3,057,864, depth 78 | 635 s |
+| FixMinMerge_Replay | replay, merges | as FixMin_Replay | **PASS** | 78,183 / 38,746, depth 62 | 7 s |
+| FixMinMerge_ReplayRest | replay, merges | as FixMin_ReplayRest | **PASS** | 78,183 / 38,746, depth 62 | 9 s |
+| FixMinMerge_ReplayCrash | replaycrash, C=1, merges | as FixMin_ReplayCrash | **PASS** | 9,093 / 5,377, depth 62 | 2 s |
+| FixMinMerge_ReplayCrashPinned | replaycrash, C=1, merges | PinnedStable | **PASS** | 9,093 / 5,377, depth 62 | 1 s |
+
+`ResolvesNewest` is left out on purpose (see Properties). Checked anyway, it
+fails under first-publish ranking on `replay` and `replaycrash`, because the
+replayed pack's republish is newest but no longer wins. `PinnedStable` holds.
+
+### The max alternative (expected to fail)
+
+| Config | Flags | Violated | Trace |
+|---|---|---|---|
+| FixMax_ReplayCrash | `RANK_BY_MEMBERSHIP = TRUE, RANK_MIN = FALSE`, replaycrash, C=1 | NoSupersededComeback | 37 states |
+
+Ranking by the newest paired publish at or below W keeps every pin stable,
+and it satisfies `ResolvesNewest`. But once the replayed pass republishes P1
+at v3, every head from 3 onwards resolves to P1, which lost to P2 at W=2. With
+`MERGES` the result is the same. First-publish ranking keeps P1 at rank 1,
+below P2, at every head.
 
 ### Consistency parameter (expected to fail)
 
@@ -218,7 +270,9 @@ the witness trace.
 
 ## Finding: a replayed pack re-promotes itself over a newer pack
 
-**Status: a real gap in the code, not a modelling artifact.**
+**Status: a real gap in main at `a987dfe`, fixed by PR #156.** The `Replay*`
+configs keep modelling main as it was, with `RANK_BY_MEMBERSHIP = FALSE`, so they
+still fail: they are the bug witness. The `FixMin*` configs model the fix.
 
 The Replay configs use the unmodified protocol. The only thing they add is a pass
 that re-indexes a pack which is already published, and the code explicitly
@@ -270,12 +324,12 @@ publishes. P2's publish is then shadowed from the moment it lands.
 is allowed by the identity rule. It breaks pinned-selection determinism, and it
 can point readers at a pack that was deliberately superseded.
 
-**Possible fixes (not implemented):**
-
-- Rank on the pack's paired manifest version at or below W, which the membership
-  subquery already computes, instead of on the descriptor row's `index_version`.
-- Or make a replay skip packs that are already members, checking membership
-  rather than the inventory.
+**Fix (PR #156).** The reader ranks a member pack by its paired manifest version
+at or below W, which the membership subquery already computes, instead of by the
+descriptor row's `index_version`. Of the pack's paired versions it takes the
+first, `min(index_version)`. Taking the newest (`max`) would fix pinned
+stability but still let a superseded pack come back once its republish becomes
+the head (`FixMax_ReplayCrash`).
 
 
 ## Python vs C++ divergences noted

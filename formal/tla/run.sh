@@ -6,7 +6,7 @@
 #        TLC_META     dir for TLC state, outside the repo (default: $TMPDIR/tlc-meta)
 #        TLC_WORKERS  default: auto;  TLC_XMX  default: 4g
 #
-# The faithful configs take roughly an hour in total on 4 cores (see each
+# The faithful configs take a little over an hour in total on 4 cores (see each
 # spec's README for per-config times). Expected-fail configs (mutations,
 # findings, witnesses) are listed in the per-spec READMEs; run them by name.
 set -uo pipefail
@@ -26,6 +26,16 @@ FAITHFUL=(
   VersionPublish/FaithfulLarge
   VersionPublish/ReplayRest
   VersionPublish/SkipClaimReadbackRest
+  VersionPublish/FixMin_Faithful
+  VersionPublish/FixMin_Replay
+  VersionPublish/FixMin_ReplayRest
+  VersionPublish/FixMin_ReplayCrash
+  VersionPublish/FixMin_ReplayCrashPinned
+  VersionPublish/FixMinMerge_Faithful
+  VersionPublish/FixMinMerge_Replay
+  VersionPublish/FixMinMerge_ReplayRest
+  VersionPublish/FixMinMerge_ReplayCrash
+  VersionPublish/FixMinMerge_ReplayCrashPinned
   PayloadRing/FaithfulRecord
   PayloadRing/FaithfulRecordLiveness
   PayloadRing/LegacyHooksWithinTaskCap

@@ -24,8 +24,19 @@ Snapshot version allocation and publish (allocator claim + read-back,
 barrier-and-fence insert, watermark read-back, pinned readers). The faithful
 model passes all safety properties and termination. The stale-read configs
 and 7 mutation configs fail, as expected. The `Replay` / `ReplayCrash` configs
-expose a real gap in the faithful protocol: re-indexing an already-published
-pack re-points pinned readers to it over a newer pack.
+expose a real gap in the protocol at `a987dfe`: re-indexing an already-published
+pack re-points pinned readers to it over a newer pack. **PR #156 fixes it** by
+ranking a member pack on its first paired publish at or below W. The module
+models both: with `RANK_BY_MEMBERSHIP = FALSE` it is main as it was, and the
+`Replay*` configs still fail as the bug witness. With
+`RANK_BY_MEMBERSHIP = TRUE, RANK_MIN = TRUE` it is PR #156, and the new configs
+pass: `FixMin_Faithful`, `FixMin_Replay`, `FixMin_ReplayRest`,
+`FixMin_ReplayCrash`, `FixMin_ReplayCrashPinned`, and their `FixMinMerge_*`
+twins, which add background merges. `FixMax_ReplayCrash`, the newest-publish
+(`max`) alternative, fails `NoSupersededComeback`, as expected. The new
+invariants are `ResolvesFirstPublished` and `NoSupersededComeback`.
+`ResolvesNewest` encodes the pre-fix intent, newest publish wins, so it is not
+checked under the fix. See `VersionPublish/README.md` for numbers.
 
 ## PayloadRing
 
@@ -61,7 +72,7 @@ TLA2TOOLS=/path/to/tla2tools.jar TLC_META=/tmp/tlc-meta ./run.sh
 ```
 
 runs every faithful config (the ones expected to pass) and prints PASS/FAIL
-per config. It takes about an hour on 4 cores. Pass `Spec/Config` names to
+per config. It takes a little over an hour on 4 cores. Pass `Spec/Config` names to
 run a subset, e.g. `./run.sh VersionPublish/ReplayRest PayloadRing/LegacyHooksWithinTaskCap`.
 Expected-fail configs are run the same way; a FAIL there is the expected result.
 Keep `TLC_META` outside the repo; `.gitignore` covers TLC output if it lands here.
