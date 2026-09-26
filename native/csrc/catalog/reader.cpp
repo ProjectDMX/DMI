@@ -766,9 +766,35 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
     grouped += quoted(column);
     order += quoted(column);
   }
+  // Choose the page's keys first, then resolve the argMax tuple for those keys
+  // alone. One GROUP BY ... LIMIT built the full resolution tuple for EVERY
+  // group past the cursor before LIMIT kept limit + 1 of them, and the keyset
+  // tuple comparison is not usable by the primary-key index, so a page cost
+  // about the whole catalog whatever its size. The Python reference reader
+  // keeps that single-phase shape, and the parity suite compares the two.
+  //
+  // Both queries carry every filter (the same `clauses`), so groups and
+  // resolution are unchanged. An inner query missing one -- snapshot
+  // membership, a hook filter -- fills its LIMIT with keys the outer query
+  // then drops: the page comes back short, owes no cursor, and a walk ends
+  // early. test_a_page_walk_skips_unpublished_keys_without_ending_early pins
+  // that.
+  //
+  // The second read counts against the read guard. max_rows_to_read limits
+  // the whole statement, and both queries read capture_raw: the inner one
+  // every row past the cursor that the filters leave, the outer one each
+  // granule holding a page key. A selective filter spreads those keys across
+  // granules, so the outer read approaches a second full scan, and a page can
+  // read up to twice the rows the single-phase query did (1,102,131 ->
+  // 2,203,414 on one corpus, so a limit of 1,500,000 that passed the old
+  // shape refuses this one with Code 158). Size max_rows_to_read for two
+  // passes over the rows past the cursor.
   const std::vector<Row> rows = client_->execute(
       "SELECT " + projection() + " FROM " + qualified("capture_raw") +
-          " WHERE " + clauses + " GROUP BY " + grouped + " ORDER BY " + order +
+          " WHERE " + clauses + " AND (" + grouped + ") IN (SELECT " +
+          grouped + " FROM " + qualified("capture_raw") + " WHERE " +
+          clauses + " GROUP BY " + grouped + " ORDER BY " + order +
+          " LIMIT %(row_limit)s) GROUP BY " + grouped + " ORDER BY " + order +
           " LIMIT %(row_limit)s",
       params, bounded_read_settings());
 

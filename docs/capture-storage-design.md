@@ -1577,6 +1577,43 @@ removed:
   because ClickHouse compares a tuple ordering argument through a generic
   `Field` once per row per aggregate.
 
+The native reader resolves that aggregate for **its own keys only**. An inner query
+groups just the five sort-key columns under the page's filters and `LIMIT`, and
+the outer query computes the `argMax` tuple for those keys. With a single
+`GROUP BY ... LIMIT`, ClickHouse built the full 27-column tuple for every group
+past the cursor before `LIMIT` kept `limit + 1` of them. The keyset comparison
+`(tenant_id, experiment_id, run_id, captured_at_ns, capture_id) > (...)` is not
+usable by the primary-key index, so each page cost about the whole catalog
+whatever its size. Measured on 25.12 over a 198k-row catalog, a 38-row page
+took ~150 ms, three quarters of it that tuple. Both queries carry every filter,
+so the groups and their resolution are unchanged: that is the same immutability
+rule, below, that makes the pre-aggregation filters safe. The Python reference
+reader keeps the single-phase shape, so the parity suite compares the two
+shapes directly. Each page still scans the rows past the cursor. Removing that
+needs index-usable cursor bounds.
+
+The two queries must filter alike. If the inner query drops a filter that the
+outer one keeps, such as snapshot membership or a hook filter, its `LIMIT` fills
+with keys the outer query then discards. The page comes back short, a short page
+issues no cursor, and the walk ends early while reporting success. The parity
+suite walks a corpus built for this: an unpublished pack whose keys interleave
+with the member keys, crossed in pages of 2, with and without a hook filter.
+
+The second read counts against the read guard. `max_rows_to_read` limits the
+whole statement, and both queries read `*_capture_raw`. The inner query reads
+every row past the cursor that the filters do not prune. The outer query reads
+every granule that holds one of the page's keys. A selective filter spreads
+those keys across granules, so the outer read can approach a second full scan,
+and a page can read up to **twice** the rows the single-phase query did. On one
+corpus a page that read 1,102,131 rows now reads 2,203,414, and a
+`max_rows_to_read` of 1,500,000 that the old shape passed refuses the new one
+with Code 158 (`TOO_MANY_ROWS`). On the parity test's corpus, one granule per
+part, 25.12 reports 68 rows read for a native page against 34 for the Python
+reader's single-phase page. Size `ReaderConfig::max_rows_to_read` (`reader.h`)
+for two passes over the rows past the cursor. At worst, the default of
+50,000,000 then trips once about 25 million rows lie past the cursor, not 50
+million.
+
 Every descriptor field except the locator is immutable for a
 `(tenant_id, capture_id)`, which is what makes the pre-aggregation `WHERE`
 filters safe; the rule is written out in `clickhouse_reader`'s module
