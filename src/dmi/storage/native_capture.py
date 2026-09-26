@@ -143,11 +143,15 @@ class NativeCaptureStorageConfig:
     clock_skew_s: float = 0.0
     # How long start() waits for a predecessor's lease to expire before
     # failing with it held. None waits lease_ttl_s + publish_timeout_s +
-    # clock_skew_s, enough to outlast a crashed predecessor that ran with the
-    # same knobs; 0 fails at once. A predecessor with a longer TTL (the
-    # native default is 30 s, which processes predating these knobs used)
-    # can outlast it: set this explicitly for the first restart after such
-    # a process.
+    # clock_skew_s; 0 fails at once. That is guaranteed to outlast a crashed
+    # predecessor only when its TTL is at most lease_ttl_s +
+    # publish_timeout_s: clock_skew_s cancels, since the wait adds it and a
+    # lagging replica sees the row live that much longer -- which assumes
+    # clock_skew_s bounds the offset between the replica that stamped the
+    # predecessor's row and the one serving the read. Set this explicitly
+    # for the first restart after a predecessor above that threshold -- 20 s
+    # on these defaults, so one on the native 30 s default (which processes
+    # predating these knobs used) outlasts the default wait by 10 s.
     start_lease_wait_s: Optional[float] = None
 
     def __post_init__(self) -> None:
