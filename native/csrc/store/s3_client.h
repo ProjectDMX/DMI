@@ -32,10 +32,18 @@ struct S3Config {
   std::string secret_key;
   std::string session_token;  // empty when unused
   bool allow_insecure_http = false;
+  // https only: trust a private CA. ca_file is a PEM bundle
+  // (CURLOPT_CAINFO), ca_path an OpenSSL-hashed certificate directory
+  // (CURLOPT_CAPATH). Both empty uses libcurl's default trust store. Either
+  // way https always verifies the peer and the host name.
+  std::string ca_file;
+  std::string ca_path;
   int connect_timeout_s = 5;
   int read_timeout_s = 120;
   int max_attempts = 4;
   uint64_t multipart_threshold_bytes = 64ull * 1024 * 1024;
+  // The size of every part but the last. S3 refuses a smaller non-final
+  // part (EntityTooSmall), so the client refuses one under kMinMultipartPartBytes.
   uint64_t multipart_chunk_bytes = 16ull * 1024 * 1024;
   std::string user_agent = "dmi-native-store/1";
 };
@@ -70,9 +78,18 @@ struct ListResult {
   std::vector<ListedObject> objects;
 };
 
+// S3's minimum size for every part of a multipart upload but the last.
+inline constexpr uint64_t kMinMultipartPartBytes = 5ull * 1024 * 1024;
+
 class S3Client {
  public:
+  // An invalid config (see ValidateConfig) does not throw: the client
+  // refuses every request with the reason, before anything goes out.
   explicit S3Client(S3Config config);
+
+  // Empty when `config` is usable; otherwise why not. Callers with an error
+  // channel of their own (the Python bindings) check it at construction.
+  static std::string ValidateConfig(const S3Config& config);
   ~S3Client();
 
   S3Client(const S3Client&) = delete;
@@ -116,6 +133,7 @@ class S3Client {
 
  private:
   S3Config config_;
+  std::string config_error_;  // non-empty: every request is refused
   std::string host_;    // endpoint host (with :port when non-default)
   std::string scheme_;
   bool is_https_ = false;

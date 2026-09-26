@@ -36,12 +36,19 @@ dmi_store::S3Config s3_config(const py::dict& d) {
   c.secret_key = get<std::string>(d, "s3_secret_key", "");
   c.session_token = get<std::string>(d, "s3_session_token", "");
   c.allow_insecure_http = get<bool>(d, "s3_allow_insecure_http", false);
+  c.ca_file = get<std::string>(d, "s3_ca_file", "");
+  c.ca_path = get<std::string>(d, "s3_ca_path", "");
   c.connect_timeout_s = get<int>(d, "s3_connect_timeout_s", c.connect_timeout_s);
   c.read_timeout_s = get<int>(d, "s3_read_timeout_s", c.read_timeout_s);
   c.max_attempts = get<int>(d, "s3_max_attempts", c.max_attempts);
   if (c.endpoint.empty() || c.bucket.empty()) {
     throw py::value_error("s3_endpoint and s3_bucket are required");
   }
+  // The client would refuse every request of an invalid config (a CA on
+  // http://, a missing CA file, a sub-5 MiB part); raising here makes the
+  // refusal land when the service or reader is built instead.
+  const std::string invalid = dmi_store::S3Client::ValidateConfig(c);
+  if (!invalid.empty()) throw py::value_error("s3: " + invalid);
   return c;
 }
 

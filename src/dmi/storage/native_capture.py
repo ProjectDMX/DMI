@@ -81,6 +81,11 @@ class NativeCaptureStorageConfig:
     s3_session_token: str = field(default="", repr=False)
     # Plain-HTTP endpoints (a local Garage or MinIO) must be opted into.
     s3_allow_insecure_http: bool = False
+    # https only: trust a private CA, as a PEM bundle (s3_ca_file) or an
+    # OpenSSL-hashed certificate directory (s3_ca_path). Empty uses the
+    # system trust store. https always verifies the peer either way.
+    s3_ca_file: str = ""
+    s3_ca_path: str = ""
     # The name packs are indexed under; readers resolve it to this store.
     store_id: str = "s3"
 
@@ -131,6 +136,16 @@ class NativeCaptureStorageConfig:
                     "never downgrades TLS; leave it False for https://")
         else:
             raise ValueError("s3_endpoint must start with http:// or https://")
+        for name in ("s3_ca_file", "s3_ca_path"):
+            value = getattr(self, name)
+            if type(value) is not str:
+                raise TypeError(f"{name} must be a str (empty for the system "
+                                "trust store)")
+            # The native client refuses the same pairing: a CA on http://
+            # reads as "this is TLS" while credentials go in the clear.
+            if value and not self.s3_endpoint.startswith("https://"):
+                raise ValueError(f"{name} applies only to an https:// "
+                                 "s3_endpoint")
         if type(self.clickhouse_port) is not int or not 0 < self.clickhouse_port < 65536:
             raise ValueError("clickhouse_port must be in 1..65535")
         _positive("poll_interval_s", self.poll_interval_s, float)
@@ -158,6 +173,8 @@ class NativeCaptureStorageConfig:
             "s3_secret_key": self.s3_secret_key,
             "s3_session_token": self.s3_session_token,
             "s3_allow_insecure_http": self.s3_allow_insecure_http,
+            "s3_ca_file": self.s3_ca_file,
+            "s3_ca_path": self.s3_ca_path,
             "store_id": self.store_id,
             "clickhouse_host": self.clickhouse_host,
             "clickhouse_port": self.clickhouse_port,

@@ -113,6 +113,75 @@ def test_https_with_the_insecure_flag_is_refused():
                         s3_allow_insecure_http=True)
 
 
+# --- a private CA for an https object store ----------------------------------
+
+
+def test_a_private_ca_reaches_the_native_service_and_reader(monkeypatch):
+    from dmi.storage import native_capture
+
+    seen = []
+
+    class _Native:
+        def __init__(self, config):
+            seen.append(dict(config))
+
+    monkeypatch.setattr(
+        native_capture, "_load_native_store_extension",
+        lambda: SimpleNamespace(StorageService=_Native, CaptureReader=_Native,
+                                SEARCH_ITEM_COLUMNS=()))
+    config = _storage_config(s3_ca_file="/etc/dmi/ca.pem",
+                             s3_ca_path="/etc/dmi/ca.d")
+    native_capture.NativeCaptureStorage(config, spool_root="/tmp/spool",
+                                        spool_max_bytes=1 << 30,
+                                        sweep_spool=True)
+    native_capture.NativeCaptureReader(config)
+    assert [(d["s3_ca_file"], d["s3_ca_path"]) for d in seen] == \
+        [("/etc/dmi/ca.pem", "/etc/dmi/ca.d")] * 2
+    # Unset means libcurl's default trust store: empty, not absent.
+    default = _storage_config()._native_dict()
+    assert (default["s3_ca_file"], default["s3_ca_path"]) == ("", "")
+
+
+@pytest.mark.parametrize("name", ["s3_ca_file", "s3_ca_path"])
+def test_a_ca_on_a_plain_http_endpoint_is_refused(name):
+    # It would read as "this is TLS" while credentials go in the clear; the
+    # native client refuses the same pairing.
+    with pytest.raises(ValueError, match=f"{name}.*https"):
+        _storage_config(s3_endpoint="http://127.0.0.1:3900",
+                        s3_allow_insecure_http=True, **{name: "/etc/dmi/ca"})
+
+
+@pytest.mark.parametrize("name", ["s3_ca_file", "s3_ca_path"])
+def test_a_ca_option_must_be_a_string(name):
+    with pytest.raises(TypeError, match=name):
+        _storage_config(**{name: None})
+
+
+def _native_store_or_skip():
+    from dmi.storage import native_capture
+
+    try:
+        return native_capture._load_native_store_extension()
+    except ImportError:
+        pytest.skip("_dmi_native_store is not built")
+
+
+@pytest.mark.parametrize("name", ["s3_ca_file", "s3_ca_path"])
+def test_the_native_module_names_a_missing_ca_at_construction(tmp_path, name):
+    """The real bindings read the CA fields into the client's config.
+
+    No store or catalog is contacted: the client's own validation refuses
+    the path when the service or reader is built, not at the first upload.
+    """
+    module = _native_store_or_skip()
+    missing = str(tmp_path / "no-such-ca")
+    native = _storage_config(**{name: missing})._native_dict()
+    with pytest.raises(ValueError, match="no-such-ca"):
+        module.CaptureReader(native)
+    with pytest.raises(ValueError, match="no-such-ca"):
+        module.StorageService({**native, "spool_root": str(tmp_path / "spool")})
+
+
 def _fake_reader(monkeypatch):
     from dmi.storage import native_capture
 
