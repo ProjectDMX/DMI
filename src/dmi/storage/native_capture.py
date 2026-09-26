@@ -19,7 +19,8 @@ not a dependency of it.
 
 Deployment shape: the catalog has ONE publisher lease per (``database``,
 ``table_prefix``), so run one capture process per catalog. A second engine
-on the same catalog fails at ``create_record_runtime`` with the lease held.
+on the same catalog waits ``start_lease_wait_s`` for the lease, then fails
+at ``create_record_runtime`` with the lease held, naming the holder.
 """
 
 from __future__ import annotations
@@ -53,6 +54,22 @@ def _load_native_store_extension() -> Any:
             "`make -C native build/_dmi_native_store "
             "PYTHON=<venv>/bin/python`."
         ) from exc
+
+
+def _finite(name: str, value: Any) -> None:
+    if type(value) not in (int, float):
+        raise TypeError(f"{name} must be float")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+
+
+def _ns(seconds: float) -> int:
+    return int(round(seconds * 1_000_000_000))
+
+
+# The native writer's MINIMUM_FENCE_MARGIN_NS: what must remain of the lease
+# once the publish statement cap and the skew bound are spent.
+_FENCE_MARGIN_NS = 100_000_000
 
 
 def _positive(name: str, value: Any, kind: type) -> None:
@@ -114,6 +131,25 @@ class NativeCaptureStorageConfig:
     # open pack, then getting every staged pack into the catalog.
     close_flush_timeout_s: float = 60.0
 
+    # The publisher lease. A crashed process holds the catalog for up to
+    # lease_ttl_s; a ClickHouse error of unknown outcome sets the lease aside
+    # for as long, after which the service takes a fresh one. The TTL must
+    # exceed publish_timeout_s + clock_skew_s by at least 0.1 s: that margin
+    # is what keeps a publish statement from outliving its lease.
+    lease_ttl_s: float = 15.0
+    # The server-side cap on each fenced publish statement, whole seconds.
+    publish_timeout_s: float = 5.0
+    # The bound on host clock disagreement across a replicated catalog.
+    clock_skew_s: float = 0.0
+    # How long start() waits for a predecessor's lease to expire before
+    # failing with it held. None waits lease_ttl_s + publish_timeout_s +
+    # clock_skew_s, enough to outlast a crashed predecessor that ran with the
+    # same knobs; 0 fails at once. A predecessor with a longer TTL (the
+    # native default is 30 s, which processes predating these knobs used)
+    # can outlast it: set this explicitly for the first restart after such
+    # a process.
+    start_lease_wait_s: Optional[float] = None
+
     def __post_init__(self) -> None:
         for name in ("s3_endpoint", "s3_bucket", "s3_access_key",
                      "s3_secret_key", "store_id", "database", "table_prefix",
@@ -163,6 +199,45 @@ class NativeCaptureStorageConfig:
             raise ValueError("reconcile_interval_s must be finite")
         if self.reconcile_interval_s < 0:
             raise ValueError("reconcile_interval_s must be non-negative")
+        self._validate_lease()
+
+    def _validate_lease(self) -> None:
+        for name in ("lease_ttl_s", "publish_timeout_s", "clock_skew_s"):
+            _finite(name, getattr(self, name))
+        if self.start_lease_wait_s is not None:
+            _finite("start_lease_wait_s", self.start_lease_wait_s)
+            if self.start_lease_wait_s < 0:
+                raise ValueError("start_lease_wait_s must be non-negative")
+        _positive("lease_ttl_s", self.lease_ttl_s, float)
+        _positive("publish_timeout_s", self.publish_timeout_s, float)
+        if self.clock_skew_s < 0:
+            raise ValueError("clock_skew_s must be non-negative")
+        if float(self.publish_timeout_s) != int(self.publish_timeout_s):
+            raise ValueError(
+                "publish_timeout_s must be a whole number of seconds: the "
+                "catalog sends it as max_execution_time in seconds, where a "
+                "fraction truncates and 0 means no limit")
+        # In nanoseconds, as the native writer checks it, so a pairing
+        # accepted here is never refused at start().
+        margin = (_ns(self.lease_ttl_s) - _ns(self.publish_timeout_s)
+                  - _ns(self.clock_skew_s))
+        if margin < _FENCE_MARGIN_NS:
+            raise ValueError(
+                "lease_ttl_s must exceed publish_timeout_s + clock_skew_s by "
+                "at least 0.1 s, or a publish statement can still be running "
+                "when its lease becomes takeable")
+
+    def _lease_native(self) -> dict[str, int]:
+        wait = self.start_lease_wait_s
+        if wait is None:
+            wait = (self.lease_ttl_s + self.publish_timeout_s
+                    + self.clock_skew_s)
+        return {
+            "lease_ttl_ns": _ns(self.lease_ttl_s),
+            "publish_timeout_ns": _ns(self.publish_timeout_s),
+            "clock_skew_ns": _ns(self.clock_skew_s),
+            "start_lease_wait_ns": _ns(wait),
+        }
 
     def _native_dict(self) -> dict[str, Any]:
         return {
@@ -210,12 +285,17 @@ class NativeCaptureStorage:
             reconcile_prefix=config.reconcile_prefix,
             reconcile_interval_ns=int(config.reconcile_interval_s * 1e9),
             sweep_spool_on_start=sweep_spool,
+            **config._lease_native(),
         )
         self._config = config
         self._service = module.StorageService(native)
 
     def start(self) -> None:
-        """Sweep the spool, ensure the catalog schema, take the lease."""
+        """Ensure the catalog schema, take the lease, sweep the spool.
+
+        Waits up to ``start_lease_wait_s`` for another holder's lease to
+        expire, then raises naming the holder.
+        """
         self._service.start()
 
     def flush(self, timeout_s: float) -> None:
