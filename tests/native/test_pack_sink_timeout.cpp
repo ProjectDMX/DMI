@@ -21,6 +21,13 @@
 // waits for the pipeline to visibly quiesce between submits), so the
 // finite timeout never touches them.
 //
+// A second case pins the ENVELOPE deadline: the ring hands the sink one
+// envelope of N rows per submit, and its admission as a whole must be bounded
+// by one admission_timeout_s -- not one timeout per row, which let a steadily
+// slow sink hold the record worker (and, through it, the forward) for N
+// timeouts. There the stager is slowed rather than wedged, so each row after
+// the pipeline fills waits a little under one timeout for room.
+//
 // Built and run by tests/test_native_pack_sink_timeout.py.
 
 #include <chrono>
@@ -32,8 +39,10 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "sink/pack_sink.h"
+#include "sink/record_row.h"
 
 namespace fs = std::filesystem;
 
@@ -183,10 +192,99 @@ void TestBlockedPipelineTimesOutAndCountsIt() {
   CHECK(final_snap.stage_packs == 0);
 }
 
+std::string MetadataJson(int n) {
+  return std::string("{\"capture_id\": \"envelope-") + std::to_string(n) +
+         "\", \"tenant_id\": \"tenant-a\", \"experiment_id\": \"exp-1\", "
+         "\"run_id\": \"run-1\", \"session_id\": \"session-1\", "
+         "\"request_id\": \"req-1\", \"sequence_id\": \"seq-1\", "
+         "\"model_id\": \"model-1\", \"model_revision\": \"rev-1\", "
+         "\"adapter_revision\": null, \"capture_policy_version\": "
+         "\"policy-1\", \"hook_name\": \"hook.0\", \"layer_number\": 0, "
+         "\"producer_rank\": 0, \"step_number\": " + std::to_string(n) +
+         ", \"token_start\": 0, \"token_end\": 1, \"batch_position\": 0, "
+         "\"dtype\": \"float32\", \"shape\": [4], \"captured_at_ns\": " +
+         std::to_string(1700000000000000000ull + n) + "}";
+}
+
+void TestAnEnvelopeSharesOneAdmissionDeadline() {
+  const char* base = std::getenv("SPOOL_TEST_ROOT");
+  const std::string root =
+      std::string(base != nullptr ? base : "/tmp") + "/sink-envelope";
+  fs::remove_all(root);
+
+  constexpr double kTimeoutS = 0.5;
+  // Each pack takes a little over half a timeout to stage, so every row
+  // that has to wait for room waits well under one timeout: row by row,
+  // none of them would ever time out.
+  constexpr auto kStage = std::chrono::milliseconds(300);
+  constexpr int kRows = 10;
+
+  dmi_sink::SinkConfig config;
+  config.spool_root = root;
+  config.num_workers = 1;
+  config.max_queue_records = 1;
+  config.max_pack_records = 1;
+  config.stage_queue_packs = 1;
+  config.max_linger_ns = 3600ull * 1000 * 1000 * 1000;
+  config.overload = dmi_sink::Overload::kBlock;
+  config.admission_timeout_s = kTimeoutS;
+
+  dmi_sink::PackSink sink(config);
+  const std::string start_error = sink.Start();
+  CHECK(start_error.empty());
+  if (!start_error.empty()) return;
+  sink.SpoolForTesting().SetStageHookForTesting(
+      [&] { std::this_thread::sleep_for(kStage); });
+
+  const uint8_t payload[16] = {};
+  std::vector<std::string> metadata;
+  for (int n = 0; n < kRows; ++n) metadata.push_back(MetadataJson(n));
+
+  const auto started = std::chrono::steady_clock::now();
+  dmi_sink::EnvelopeAdmission envelope(sink);
+  dmi_sink::RowStatus status = dmi_sink::RowStatus::kOk;
+  std::string detail;
+  int admitted = 0;
+  for (int n = 0; n < kRows; ++n) {
+    dmi_sink::RowInput row;
+    row.metadata_json = metadata[n];
+    row.payload = payload;
+    row.payload_bytes = sizeof(payload);
+    row.dtype_name = "float32";
+    row.shape = {4};
+    status = envelope.SubmitRow(row, &detail);
+    if (status != dmi_sink::RowStatus::kOk) break;
+    ++admitted;
+  }
+  const double elapsed_s = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - started).count();
+
+  // One timeout for the whole envelope: a row times out once the
+  // envelope's deadline passes, well before every row got in.
+  CHECK(status == dmi_sink::RowStatus::kNotAccepted);
+  CHECK(detail == "timed_out");
+  CHECK(admitted < kRows);
+  CHECK(elapsed_s >= kTimeoutS - 0.05);
+  CHECK(elapsed_s < kTimeoutS + 0.25);
+  if (status != dmi_sink::RowStatus::kNotAccepted ||
+      elapsed_s >= kTimeoutS + 0.25) {
+    std::cerr << "envelope: " << admitted << " rows admitted in "
+              << elapsed_s << " s (status " << RowStatusName(status)
+              << ")\n";
+  }
+  CHECK(sink.Snapshot().timed_out_records == 1);
+
+  std::string close_error;
+  const dmi_sink::SinkSnapshot final_snap = sink.Close(-1.0, &close_error);
+  CHECK(close_error.empty());
+  CHECK(final_snap.persisted_records == static_cast<uint64_t>(admitted));
+}
+
 }  // namespace
 
 int main() {
   TestBlockedPipelineTimesOutAndCountsIt();
+  TestAnEnvelopeSharesOneAdmissionDeadline();
   if (g_failures != 0) {
     std::cerr << g_failures << " check(s) failed\n";
     return 1;

@@ -18,42 +18,14 @@ importing :mod:`dmi.storage.capture` never requires torch.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
+
+# The value type is live code, so the public config does not depend on this
+# backup package; it is re-exported here for this module's callers.
+from ..native_capture import NativeSinkConfig
 
 
 LAYOUT_NAME = "capture_pack_reference_v1"
-
-
-@dataclass(frozen=True, slots=True)
-class NativeSinkConfig:
-    """Pack-sink bounds for the native writer. Field-by-field the same
-    contract as the pipeline config the reference sink takes."""
-
-    spool_root: str
-    spool_max_bytes: int = 1 << 40
-    num_workers: int = 1
-    max_queue_records: int = 256
-    max_queue_bytes: int = 16 * 1024 * 1024
-    max_pack_bytes: int = 128 * 1024 * 1024
-    max_pack_records: int = 10_000
-    max_linger_ns: int = 1_000_000_000
-
-    def __post_init__(self) -> None:
-        if not self.spool_root:
-            raise ValueError("spool_root is required")
-        for name in (
-            "spool_max_bytes",
-            "num_workers",
-            "max_queue_records",
-            "max_queue_bytes",
-            "max_pack_bytes",
-            "max_pack_records",
-            "max_linger_ns",
-        ):
-            value = getattr(self, name)
-            if type(value) is not int or value <= 0:
-                raise ValueError(f"{name} must be positive")
 
 
 def _load_native_sink_extension() -> Any:
@@ -128,6 +100,8 @@ class NativePackSinkHandle:
             max_pack_records=config.max_pack_records,
             max_linger_ns=config.max_linger_ns,
             spool_max_bytes=config.spool_max_bytes,
+            overload=config.overload,
+            admission_timeout_s=config.admission_timeout_s,
         )
         # Engine ownership is taken by create_record_runtime; holding no
         # lease here keeps the handle closable without an engine.

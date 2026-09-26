@@ -12,7 +12,9 @@
 #include <torch/extension.h>
 
 #include <chrono>
+#include <cmath>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "../ring/record_sink.h"
@@ -43,6 +45,27 @@ ring::PayloadSlice ParseSlice(const py::dict& row) {
     slice.inferred_dynamic_dim = row["inferred_dynamic_dim"].cast<int32_t>();
   }
   return slice;
+}
+
+dmi_sink::Overload ParseOverload(const std::string& name) {
+  if (name == "block") return dmi_sink::Overload::kBlock;
+  if (name == "drop_newest") return dmi_sink::Overload::kDropNewest;
+  throw py::value_error("overload must be 'block' or 'drop_newest', got '" +
+                        name + "'");
+}
+
+const char* OverloadName(dmi_sink::Overload overload) {
+  return overload == dmi_sink::Overload::kBlock ? "block" : "drop_newest";
+}
+
+// None waits without bound under block, as SinkConfig's -1 does.
+double ParseAdmissionTimeout(const std::optional<double>& timeout_s) {
+  if (!timeout_s.has_value()) return -1.0;
+  if (!std::isfinite(*timeout_s) || *timeout_s < 0.0) {
+    throw py::value_error(
+        "admission_timeout_s must be None or a finite, non-negative number");
+  }
+  return *timeout_s;
 }
 
 }  // namespace
@@ -77,6 +100,14 @@ bool RingTypesRegistered() {
          py::detail::get_type_info(typeid(ring::RecordSinkLease)) != nullptr;
 }
 
+// RecordSink.admission_bound_s: the sink's admission bound in seconds, or
+// None when it has none.
+std::optional<double> AdmissionBoundSeconds(const ring::RecordSink& sink) {
+  const auto bound = sink.admission_bound();
+  if (!bound) return std::nullopt;
+  return std::chrono::duration<double>(*bound).count();
+}
+
 void EnsureRingTypes(py::module_& m) {
   if (RingTypesRegistered()) return;
   // The main backend lives beside the dmi package and is loaded from its
@@ -100,7 +131,8 @@ void EnsureRingTypes(py::module_& m) {
       .def("_acquire_engine",
            [](std::shared_ptr<ring::RecordSink> sink) {
              return ring::RecordSinkLease::acquire(std::move(sink));
-           });
+           })
+      .def_property_readonly("admission_bound_s", &AdmissionBoundSeconds);
   m.attr("RING_TYPES_ARE_STANDINS") = true;
 }
 
@@ -123,8 +155,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        const std::string& layout, int num_workers,
                        uint64_t max_queue_records, uint64_t max_queue_bytes,
                        uint64_t max_pack_bytes, uint64_t max_pack_records,
-                       uint64_t max_linger_ns, uint64_t spool_max_bytes) {
+                       uint64_t max_linger_ns, uint64_t spool_max_bytes,
+                       const std::string& overload,
+                       std::optional<double> admission_timeout_s) {
              dmi_sink::SinkConfig config;
+             config.overload = ParseOverload(overload);
+             config.admission_timeout_s =
+                 ParseAdmissionTimeout(admission_timeout_s);
              config.spool_root = spool_root;
              config.spool_max_bytes = spool_max_bytes;
              config.num_workers = num_workers;
@@ -144,7 +181,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("max_pack_bytes") = 128ull * 1024 * 1024,
            py::arg("max_pack_records") = 10'000,
            py::arg("max_linger_ns") = 1'000'000'000,
-           py::arg("spool_max_bytes") = 1ull << 40)
+           py::arg("spool_max_bytes") = 1ull << 40,
+           // SinkConfig's own defaults: the Python NativeSinkConfig, which
+           // the ring-fed sink is built from, picks block with 2 s.
+           py::arg("overload") = "drop_newest",
+           py::arg("admission_timeout_s") = py::none())
       .def("attach",
            [](std::shared_ptr<dmi_sink::NativePackSink> self) {
              // Simulates engine ownership for tests (the real engine takes
@@ -175,6 +216,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            })
       .def("rethrow_if_failed", &dmi_sink::NativePackSink::rethrow_if_failed)
       .def_property_readonly("layout", &dmi_sink::NativePackSink::layout)
+      .def_property_readonly(
+          "overload",
+          [](const dmi_sink::NativePackSink& self) {
+            return std::string(OverloadName(self.sink().config().overload));
+          })
+      .def_property_readonly(
+          "admission_timeout_s",
+          [](const dmi_sink::NativePackSink& self) -> std::optional<double> {
+            const double timeout_s = self.sink().config().admission_timeout_s;
+            if (timeout_s < 0) return std::nullopt;
+            return timeout_s;
+          })
       .def("snapshot", [](dmi_sink::NativePackSink& self) {
         const dmi_sink::SinkSnapshot snapshot = self.sink().Snapshot();
         py::dict out;
@@ -183,6 +236,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         out["persisted_records"] = snapshot.persisted_records;
         out["packs_persisted"] = snapshot.packs_persisted;
         out["dropped_records"] = snapshot.dropped_records;
+        out["timed_out_records"] = snapshot.timed_out_records;
+        out["rejected_closed_records"] = snapshot.rejected_closed_records;
         out["duplicate_records"] = snapshot.duplicate_records;
         out["oversized_records"] = snapshot.oversized_records;
         out["failures"] = snapshot.failures;

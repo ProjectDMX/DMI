@@ -36,7 +36,8 @@ RingEngine::RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
 }
 
 RingEngine::RingEngine(const RingConfig& cfg,
-                       std::shared_ptr<RecordSinkLease> lease)
+                       std::shared_ptr<RecordSinkLease> lease,
+                       RecordFailurePolicy failure_policy)
     : cfg_(cfg), ring_(cfg), record_sink_lease_(std::move(lease))
 {
     if (cfg_.payload_ring_bytes % PAYLOAD_ALIGN != 0) {
@@ -64,7 +65,7 @@ RingEngine::RingEngine(const RingConfig& cfg,
         ? record_sink_lease_->claim() : nullptr;
     try {
         record_p2p_ = std::make_unique<RecordP2PThread>(
-            *drain_, record_sink_);
+            *drain_, record_sink_, failure_policy);
     } catch (...) {
         release_record_sink();
         throw;

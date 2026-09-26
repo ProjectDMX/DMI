@@ -309,6 +309,26 @@ class RecordRuntime(Generic[MetadataT]):
             self._device_gated_output_ids.update(output_ids)
         self._bound_hooks.add(id(hook))
 
+    def begin_step(self) -> None:
+        """Mark the start of one model step.
+
+        The record reservations after this call share one fresh
+        ``step_stall_budget_ms`` (see ``create_record_runtime``), and a
+        step skipped because the previous budget ran out ends here. Call it
+        once per model step, before the step's first ``emit_output`` or
+        ``prepare_replay``: with a budget, a reservation before the first
+        call is refused. The runtime cannot find step boundaries itself --
+        eager hooks reserve once per output, output ids repeat within a
+        step, and a CUDA-graph step replays one plan or, with piecewise
+        graphs, several.
+
+        Under ``failure_policy="raise"`` it raises a failure latched during
+        the previous step, including a spent stall budget, so the error
+        surfaces here, outside the forward.
+        """
+
+        self._transport.begin_record_step()
+
     def emit_output(
         self,
         entry: ProducerPlanEntry,

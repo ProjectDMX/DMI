@@ -62,6 +62,22 @@ int DtypeWidth(const std::string& dtype_name);
 // On kNotAccepted, `detail` carries the sink's admission name.
 RowStatus SubmitRow(PackSink& sink, const RowInput& row, std::string* detail);
 
+// The rows of one envelope, admitted against ONE deadline. The ring's record
+// worker submits an envelope at a time, and the record ring's stall bound
+// counts one admission timeout per envelope: with a deadline per row, a
+// steadily slow sink held an N-row envelope for up to N timeouts. The
+// deadline starts at construction; PackSink::Submit keeps its per-call
+// deadline for its other callers.
+class EnvelopeAdmission {
+ public:
+  explicit EnvelopeAdmission(PackSink& sink);
+  RowStatus SubmitRow(const RowInput& row, std::string* detail);
+
+ private:
+  PackSink& sink_;
+  const double deadline_s_;  // PackSink::AdmissionDeadline(); -1 = none
+};
+
 }  // namespace dmi_sink
 
 #endif  // DMI_SINK_RECORD_ROW_H_
