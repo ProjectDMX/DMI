@@ -17,7 +17,9 @@ class RingEngine {
 public:
     RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
                SubmitFn submit_fn);
-    RingEngine(const RingConfig& cfg, std::shared_ptr<RecordSinkLease> lease);
+    RingEngine(const RingConfig& cfg, std::shared_ptr<RecordSinkLease> lease,
+               RecordFailurePolicy failure_policy =
+                   RecordFailurePolicy::kRaiseAtProducer);
     ~RingEngine() noexcept;
 
     RingEngine(const RingEngine&)            = delete;

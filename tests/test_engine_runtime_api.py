@@ -285,7 +285,7 @@ def test_create_record_runtime_is_additive_and_uses_active_transport(monkeypatch
 
     class _Factory:
         @staticmethod
-        def create_record(config, host):
+        def create_record(config, host, **_options):
             created.append((config, host))
             return new_ring
 
@@ -444,7 +444,7 @@ def test_explicit_record_sink_lease_is_owned_by_native_ring(monkeypatch):
 
     class _Factory:
         @staticmethod
-        def create_record(config, target):
+        def create_record(config, target, **_options):
             created.append((config, target))
             return new_ring
 
@@ -542,7 +542,7 @@ def test_record_runtime_rollback_stops_the_new_ring_before_dropping_it(monkeypat
 
     class _Factory:
         @staticmethod
-        def create_record(config, target):
+        def create_record(config, target, **_options):
             return new_ring
 
     class _FakeTransport:
@@ -822,7 +822,7 @@ def test_capture_backend_defaults_to_the_native_pack_sink(monkeypatch, tmp_path)
         "RingEngine",
         (),
         {"create_record": staticmethod(
-            lambda config, target: new_ring)},
+            lambda config, target, **_options: new_ring)},
     )
     monkeypatch.setitem(sys.modules, "dmi.transport.ring", fake_transport_module)
     monkeypatch.setitem(sys.modules, "dmi.transport.native", fake_native_module)
@@ -968,7 +968,7 @@ def test_second_record_runtime_is_refused_while_one_is_active(monkeypatch):
     activated = []
     deactivated = []
 
-    def create_record(config, target):
+    def create_record(config, target, **_options):
         created.append((config, target))
         return new_ring
 
@@ -1020,7 +1020,7 @@ def test_record_ring_construction_failure_rolls_the_engine_back(
 
     new_ring = _Boom()
 
-    def create_record(config, target):
+    def create_record(config, target, **_options):
         if failing_step == "create_record":
             raise RuntimeError("record ring create failed")
         return new_ring
@@ -1068,7 +1068,7 @@ def test_activate_failure_rolls_back_the_half_installed_record_ring(monkeypatch)
 
     _record_ring_fakes(
         monkeypatch,
-        create_record=lambda config, target: new_ring,
+        create_record=lambda config, target, **_options: new_ring,
         activate=boom_activate,
         deactivated=deactivated,
     )

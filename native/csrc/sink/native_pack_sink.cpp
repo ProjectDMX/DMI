@@ -111,12 +111,52 @@ NativePackSink::NativePackSink(std::unique_ptr<PackSink> sink,
   std::string error;
   const std::string start_error = sink_->Start(&error);
   if (!start_error.empty()) invalid("sink start failed: " + start_error);
+  baseline_ = sink_->Snapshot();
+}
+
+std::string NativePackSink::LossError() const {
+  const SinkSnapshot now = sink_->Snapshot();
+  std::string losses;
+  const auto add = [&](const char* name, uint64_t current, uint64_t base) {
+    if (current == base) return;
+    if (!losses.empty()) losses += ", ";
+    losses += std::string(name) + "=" + std::to_string(current - base);
+  };
+  // record_adapter.py _LOSS_COUNTERS, in its order.
+  add("dropped_records", now.dropped_records, baseline_.dropped_records);
+  add("timed_out_records", now.timed_out_records,
+      baseline_.timed_out_records);
+  add("oversized_records", now.oversized_records,
+      baseline_.oversized_records);
+  add("duplicate_records", now.duplicate_records,
+      baseline_.duplicate_records);
+  add("rejected_closed_records", now.rejected_closed_records,
+      baseline_.rejected_closed_records);
+  add("failures", now.failures, baseline_.failures);
+  if (losses.empty()) return "";
+  return "NativePackSink: pipeline reported lost records (" + losses + ")";
+}
+
+std::optional<ring::RecordSink::Duration>
+NativePackSink::admission_bound() const {
+  const SinkConfig& config = sink_->config();
+  if (config.overload == Overload::kDropNewest) return Duration::zero();
+  if (config.admission_timeout_s < 0) return std::nullopt;
+  // Rounded up: a bound the ring waits on must not be shorter than the
+  // sink's own deadline.
+  return std::chrono::ceil<Duration>(
+      std::chrono::duration<double>(config.admission_timeout_s));
 }
 
 NativePackSink::~NativePackSink() = default;
 
 void NativePackSink::submit(ring::RecordEnvelope envelope) {
   if (!engine_owned()) invalid("sink is not attached to a RingEngine");
+  // A record lost after admission (oversized framing, a duplicate id) is
+  // counted on the pack worker, after its submit returned. Refusing the
+  // next envelope is how the ring hears of it: its record runtime latches
+  // and reports the loss instead of storing around a hole.
+  rethrow_if_failed();
   const ring::RecordDescriptor& descriptor = envelope.descriptor;
   if (descriptor.layout != layout_) invalid("unexpected record layout");
   if (descriptor.rows.empty()) {
@@ -134,6 +174,8 @@ void NativePackSink::submit(ring::RecordEnvelope envelope) {
       static_cast<uint64_t>(payload.numel()) *
       static_cast<uint64_t>(payload.element_size());
 
+  // One admission deadline for the whole envelope, started here.
+  EnvelopeAdmission admission(*sink_);
   for (const ring::EncodedRecordRow& row : descriptor.rows) {
     // Cheap structural check first (mirrors the reference sink).
     if (row.cells.size() != 2) invalid("descriptor row must contain two cells");
@@ -175,7 +217,7 @@ void NativePackSink::submit(ring::RecordEnvelope envelope) {
     input.dtype_name = dtype_name;
     input.shape = std::move(shape);
     std::string detail;
-    const RowStatus status = SubmitRow(*sink_, input, &detail);
+    const RowStatus status = admission.SubmitRow(input, &detail);
     if (status != RowStatus::kOk) {
       invalid(std::string(RowStatusName(status)) +
               (detail.empty() ? "" : ": " + detail));
@@ -186,12 +228,26 @@ void NativePackSink::submit(ring::RecordEnvelope envelope) {
 bool NativePackSink::flush_and_wait(Duration timeout) {
   if (!engine_owned()) invalid("sink is not attached to a RingEngine");
   const double timeout_s = std::chrono::duration<double>(timeout).count();
+  // Everything admitted before the barrier must be persisted by it.
+  const uint64_t target = sink_->Snapshot().admitted_records;
   std::string error;
   const bool ok = sink_->Flush(timeout_s < 0 ? -1.0 : timeout_s, &error);
   if (!error.empty()) {
     throw std::runtime_error("NativePackSink: flush failed: " + error);
   }
-  return ok;
+  if (!ok) return false;
+  const std::string losses = LossError();
+  if (!losses.empty()) throw std::runtime_error(losses);
+  const uint64_t persisted = sink_->Snapshot().persisted_records;
+  if (persisted - baseline_.persisted_records <
+      target - baseline_.admitted_records) {
+    throw std::runtime_error(
+        "NativePackSink: durability mismatch: admitted=" +
+        std::to_string(target - baseline_.admitted_records) +
+        ", persisted=" +
+        std::to_string(persisted - baseline_.persisted_records));
+  }
+  return true;
 }
 
 void NativePackSink::rethrow_if_failed() const {
@@ -200,6 +256,8 @@ void NativePackSink::rethrow_if_failed() const {
   if (!error.empty()) {
     throw std::runtime_error("NativePackSink: pipeline failed: " + error);
   }
+  const std::string losses = LossError();
+  if (!losses.empty()) throw std::runtime_error(losses);
 }
 
 }  // namespace dmi_sink

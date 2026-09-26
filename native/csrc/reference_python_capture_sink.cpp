@@ -99,8 +99,10 @@ py::object target_method(PyObject* target, const char* name) {
 }  // namespace
 
 ReferencePythonCaptureSink::ReferencePythonCaptureSink(
-    PyObject* target, std::string layout)
-    : target_(target), layout_(std::move(layout)) {
+    PyObject* target, std::string layout,
+    std::optional<Duration> admission_bound)
+    : target_(target), layout_(std::move(layout)),
+      admission_bound_(admission_bound) {
     if (target == nullptr || target == Py_None) {
         throw std::invalid_argument(
             "ReferencePythonCaptureSink requires a Python target");

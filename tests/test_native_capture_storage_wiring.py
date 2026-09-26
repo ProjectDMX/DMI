@@ -490,7 +490,8 @@ def _capture_engine(monkeypatch, tmp_path, *, fail_ring=False):
         def __init__(self, config, host):
             events.append(("ring", "create"))
 
-        create_record = staticmethod(lambda config, target: _NewRing())
+        create_record = staticmethod(
+            lambda config, target, **_options: _NewRing())
 
     native.RingEngine = _RingEngine
     ring = ModuleType("dmi.transport.ring")

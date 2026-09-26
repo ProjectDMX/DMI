@@ -160,8 +160,20 @@ size_t PackSink::RouteWorker(const std::string& tenant,
   return static_cast<size_t>(z % static_cast<uint64_t>(queues_.size()));
 }
 
+double PackSink::AdmissionDeadline() const {
+  return config_.admission_timeout_s < 0
+             ? -1.0
+             : NowS() + config_.admission_timeout_s;
+}
+
 Admission PackSink::Submit(dmi_pack::RecordMetadata metadata,
                            const uint8_t* payload, size_t n) {
+  return SubmitBy(std::move(metadata), payload, n, AdmissionDeadline());
+}
+
+Admission PackSink::SubmitBy(dmi_pack::RecordMetadata metadata,
+                             const uint8_t* payload, size_t n,
+                             double deadline) {
   size_t worker = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -193,10 +205,6 @@ Admission PackSink::Submit(dmi_pack::RecordMetadata metadata,
     return Admission::kTooLarge;
   }
   const bool block = config_.overload == Overload::kBlock;
-  const double deadline =
-      config_.admission_timeout_s < 0
-          ? -1.0
-          : NowS() + config_.admission_timeout_s;
   SinkRecord record;
   record.metadata = std::move(metadata);
   record.payload.assign(payload, payload + n);
@@ -640,6 +648,20 @@ void PackSink::Run(size_t w) {
       if (st == dmi_pack::Status::kDuplicateId) {
         std::lock_guard<std::mutex> lock(mutex_);
         ++counters_.duplicate_records;
+        continue;
+      }
+      if (st == dmi_pack::Status::kCapacity &&
+          assembler.builder->record_count() == 0) {
+        // The pack was opened for this record and it fits no empty pack:
+        // admission screened the payload, not the header, footer row and
+        // trailer around it. The reference's OversizedRecordError: drop the
+        // record, keep the pipeline. Sealing the empty pack instead failed
+        // the whole sink ("cannot seal an empty pack").
+        assembler.builder.reset();
+        assembler.has_first = false;
+        assembler.opened_ns = -1;
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++counters_.oversized_records;
         continue;
       }
       if (st == dmi_pack::Status::kCapacity) {

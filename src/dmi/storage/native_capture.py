@@ -31,7 +31,7 @@ import os
 import re
 import socket
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from typing import Any, Optional, Sequence
 
 
@@ -61,6 +61,7 @@ def _load_native_store_extension() -> Any:
 # else would change what the URL the native client builds means.
 _BARE_HOST = re.compile(r"[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\]")
 
+
 def _text(name: str, value: Any) -> None:
     if type(value) is not str:
         raise TypeError(f"{name} must be str")
@@ -83,6 +84,93 @@ def _ns(seconds: float) -> int:
 # The native writer's MINIMUM_FENCE_MARGIN_NS: what must remain of the lease
 # once the publish statement cap and the skew bound are spent.
 _FENCE_MARGIN_NS = 100_000_000
+
+
+# The sink's admission policies (native/csrc/sink/pack_sink.h Overload).
+SINK_OVERLOAD_POLICIES = ("block", "drop_newest")
+
+
+@dataclass(frozen=True, slots=True)
+class NativeSinkConfig:
+    """Bounds and admission policy for the native pack sink.
+
+    The sink runs on the ring's record worker: every record the forward
+    captures is admitted here, into a bounded queue ahead of pack assembly.
+    ``overload`` decides what a full queue does. ``"block"`` waits for room
+    for up to ``admission_timeout_s`` (``None`` waits without bound) and
+    then refuses the record as timed out; the rows of one ring record (one
+    envelope) share that one deadline. ``"drop_newest"`` refuses it at
+    once, and ``admission_timeout_s`` is not used. Either refusal latches
+    the record runtime (see ``create_record_runtime``'s failure policy),
+    and so does a record lost after admission. A ``step_stall_budget_ms``
+    needs a bounded admission, so it is refused with block and no timeout.
+
+    The default, block with 2 s, absorbs a burst larger than the queue at
+    the cost of stalling the record worker, and so the ring, while the sink
+    catches up. The C++ ``SinkConfig`` keeps drop_newest with no timeout,
+    the reference pipeline's default; this config is what the ring-fed sink
+    is built from.
+
+    A record larger than ``max_queue_bytes`` or ``max_pack_bytes`` can
+    never be admitted; ``validate_capture_bounds`` refuses such a bound at
+    attach, before any forward runs.
+    """
+
+    spool_root: str
+    spool_max_bytes: int = 1 << 40
+    num_workers: int = 1
+    max_queue_records: int = 256
+    max_queue_bytes: int = 16 * 1024 * 1024
+    max_pack_bytes: int = 128 * 1024 * 1024
+    max_pack_records: int = 10_000
+    max_linger_ns: int = 1_000_000_000
+    overload: str = "block"
+    admission_timeout_s: Optional[float] = 2.0
+
+    def __post_init__(self) -> None:
+        if not self.spool_root:
+            raise ValueError("spool_root is required")
+        for name in (
+            "spool_max_bytes",
+            "num_workers",
+            "max_queue_records",
+            "max_queue_bytes",
+            "max_pack_bytes",
+            "max_pack_records",
+            "max_linger_ns",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.overload not in SINK_OVERLOAD_POLICIES:
+            raise ValueError(
+                f"overload must be one of {SINK_OVERLOAD_POLICIES}, "
+                f"got {self.overload!r}")
+        if self.admission_timeout_s is not None:
+            _positive("admission_timeout_s", self.admission_timeout_s, float)
+
+
+def _native_sink_config_setstate(self: NativeSinkConfig, state: Any) -> None:
+    # A frozen slots dataclass pickles its field values as a list, and the
+    # generated __setstate__ zips them with the current fields, leaving any
+    # the pickle predates unset. A config pickled before the admission
+    # fields existed (the old class, at the path that now re-exports this
+    # one) gets their defaults instead.
+    names = fields(NativeSinkConfig)
+    if len(state) > len(names):
+        raise TypeError(
+            f"NativeSinkConfig state has {len(state)} values, expected at "
+            f"most {len(names)}")
+    for item, value in zip(names, state):
+        object.__setattr__(self, item.name, value)
+    for item in names[len(state):]:
+        if item.default is MISSING:
+            raise TypeError(
+                f"NativeSinkConfig state is missing {item.name!r}")
+        object.__setattr__(self, item.name, item.default)
+
+
+NativeSinkConfig.__setstate__ = _native_sink_config_setstate  # type: ignore[method-assign]
 
 
 def _positive(name: str, value: Any, kind: type) -> None:
@@ -164,6 +252,10 @@ class NativeCaptureStorageConfig:
     # engine.close()'s total budget for draining capture: sealing the sink's
     # open pack, then getting every staged pack into the catalog.
     close_flush_timeout_s: float = 60.0
+    # Bytes of packs the uploader holds in flight at once. A staged pack
+    # larger than this is never uploaded, so the sink's max_pack_bytes must
+    # not exceed it (validate_capture_bounds). The native default.
+    uploader_max_in_flight_bytes: int = 256 * 1024 * 1024
 
     # The publisher lease. A crashed process holds the catalog for up to
     # lease_ttl_s; a ClickHouse error of unknown outcome sets the lease aside
@@ -228,6 +320,9 @@ class NativeCaptureStorageConfig:
                   self.clickhouse_request_timeout_s, float)
         self._validate_clickhouse_connection()
         _positive("close_flush_timeout_s", self.close_flush_timeout_s, float)
+        if (type(self.uploader_max_in_flight_bytes) is not int
+                or self.uploader_max_in_flight_bytes <= 0):
+            raise ValueError("uploader_max_in_flight_bytes must be positive")
         if type(self.reconcile_interval_s) not in (int, float):
             raise TypeError("reconcile_interval_s must be float")
         if not math.isfinite(self.reconcile_interval_s):
@@ -352,6 +447,7 @@ class NativeCaptureStorageConfig:
             "clickhouse_request_timeout_s": float(self.clickhouse_request_timeout_s),
             "database": self.database,
             "table_prefix": self.table_prefix,
+            "uploader_max_in_flight_bytes": self.uploader_max_in_flight_bytes,
         }
 
     def _native_reader_dict(self) -> dict[str, Any]:
@@ -361,6 +457,62 @@ class NativeCaptureStorageConfig:
             native["clickhouse_user"] = self.clickhouse_reader_user
             native["clickhouse_password"] = self.clickhouse_reader_password
         return native
+
+
+# What an empty pack needs besides one record's payload: the 64-byte header
+# and trailer, up to 63 bytes of payload alignment, and that record's footer
+# row (its metadata as JSON, well under a kilobyte for real identifiers).
+# Generous on purpose: undershooting it lets a record through that the pack
+# worker then counts as oversized and drops.
+PACK_FRAMING_RESERVE_BYTES = 64 * 1024
+
+
+def validate_capture_bounds(
+    sink_config: NativeSinkConfig,
+    max_record_bytes: int,
+    *,
+    storage_config: Optional[NativeCaptureStorageConfig] = None,
+) -> None:
+    """Refuse capture bounds under which a record or pack cannot be stored.
+
+    ``max_record_bytes`` is the largest single record (one captured row's
+    payload) the caller will emit. Checked here, at attach, these refusals
+    never reach the forward:
+
+    - ``max_queue_bytes`` below it: the sink refuses the record outright.
+    - ``max_pack_bytes`` below it plus ``PACK_FRAMING_RESERVE_BYTES``: the
+      sink admits the record and the pack worker then drops it as oversized.
+    - ``max_pack_bytes`` above ``uploader_max_in_flight_bytes``: a full pack
+      is staged and never uploaded.
+
+    Raises ``ConfigurationError`` naming the bound to raise.
+    """
+    if not isinstance(sink_config, NativeSinkConfig):
+        raise TypeError("sink_config must be a NativeSinkConfig")
+    if type(max_record_bytes) is not int or max_record_bytes <= 0:
+        raise ValueError("max_record_bytes must be a positive int")
+    from ..configuration.errors import ConfigurationError
+
+    if sink_config.max_queue_bytes < max_record_bytes:
+        raise ConfigurationError(
+            f"a {max_record_bytes}-byte record exceeds the sink's "
+            f"max_queue_bytes ({sink_config.max_queue_bytes}); raise "
+            "max_queue_bytes to at least the largest record")
+    needed = max_record_bytes + PACK_FRAMING_RESERVE_BYTES
+    if sink_config.max_pack_bytes < needed:
+        raise ConfigurationError(
+            f"a {max_record_bytes}-byte record does not fit an empty pack of "
+            f"max_pack_bytes ({sink_config.max_pack_bytes}); raise "
+            f"max_pack_bytes to at least {needed} (the record plus "
+            f"{PACK_FRAMING_RESERVE_BYTES} bytes of pack framing)")
+    if (storage_config is not None and sink_config.max_pack_bytes
+            > storage_config.uploader_max_in_flight_bytes):
+        raise ConfigurationError(
+            f"the sink's max_pack_bytes ({sink_config.max_pack_bytes}) "
+            "exceeds the storage service's uploader_max_in_flight_bytes "
+            f"({storage_config.uploader_max_in_flight_bytes}), so a full "
+            "pack would never be uploaded; lower max_pack_bytes or raise "
+            "uploader_max_in_flight_bytes")
 
 
 class NativeCaptureStorage:
@@ -615,10 +767,14 @@ class NativeCaptureReader:
 
 
 __all__ = [
+    "PACK_FRAMING_RESERVE_BYTES",
+    "SINK_OVERLOAD_POLICIES",
+    "NativeSinkConfig",
     "NativeCapture",
     "NativeCapturePage",
     "NativeCaptureReader",
     "NativeCaptureSelection",
     "NativeCaptureStorage",
     "NativeCaptureStorageConfig",
+    "validate_capture_bounds",
 ]

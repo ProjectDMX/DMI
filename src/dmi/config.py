@@ -11,8 +11,8 @@ if TYPE_CHECKING:
     # For the string annotations on MonitoringConfig only. Importing them at
     # runtime would make this dependency-free module load the storage
     # packages; the engine imports them where it validates the values.
-    from .storage.capture.native_sink import NativeSinkConfig
-    from .storage.native_capture import NativeCaptureStorageConfig
+    from .storage.native_capture import (
+        NativeCaptureStorageConfig, NativeSinkConfig)
 
 
 StorageBackend = Literal[

@@ -202,7 +202,12 @@ bool ParseMetadataJson(const std::string& text,
   return true;
 }
 
-RowStatus SubmitRow(PackSink& sink, const RowInput& row, std::string* detail) {
+namespace {
+
+// Validate the row against its metadata, then admit it by `deadline_s` (the
+// sink's AdmissionDeadline() clock).
+RowStatus SubmitRowBy(PackSink& sink, const RowInput& row, double deadline_s,
+                      std::string* detail) {
   dmi_pack::RecordMetadata metadata;
   std::string error;
   if (!ParseMetadataJson(row.metadata_json, &metadata, &error)) {
@@ -239,13 +244,30 @@ RowStatus SubmitRow(PackSink& sink, const RowInput& row, std::string* detail) {
     }
     return RowStatus::kSizeMismatch;
   }
-  const Admission admission =
-      sink.Submit(std::move(metadata), row.payload, row.payload_bytes);
+  const Admission admission = sink.SubmitBy(
+      std::move(metadata), row.payload, row.payload_bytes, deadline_s);
   if (admission != Admission::kAccepted) {
     if (detail) *detail = AdmissionName(admission);
     return RowStatus::kNotAccepted;
   }
   return RowStatus::kOk;
+}
+
+}  // namespace
+
+RowStatus SubmitRow(PackSink& sink, const RowInput& row, std::string* detail) {
+  // One deadline per call, as Submit takes it. It is taken before the row
+  // is validated rather than after; validation never blocks, so nothing
+  // observable changes.
+  return SubmitRowBy(sink, row, sink.AdmissionDeadline(), detail);
+}
+
+EnvelopeAdmission::EnvelopeAdmission(PackSink& sink)
+    : sink_(sink), deadline_s_(sink.AdmissionDeadline()) {}
+
+RowStatus EnvelopeAdmission::SubmitRow(const RowInput& row,
+                                       std::string* detail) {
+  return SubmitRowBy(sink_, row, deadline_s_, detail);
 }
 
 }  // namespace dmi_sink
