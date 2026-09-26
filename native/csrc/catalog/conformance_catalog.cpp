@@ -340,9 +340,45 @@ Session make_session(const std::string& line) {
   // HTTP interface: the driver speaks HTTP (libcurl), not the native TCP
   // protocol clickhouse-driver uses, so the port differs from the
   // Python-side suites' DMI_CLICKHOUSE_PORT. 8123 is ClickHouse's default.
-  session.client = std::make_shared<const dmi_catalog::ClickHouseClient>(
-      host != nullptr ? host : "127.0.0.1",
-      static_cast<uint16_t>(port != nullptr ? std::atoi(port) : 8123));
+  dmi_catalog::ClickHouseConnection connection;
+  connection.host = host != nullptr ? host : "127.0.0.1";
+  connection.port =
+      static_cast<uint16_t>(port != nullptr ? std::atoi(port) : 8123);
+  // Optional per-session overrides of the connection, for the suites that
+  // pin what the client sends (tests/test_native_catalog_connection.py).
+  // Absent keys keep the environment's plain-http defaults above.
+  if (jc::HasKey(line, "clickhouse_scheme")) {
+    connection.scheme = jc::FindString(line, "clickhouse_scheme");
+  }
+  if (jc::HasKey(line, "clickhouse_host")) {
+    connection.host = jc::FindString(line, "clickhouse_host");
+  }
+  if (jc::HasKey(line, "clickhouse_port")) {
+    connection.port = static_cast<uint16_t>(field_int(line, "clickhouse_port"));
+  }
+  connection.user = jc::FindString(line, "clickhouse_user");
+  connection.password = jc::FindString(line, "clickhouse_password");
+  connection.ca_file = jc::FindString(line, "clickhouse_ca_file");
+  connection.ca_path = jc::FindString(line, "clickhouse_ca_path");
+  connection.allow_insecure_http =
+      jc::FindBool(line, "clickhouse_allow_insecure_http");
+  if (jc::HasKey(line, "clickhouse_request_timeout_ms")) {
+    connection.timeouts.request_s =
+        static_cast<double>(field_int(line, "clickhouse_request_timeout_ms")) /
+        1000.0;
+  }
+  // Microseconds, for the sub-millisecond bound libcurl cannot express.
+  if (jc::HasKey(line, "clickhouse_request_timeout_us")) {
+    connection.timeouts.request_s =
+        static_cast<double>(field_int(line, "clickhouse_request_timeout_us")) /
+        1e6;
+  }
+  if (jc::HasKey(line, "clickhouse_max_attempts")) {
+    connection.max_attempts =
+        static_cast<int>(field_int(line, "clickhouse_max_attempts"));
+  }
+  session.client =
+      std::make_shared<const dmi_catalog::ClickHouseClient>(connection);
   session.writer = std::make_unique<CatalogWriter>(session.client, config);
   session.database = config.database;
   session.table_prefix = config.table_prefix;
@@ -479,6 +515,8 @@ std::string respond(const std::string& line, Session* session) {
       s3_config.access_key = jc::FindString(line, "access");
       s3_config.secret_key = jc::FindString(line, "secret");
       s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      s3_config.ca_file = jc::FindString(line, "ca_file");
+      s3_config.ca_path = jc::FindString(line, "ca_path");
       dmi_store::S3Client s3(s3_config);
       dmi_catalog::NativeCaptureReader reader(
           &s3, s3_config.bucket, session->client, rc);
@@ -511,6 +549,8 @@ std::string respond(const std::string& line, Session* session) {
       s3_config.access_key = jc::FindString(line, "access");
       s3_config.secret_key = jc::FindString(line, "secret");
       s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      s3_config.ca_file = jc::FindString(line, "ca_file");
+      s3_config.ca_path = jc::FindString(line, "ca_path");
       dmi_store::S3Client s3(s3_config);
       dmi_catalog::NativeCaptureReader reader(
           &s3, s3_config.bucket, session->client, rc);
@@ -547,6 +587,8 @@ std::string respond(const std::string& line, Session* session) {
       s3_config.access_key = jc::FindString(line, "access");
       s3_config.secret_key = jc::FindString(line, "secret");
       s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      s3_config.ca_file = jc::FindString(line, "ca_file");
+      s3_config.ca_path = jc::FindString(line, "ca_path");
       dmi_store::S3Client s3(s3_config);
       dmi_catalog::NativeCaptureReader reader(
           &s3, s3_config.bucket, session->client, rc);
@@ -954,6 +996,8 @@ std::string respond(const std::string& line, Session* session) {
       s3_config.access_key = jc::FindString(line, "access");
       s3_config.secret_key = jc::FindString(line, "secret");
       s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      s3_config.ca_file = jc::FindString(line, "ca_file");
+      s3_config.ca_path = jc::FindString(line, "ca_path");
       dmi_store::S3Client s3(s3_config);
       std::vector<dmi_catalog::PackRefData> refs;
       for (const std::string& element : jc::SplitElements(
@@ -1031,8 +1075,10 @@ std::string respond(const std::string& line, Session* session) {
           static_cast<uint64_t>(field_int(line, "clock_skew_ns")));
       out = std::string(",\"admits\":") + (admits ? "1" : "0");
     } else if (op == "execute") {
+      int attempts = 0;
       out = rows_to_json(session->client->execute(
-          jc::FindString(line, "query")));
+          jc::FindString(line, "query"), {}, {}, &attempts));
+      out += ",\"attempts\":" + std::to_string(attempts);
     } else {
       return prefix + "false,\"what\":\"unknown op\"}";
     }

@@ -17,6 +17,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import shutil
+import ssl
 import subprocess
 import sys
 import threading
@@ -175,6 +177,11 @@ class FakeS3Handler(BaseHTTPRequestHandler):
             n = STATE.fault_counts.get(key, 0)
             STATE.fault_counts[key] = n + 1
         if under("fault/once-500") and n == 0:
+            return 500, b"boom"
+        if under("fault/slow-once-500") and n == 0:
+            # Outlive the one-second resolution of x-amz-date, so a retry
+            # that reuses the first attempt's signature is visible.
+            time.sleep(1.2)
             return 500, b"boom"
         if under("fault/always-500"):
             return 500, b"boom"
@@ -354,7 +361,13 @@ class FakeS3Handler(BaseHTTPRequestHandler):
         if not numbers:
             self._send(400, {}, b"invalid xml")
             return
-        assembled = b"".join(upload["parts"][n] for n in sorted(numbers))
+        ordered = sorted(numbers)
+        # S3's rule: every part but the last is at least 5 MiB.
+        if any(len(upload["parts"][n]) < 5 * 1024 * 1024
+               for n in ordered[:-1]):
+            self._send(400, {}, b"<Error><Code>EntityTooSmall</Code></Error>")
+            return
+        assembled = b"".join(upload["parts"][n] for n in ordered)
         meta = upload["meta"]
         with STATE.lock:
             STATE.objects[key] = {
@@ -371,16 +384,136 @@ class FakeS3Handler(BaseHTTPRequestHandler):
         self._send(204, {})
 
 
-@pytest.fixture()
-def fake_s3():
+def _reset_state():
     STATE.objects.clear()
     STATE.uploads.clear()
     STATE.calls.clear()
     STATE.fault_counts.clear()
+
+
+@pytest.fixture()
+def fake_s3():
+    _reset_state()
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeS3Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield f"http://127.0.0.1:{server.server_port}"
+    server.shutdown()
+
+
+# --- TLS ---------------------------------------------------------------------
+#
+# The same signature-verifying fake, behind TLS with a server certificate
+# issued by a private CA generated here. Nothing about the CA is installed
+# anywhere: a client trusts it only when told to (ca_file / ca_path).
+
+
+def _openssl(*args: str, cwd: Path) -> str:
+    return subprocess.run(["openssl", *args], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout
+
+
+@pytest.fixture(scope="session")
+def private_ca(tmp_path_factory):
+    """(ca_file, ca_path, server_cert, server_key) for 127.0.0.1."""
+    if shutil.which("openssl") is None:
+        pytest.skip("the openssl CLI is needed to mint the test CA")
+    root = tmp_path_factory.mktemp("private-ca")
+    # Own config files, not the system openssl.cnf: its v3_ca section adds a
+    # basicConstraints of its own, and a duplicated extension makes OpenSSL
+    # reject the CA ("unable to get local issuer certificate").
+    (root / "ca.cnf").write_text(
+        "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=v3_ca\n"
+        "[dn]\nCN=DMI test private CA\n"
+        "[v3_ca]\nbasicConstraints=critical,CA:TRUE\n"
+        "keyUsage=critical,keyCertSign,cRLSign\n"
+        "subjectKeyIdentifier=hash\n")
+    (root / "server.cnf").write_text(
+        "[req]\nprompt=no\ndistinguished_name=dn\n[dn]\nCN=127.0.0.1\n")
+    (root / "server.ext").write_text(
+        "basicConstraints=CA:FALSE\n"
+        "keyUsage=critical,digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\n"
+        "subjectAltName=IP:127.0.0.1,DNS:localhost\n"
+        "authorityKeyIdentifier=keyid\n")
+    _openssl("req", "-config", "ca.cnf", "-x509", "-newkey", "rsa:2048",
+             "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "2",
+             cwd=root)
+    _openssl("req", "-config", "server.cnf", "-new", "-newkey", "rsa:2048",
+             "-nodes", "-keyout", "server.key", "-out", "server.csr",
+             cwd=root)
+    _openssl("x509", "-req", "-in", "server.csr", "-CA", "ca.pem",
+             "-CAkey", "ca.key", "-CAcreateserial", "-out", "server.pem",
+             "-days", "2", "-extfile", "server.ext", cwd=root)
+    _openssl("verify", "-CAfile", "ca.pem", "server.pem", cwd=root)
+    # CURLOPT_CAPATH reads an OpenSSL-hashed directory: <subject hash>.0.
+    ca_dir = root / "ca-dir"
+    ca_dir.mkdir()
+    subject_hash = _openssl("x509", "-hash", "-noout", "-in", "ca.pem",
+                            cwd=root).strip()
+    shutil.copy(root / "ca.pem", ca_dir / f"{subject_hash}.0")
+    return (str(root / "ca.pem"), str(ca_dir), str(root / "server.pem"),
+            str(root / "server.key"))
+
+
+class _QuietTLSServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # A client that refuses the certificate aborts the handshake; that is
+        # the outcome under test, not a server fault worth a traceback.
+        if isinstance(sys.exc_info()[1], (ssl.SSLError, ConnectionError)):
+            return
+        super().handle_error(request, client_address)
+
+
+@pytest.fixture()
+def fake_s3_tls(private_ca):
+    """https://127.0.0.1:<port> served with the private CA's certificate."""
+    _reset_state()
+    _ca_file, _ca_path, cert, key = private_ca
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    server = _QuietTLSServer(("127.0.0.1", 0), FakeS3Handler)
+    # The handshake runs lazily, on the handler's thread, so a client that
+    # hangs or aborts it cannot stall the accept loop.
+    server.socket = context.wrap_socket(server.socket, server_side=True,
+                                        do_handshake_on_connect=False)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"https://127.0.0.1:{server.server_port}"
+    server.shutdown()
+
+
+@pytest.fixture()
+def fake_s3_tls_wrong_name(private_ca):
+    """https://127.0.0.1:<port> served with a certificate the private CA
+    issued for ANOTHER name: trusted chain, mismatched host."""
+    _reset_state()
+    ca_file, _ca_path, _cert, _key = private_ca
+    root = Path(ca_file).parent
+    (root / "other.ext").write_text(
+        "basicConstraints=CA:FALSE\n"
+        "keyUsage=critical,digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\n"
+        "subjectAltName=DNS:other.example\n"
+        "authorityKeyIdentifier=keyid\n")
+    (root / "other.cnf").write_text(
+        "[req]\nprompt=no\ndistinguished_name=dn\n[dn]\nCN=other.example\n")
+    if not (root / "other.pem").exists():
+        _openssl("req", "-config", "other.cnf", "-new", "-newkey", "rsa:2048",
+                 "-nodes", "-keyout", "other.key", "-out", "other.csr",
+                 cwd=root)
+        _openssl("x509", "-req", "-in", "other.csr", "-CA", "ca.pem",
+                 "-CAkey", "ca.key", "-CAcreateserial", "-out", "other.pem",
+                 "-days", "2", "-extfile", "other.ext", cwd=root)
+        _openssl("verify", "-CAfile", "ca.pem", "other.pem", cwd=root)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(root / "other.pem"), str(root / "other.key"))
+    server = _QuietTLSServer(("127.0.0.1", 0), FakeS3Handler)
+    server.socket = context.wrap_socket(server.socket, server_side=True,
+                                        do_handshake_on_connect=False)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"https://127.0.0.1:{server.server_port}"
     server.shutdown()
 
 
@@ -447,16 +580,52 @@ def test_put_get_head_delete_round_trip(fake_s3):
     assert missing["ok"] and not missing["found"]
 
 
+MIB = 1024 * 1024
+
+
 def test_put_multipart_round_trip(fake_s3):
-    payload = bytes((i * 7) & 0xFF for i in range(3 * 1024 * 1024))
+    """Real part sizes: S3 refuses a part under 5 MiB unless it is the last.
+
+    12 MiB in 5 MiB parts is two full parts and a 2 MiB tail -- the
+    smallest shape with both a minimum-size part and a short final one.
+    """
+    payload = bytes((i * 7) & 0xFF for i in range(12 * MIB))
     put = _call("put", **_base(fake_s3), key="packs/big.dmi-pack",
                 data_b64=base64.b64encode(payload).decode(), metadata={},
                 content_type="application/vnd.dmi.pack",
-                multipart_threshold=1024 * 1024, multipart_chunk=1024 * 1024)
+                multipart_threshold=5 * MIB, multipart_chunk=5 * MIB)
     assert put["ok"], put
+    parts = [call["body_len"] for call in STATE.calls
+             if call["method"] == "PUT" and "partNumber=" in call["path"]]
+    assert parts == [5 * MIB, 5 * MIB, 2 * MIB]
     echo = _call("get", **_base(fake_s3), key="packs/big.dmi-pack",
                  offset=0, length=len(payload))
     assert echo["ok"] and base64.b64decode(echo["data_b64"]) == payload
+
+
+def test_multipart_part_under_5_mib_is_refused_before_any_request(fake_s3):
+    """The client refuses the part size, as the Python store does (s3.py).
+
+    Left to the server, a sub-5 MiB part fails only at
+    CompleteMultipartUpload, after every part was sent -- and a payload
+    under the threshold never notices. The refusal is the configuration's,
+    so it lands on every operation, before any request.
+    """
+    payload = bytes(3 * MIB)
+    put = _call("put", **_base(fake_s3), key="packs/small-parts.dmi-pack",
+                data_b64=base64.b64encode(payload).decode(), metadata={},
+                content_type="application/vnd.dmi.pack",
+                multipart_threshold=MIB, multipart_chunk=MIB)
+    assert not put["ok"], put
+    assert "multipart_chunk_bytes" in put["what"], put
+    assert str(5 * MIB) in put["what"], put
+    head = _call("head", **_base(fake_s3), key="anything",
+                 multipart_chunk=5 * MIB - 1)
+    assert not head["ok"] and "multipart_chunk_bytes" in head["what"], head
+    assert STATE.calls == []
+    # Exactly 5 MiB is S3's minimum, and is accepted.
+    assert _call("head", **_base(fake_s3), key="anything",
+                 multipart_chunk=5 * MIB)["ok"]
 
 
 def test_list_pagination(fake_s3):
@@ -482,6 +651,37 @@ def test_retry_then_success_on_500(fake_s3):
                 content_type="application/octet-stream")
     assert put["ok"], put
     assert put["attempts"] == 2
+
+
+def _header(call: dict, name: str) -> str:
+    return next(v for k, v in call["headers"].items() if k.lower() == name)
+
+
+def test_every_attempt_is_signed_afresh(fake_s3):
+    """A retry carries its own x-amz-date and signature, both still valid.
+
+    SigV4 binds the signature to x-amz-date, and S3 refuses a request whose
+    date is more than 15 minutes off. Signing once before the loop replayed
+    the first attempt's date on every retry, so a slow first attempt (up to
+    read_timeout_s each, plus backoff) aged every later one. The first
+    attempt here outlives a second before failing with a 500: a fresh
+    signature must carry a later date. Both attempts passed the server's
+    botocore re-signing check -- the 500 is only reached after it -- and
+    the second one stored the object.
+    """
+    put = _call("put", **_base(fake_s3), key="fault/slow-once-500",
+                data_b64=base64.b64encode(b"data").decode(), metadata={},
+                content_type="application/octet-stream")
+    assert put["ok"], put
+    assert put["attempts"] == 2
+    attempts = [call for call in STATE.calls
+                if call["path"].endswith("/fault/slow-once-500")]
+    assert len(attempts) == 2, attempts
+    first, second = attempts
+    assert _header(second, "x-amz-date") > _header(first, "x-amz-date")
+    assert _header(second, "authorization") != \
+        _header(first, "authorization")
+    assert STATE.objects["fault/slow-once-500"]["body"] == b"data"
 
 
 def test_no_retry_on_403(fake_s3):
@@ -596,3 +796,75 @@ def test_the_64_bit_boundaries_still_reach_the_transport(fake_s3):
                 length=len(payload))
     assert get["ok"], get
     assert base64.b64decode(get["data_b64"]) == payload
+
+
+# --- https with a private CA --------------------------------------------------
+
+
+def _tls(endpoint: str, **overrides) -> dict:
+    return _base(endpoint, insecure=False, **overrides)
+
+
+@pytest.mark.parametrize("trust", ["ca_file", "ca_path"])
+def test_https_round_trip_trusts_a_private_ca(fake_s3_tls, private_ca, trust):
+    ca_file, ca_path, _cert, _key = private_ca
+    anchor = {"ca_file": ca_file} if trust == "ca_file" else {"ca_path": ca_path}
+    payload = bytes(range(256)) * 16
+    meta = {"dmi-format": "dmi-pack-v1"}
+    put = _call("put", **_tls(fake_s3_tls, **anchor), key="tls/a",
+                data_b64=base64.b64encode(payload).decode(), metadata=meta,
+                content_type="application/octet-stream")
+    assert put["ok"], put
+    head = _call("head", **_tls(fake_s3_tls, **anchor), key="tls/a")
+    assert head["ok"] and head["found"] and head["metadata"] == meta, head
+    get = _call("get", **_tls(fake_s3_tls, **anchor), key="tls/a",
+                offset=0, length=len(payload))
+    assert get["ok"], get
+    assert base64.b64decode(get["data_b64"]) == payload
+
+
+def test_https_without_the_private_ca_is_refused(fake_s3_tls):
+    """libcurl's default trust store does not know the CA: no request lands.
+
+    A certificate failure is not transient, so it is not retried.
+    """
+    put = _call("put", **_tls(fake_s3_tls), key="tls/untrusted",
+                data_b64=base64.b64encode(b"data").decode(), metadata={},
+                content_type="application/octet-stream")
+    assert not put["ok"], put
+    assert "certificate" in put["what"].lower(), put
+    assert put["attempts"] == 1, put
+    assert STATE.calls == [] and STATE.objects == {}
+
+
+def test_https_refuses_a_certificate_for_another_host(
+        fake_s3_tls_wrong_name, private_ca):
+    """The chain is trusted (the private CA issued it), but it names
+    other.example, not 127.0.0.1: host-name verification must refuse it
+    before any request, with no retry."""
+    ca_file, _ca_path, _cert, _key = private_ca
+    head = _call("head", **_tls(fake_s3_tls_wrong_name, ca_file=ca_file),
+                 key="tls/wrong-name")
+    assert not head["ok"], head
+    assert head["attempts"] == 1, head
+    assert STATE.calls == []
+
+
+def test_ca_options_on_plain_http_are_refused(fake_s3, private_ca):
+    ca_file, ca_path, _cert, _key = private_ca
+    for anchor in ({"ca_file": ca_file}, {"ca_path": ca_path}):
+        head = _call("head", **_base(fake_s3, **anchor), key="anything")
+        assert not head["ok"], head
+        assert "https" in head["what"], head
+    assert STATE.calls == []
+
+
+def test_a_missing_ca_is_named_before_any_request(fake_s3_tls, tmp_path):
+    missing = tmp_path / "no-such-ca.pem"
+    head = _call("head", **_tls(fake_s3_tls, ca_file=str(missing)),
+                 key="anything")
+    assert not head["ok"] and str(missing) in head["what"], head
+    head = _call("head", **_tls(fake_s3_tls, ca_path=str(missing)),
+                 key="anything")
+    assert not head["ok"] and str(missing) in head["what"], head
+    assert STATE.calls == []
