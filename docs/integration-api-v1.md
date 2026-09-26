@@ -134,14 +134,78 @@ schedule.should_capture_step(
 
 The predicates apply warmup, then offset, then stride. Step selection also
 honors `capture_prefill`/`capture_decode`; an unknown phase raises `ValueError`.
-`MonitoringConfig` carries this schedule plus two storage fields:
-`storage_backend` (`"auto" | "native" | "capture" | "none"`) and
-`capture_sink_config` (a `NativeSinkConfig`, or `None`). Both are acted on by
-`MonitoringEngine`, and some combinations are refused at construction --
-`storage_backend="native"` without a host engine, or `"capture"`/`"none"` with
-one -- so a caller setting them should expect `ValueError` rather than a
-silent choice. `capture_sink_config` is read only when `storage_backend` is
-`"capture"`; see `docs/capture-storage-design.md` for the writer it selects.
+`MonitoringConfig` carries this schedule plus three storage fields:
+`storage_backend`, `capture_sink_config` (a `NativeSinkConfig`, or `None`) and
+`capture_storage_config` (a `NativeCaptureStorageConfig` from
+`dmi.storage.native_capture`, or `None`).
+
+`storage_backend` is the user's storage choice, one of
+`dmi.config.USER_STORAGE_CHOICES`:
+
+- `"in-memory"`: records are delivered in memory. Until its consumer interface
+  exists, this runs the C++ `ClickHouseRecordSink` and needs a host engine.
+- `"persistent"`: the native capture storage path (object store + catalog +
+  ClickHouse).
+- `"none"`: capture off entirely. The engine allocates no ring, and a record
+  runtime, a host engine, a `ring_config` and adapter attachment are refused.
+
+Left unset, it is `"auto"`, which infers the path from what was passed, as every
+caller did before the field existed. The earlier names `"native"` and
+`"capture"` still work, with a `DeprecationWarning`, and mean `"in-memory"` and
+`"persistent"`. `MonitoringConfig.canonical_storage_backend` gives the current
+name.
+
+All three fields are acted on by `MonitoringEngine`, and a mismatch is an error
+rather than a silent choice:
+
+- At construction, `ValueError`: `"in-memory"` without a host engine,
+  `"persistent"` or `"none"` with one, `"none"` with a `ring_config`, or
+  `capture_storage_config` without `capture_sink_config`.
+- Under `"none"`, `RuntimeError` from `create_record_runtime()` and
+  `enable_ring_transport()`, and `ConfigurationError` from an adaptor's
+  `attach_model()`.
+`capture_sink_config` is read only when `storage_backend` is `"persistent"`; see
+`docs/capture-storage-design.md` for the writer it selects. With
+`capture_storage_config` as well, the engine runs the native storage service
+in-process: from `create_record_runtime` until `close`, or until
+`enable_ring_transport` replaces the record ring (both seal the sink and drain
+the service before stopping it), a C++ thread uploads each pack the sink
+stages to the object store and indexes it into the ClickHouse catalog, and `flush_and_wait` returns only once every record
+captured before it is queryable there (`TimeoutError` otherwise, naming the
+last upload or index error). `NativeCaptureReader` reads it back. No adapter
+drives this path yet: the HF, vLLM and Megatron integrations never create a
+capture record runtime, so it is reached only by a caller that builds the
+record runtime and its hook points itself, as
+`tests/test_native_capture_storage_gpu_e2e.py` does, and the HF adaptor
+refuses the persistent backend with `ConfigurationError` rather than generating
+with nothing stored. The catalog
+takes one publisher per `(database, table_prefix)`, so a second engine on the
+same catalog is refused at `create_record_runtime`.
+To reach a secured catalog, set `clickhouse_scheme="https"` (and the server's
+TLS HTTP port, usually 8443) on `NativeCaptureStorageConfig`. The client always
+verifies the server's certificate and name, against libcurl's built-in CA
+bundle/directory, or a private CA given as `clickhouse_ca_file` (a PEM bundle)
+or `clickhouse_ca_path` (a hashed directory). Each replaces libcurl's built-in
+default for that option rather than adding to it: a libcurl built with both a
+bundle and a directory (Debian, Ubuntu) keeps trusting the system roots
+through the other, a bundle-only build (RHEL, Fedora) does not, so to trust
+both there, pass a bundle holding the system roots and the private CA.
+`clickhouse_user`/`clickhouse_password` travel as
+`X-ClickHouse-User`/`X-ClickHouse-Key` headers, never in a URL, and the
+password is left out of the config's repr. A password over plain http is
+refused unless `clickhouse_allow_insecure_http=True`, and `clickhouse_host`
+must be a bare host (no scheme, port or `user:password@`).
+`clickhouse_reader_user`/`clickhouse_reader_password` give
+`NativeCaptureReader` a separate account, for example one limited with
+`GRANT SELECT` on the catalog tables (or a `readonly=2` settings profile). Do
+not use a `readonly=1` profile: the reader sends its query limits
+(`max_rows_to_read`, `max_execution_time`, ...) as settings, which
+`readonly=1` refuses (Code 164, READONLY). The storage service always uses
+`clickhouse_user`. Every catalog request is bounded by
+`clickhouse_request_timeout_s`, which must be at least twice
+`publish_timeout_s` (10 s at the default 5 s publish timeout). A refused connection is retried for any
+statement; a reset, or a 5xx that is not a permanent ClickHouse error (such
+as a row limit or a denied grant), for reads only; and a timeout never.
 The schedule's default factory creates a distinct `CaptureSchedule` for each
 config instance.
 `MonitoringEngine` stores the config, while concrete adaptors decide whether
@@ -466,7 +530,13 @@ or non-owning PP/TP hooks, installs ring fields on remaining HookPoints, and
 publishes the selected inventory. It mutates HookPoints and is not
 transactional; call it before graph capture. An unknown
 selection raises `ValueError`, and an executable inventory containing
-`module=None` raises `RuntimeError`.
+`module=None` raises `RuntimeError`. Under `storage_backend="persistent"`, and
+under `"none"`, which turns capture off, it raises
+`dmi.configuration.ConfigurationError`, as do the HF entry points built on it,
+`generate_with_monitoring()` and `generate_greedy_with_monitoring()`: no adaptor
+drives the capture storage path yet, and attaching would install hooks whose
+captures nothing stores. `ConfigurationError` is not a `ValueError`; catch it
+by name.
 
 One engine supports one active model inventory. Attaching a second adaptor
 invalidates the first inventory while the first model's HookPoints remain
@@ -476,8 +546,9 @@ and producers.
 #### `before_forward(*framework_state)`
 
 Call this once immediately before the corresponding model forward. It returns
-early when capture is disabled or `build_step_context()` returns `None`.
-Otherwise it:
+early when capture is disabled or `build_step_context()` returns `None`. On an
+engine in record mode it raises `RuntimeError` instead, even while capture is
+disabled, as `commit_step()` does. Otherwise it:
 
 1. builds a `StepContext`;
 2. calls `plan_step()` to compute each firing hook's shape and 16-byte-aligned
@@ -534,6 +605,20 @@ once. Its result is:
 | `RESERVED` | 0 | The step was reserved in current ring capacity. |
 | `FLUSHED` | 1 | Existing ring work was flushed before the step was reserved. |
 | `OVERSIZED` | 2 | The complete step cannot fit; per-hook eager fallback is active. |
+
+On an engine in record mode (after `create_record_runtime()`), `commit_step()`
+raises `RuntimeError` before reserving anything: a record ring cannot store
+the legacy step protocol, and an adaptor attached before the switch still
+holds the stopped legacy ring, which would otherwise accept the step silently.
+This holds while capture is disabled too, so disabling capture never turns
+a record-mode step into `SKIPPED`: `set_capture_enabled(False)` leaves the
+installed `HookPoint`s armed, and on a record ring they would fail inside the
+model forward with a native error that names neither the adaptor nor the cause.
+Under `storage_backend="persistent"` it raises `ConfigurationError`, also before
+reserving anything, for the reason `attach_model()` does. The check is repeated
+here because a step need not come through the base `attach_model()`: an adaptor
+may override it without calling `super()`, or arm its hooks with
+`install_ring_hooks()` and commit steps directly.
 
 For `SKIPPED` caused only by zero computable hooks, `commit_step()` still
 publishes the step context; the metadata loop emits no hook records. A supplied

@@ -19,6 +19,12 @@ make -C native -j
 python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ```
 
+`make -C native` rebuilds the full backend and the capture storage
+extensions (`_dmi_native_sink`, `_dmi_native_store`), which `clean` also
+removes. The capture extensions need `libcurl4-openssl-dev`; see
+[core installation](install.md#5-build-native-dependencies). Pass
+`CAPTURE=0` to build the backend alone.
+
 On a checkout shared with another DMI environment (for example a
 Python 3.10 install alongside a Python 3.12 vLLM environment), drop the
 `clean` step: the native build emits ABI-suffixed extensions

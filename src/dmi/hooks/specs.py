@@ -237,33 +237,37 @@ def compute_hook_shape(
 
     if hook_type in _HIDDEN_DIM_TYPES:
         return b + [q_len, cfg.hidden_dim]
-    if hook_type == HOOK_TYPE_Q:
+    # The HOOK_TYPE_* names are bound by the globals() loop over
+    # _HOOK_DEFS above, which static analysis cannot follow: hence the
+    # F821 suppressions, one per line rather than one for the file, so the
+    # rest of the module stays checked.
+    if hook_type == HOOK_TYPE_Q:  # noqa: F821
         return b + [q_len, cfg.num_heads // tp, cfg.head_dim]
-    if hook_type in (HOOK_TYPE_K, HOOK_TYPE_V):
+    if hook_type in (HOOK_TYPE_K, HOOK_TYPE_V):  # noqa: F821
         kv_heads = max(1, cfg.num_kv_heads // tp)  # GQA: may replicate
         return b + [q_len, kv_heads, cfg.head_dim]
-    if hook_type == HOOK_TYPE_Z:
+    if hook_type == HOOK_TYPE_Z:  # noqa: F821
         # Packed/flattened convention flattens heads into a single
         # trailing dim -> [q_len, num_heads * head_dim].
         # Batched convention keeps four dims -> [batch, q_len, num_heads, head_dim].
         if batch == 0:
             return [q_len, (cfg.num_heads // tp) * cfg.head_dim]
         return b + [q_len, cfg.num_heads // tp, cfg.head_dim]
-    if hook_type in (HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN):
+    if hook_type in (HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN):  # noqa: F821
         return b + [cfg.num_heads // tp, q_len, kv_dim]
-    if hook_type == HOOK_TYPE_MLP_POST:
+    if hook_type == HOOK_TYPE_MLP_POST:  # noqa: F821
         if cfg.intermediate_dim == 0:
             return []  # intermediate_dim unknown -- skip this hook
         return b + [q_len, cfg.intermediate_dim // tp]
-    if hook_type == HOOK_TYPE_ROUTER_LOGITS:
+    if hook_type == HOOK_TYPE_ROUTER_LOGITS:  # noqa: F821
         return (b + [q_len, cfg.num_experts]) if cfg.num_experts > 0 else []
-    if hook_type == HOOK_TYPE_TOPK_IDS:
+    if hook_type == HOOK_TYPE_TOPK_IDS:  # noqa: F821
         return (b + [q_len, cfg.top_k]) if cfg.top_k > 0 else []
-    if hook_type == HOOK_TYPE_TOPK_WEIGHTS:
+    if hook_type == HOOK_TYPE_TOPK_WEIGHTS:  # noqa: F821
         return (b + [q_len, cfg.top_k]) if cfg.top_k > 0 else []
-    if hook_type == HOOK_TYPE_TOKEN_IDS:
+    if hook_type == HOOK_TYPE_TOKEN_IDS:  # noqa: F821
         return b + [q_len]
-    if hook_type == HOOK_TYPE_FINAL_LOGITS:
+    if hook_type == HOOK_TYPE_FINAL_LOGITS:  # noqa: F821
         # compute_logits returns fewer rows than q_len when the framework
         # only materializes the last-token logits per request.
         #

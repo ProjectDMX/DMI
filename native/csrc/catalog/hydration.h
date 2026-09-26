@@ -96,11 +96,13 @@ class NativeCaptureReader {
   std::vector<std::pair<std::string, CoreSummaryData>> summarize_core(
       const Selection& selection, int64_t byte_limit, int64_t request_limit,
       uint64_t max_summary_captures, uint64_t max_summary_elements) const;
-
- private:
+  // The selection's descriptors at its catalog watermark, in selection order
+  // and in the SearchPage item layout -- what pairs each hydrate() payload
+  // with its dtype and shape.
   std::vector<std::vector<std::string>> resolve(const Selection& selection)
       const;
 
+ private:
   dmi_store::S3Client* s3_;
   std::string bucket_;
   NativeCaptureCatalog catalog_;

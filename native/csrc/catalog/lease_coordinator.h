@@ -63,7 +63,10 @@ class CatalogError : public std::runtime_error {
     kPublishRace,
     kPublishConflict,
     kQuarantined,
-    kSchema
+    kSchema,
+    // index() refused a batch over max_estimated_bytes. Its own kind so a
+    // caller that can split the batch need not match message text.
+    kBatchTooLarge
   };
 
   CatalogError(Kind kind, const std::string& what)

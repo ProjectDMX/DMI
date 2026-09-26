@@ -51,6 +51,46 @@ if TYPE_CHECKING:
     from ..engine import MonitoringEngine
 
 
+def _refuse_unwired_capture_storage(
+    engine: object, entry_point: str, adapter_name: str
+) -> None:
+    """Refuse a storage choice an adapter cannot serve, before anything arms.
+
+    ``storage_backend="none"`` turns capture off, so the engine has no ring
+    and there is nothing to attach hooks to.
+
+    ``storage_backend="persistent"``: adapters drive legacy HookPoints, and
+    nothing connects those to the native capture storage path yet. Under
+    that config they run on the engine's legacy ring, which has no host (the
+    backend refuses one), so its P2P thread drops every capture: generation
+    "succeeds" and the catalog stays empty. After ``create_record_runtime``
+    the same hooks meet a record ring, which refuses their metadata. Neither
+    stores what the config asked for.
+    """
+    backend = getattr(engine, "_storage_backend", None)
+    if backend not in ("persistent", "none"):
+        return
+    from ..configuration.errors import ConfigurationError
+
+    if backend == "none":
+        raise ConfigurationError(
+            f"{entry_point}: config.storage_backend='none' means capture is "
+            f"off, so the engine has no ring and {adapter_name} has nothing "
+            "to attach its hooks to. Pick 'in-memory' or 'persistent' to "
+            "capture, or run the model without a monitoring adapter."
+        )
+    raise ConfigurationError(
+        f"{entry_point}: config.storage_backend='persistent' selects the "
+        f"native capture storage path, but capture storage is not wired to "
+        f"{adapter_name} yet. Its hooks write to the legacy ring, which under this config has "
+        "no host and drops every capture, so generation would succeed and "
+        "store nothing. Capture records through "
+        "engine.create_record_runtime(...), or use "
+        "storage_backend='in-memory' with a host engine for monitored "
+        "generation."
+    )
+
+
 class StepPlan(NamedTuple):
     """Immutable, tuple-compatible reservation inputs for one model step."""
 
@@ -178,7 +218,14 @@ class BackendAdapter(abc.ABC):
         PP/TP filters.  Order matters: ``apply_hook_selection`` is what
         establishes the enabled/disabled state across every spec, and each
         later filter only ever disables further.
+
+        Raises ``ConfigurationError`` under ``storage_backend="persistent"``,
+        which no adapter's hooks are wired to yet, and under ``"none"``, which
+        turns capture off.
         """
+        _refuse_unwired_capture_storage(
+            self.engine, f"{type(self).__name__}.attach_model()",
+            type(self).__name__)
         if self.transport is None:
             raise RuntimeError(
                 "BackendAdapter.attach_model called before "
@@ -253,9 +300,37 @@ class BackendAdapter(abc.ABC):
             return False
         return (effective - schedule.step_offset) % schedule.step_stride == 0
 
+    def _refuse_record_mode(self, entry_point: str) -> None:
+        """Refuse the legacy step protocol on an engine in record mode.
+
+        A record ring refuses the legacy step protocol natively, but an
+        adapter attached before ``create_record_runtime`` still holds the
+        stopped legacy ring, which accepts it: the step would reserve and
+        publish into a ring nobody drains. So the refusal is here, whichever
+        ring the adapter holds.
+
+        It also comes before the null-mode early return. Disabling capture
+        (``set_capture_enabled(False)``) leaves the HookPoints armed, and on
+        a record ring they then fail inside the model forward with the
+        native "legacy producer cannot be used on a record ring", which
+        names neither the adapter nor the fix.
+        """
+        if getattr(self.engine, "_record_mode", False):
+            raise RuntimeError(
+                f"{entry_point}: the engine is in record mode "
+                "(create_record_runtime replaced its legacy ring), and "
+                f"{type(self).__name__} drives the legacy step protocol, "
+                "which a record ring cannot store. Capture records through "
+                "the RecordRuntime, or monitor on an engine without one."
+            )
+
     def before_forward(self, *raw) -> None:
         """Canonical per-step driver.  See module docstring for the flow."""
-        if self.transport is None or self.transport.null_offload:
+        if self.transport is None:
+            return
+        # Before the null-mode return: see _refuse_record_mode.
+        self._refuse_record_mode("before_forward()")
+        if self.transport.null_offload:
             return
         # Disarm the hooks FIRST: skipping plan/commit is not enough, because
         # the model's HookPoints still fire during this step's forward and
@@ -288,8 +363,20 @@ class BackendAdapter(abc.ABC):
         the real layout is known, without exposing the transport or native
         ring engine.
         """
-        if self.transport is None or self.transport.null_offload:
+        if self.transport is None:
             return StepReservation.SKIPPED
+        # Before the null-mode return: see _refuse_record_mode.
+        self._refuse_record_mode("commit_step()")
+        if self.transport.null_offload:
+            return StepReservation.SKIPPED
+        # attach_model refuses the capture config, but not every step comes
+        # through it: an adapter may override attach_model without calling
+        # super() (attach_config allows that), and a v1 integration may arm
+        # its hooks with install_ring_hooks and commit steps directly. Either
+        # would reserve and publish into a legacy ring with no host.
+        _refuse_unwired_capture_storage(
+            self.engine, f"{type(self).__name__}.commit_step()",
+            type(self).__name__)
         if plan is None:
             plan = self.plan_step(ctx)
 

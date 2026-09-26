@@ -6,7 +6,7 @@
 //    "access":"...","secret":"...","token":null,"insecure":true,
 //    "key":"...","data_b64":"...","metadata":{...},"content_type":"...",
 //    "multipart_threshold":N,"multipart_chunk":N,"max_attempts":N,
-//    "connect_timeout":N,"read_timeout":N}
+//    "connect_timeout":N,"read_timeout":N,"ca_file":"...","ca_path":"..."}
 //     -> {"ok":true,"etag":"...","attempts":N}
 //   {"op":"get",...,"offset":N,"length":N} -> {"ok":true,"data_b64":"...","attempts":N}
 //   {"op":"head",...} -> {"ok":true,"found":bool,"size":N,"metadata":{...},
@@ -92,6 +92,8 @@ dmi_store::S3Config ReadConfig(const std::string& line) {
     }
   }
   config.allow_insecure_http = jc::FindBool(line, "insecure");
+  config.ca_file = jc::FindString(line, "ca_file");
+  config.ca_path = jc::FindString(line, "ca_path");
   const int64_t connect_timeout = Integer(line, "connect_timeout");
   config.connect_timeout_s =
       static_cast<int>(connect_timeout > 0 ? connect_timeout : 5);

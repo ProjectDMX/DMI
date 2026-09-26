@@ -80,24 +80,34 @@ bounded slabs -> pack assembler -> direct upload or NVMe spool
        metadata-first query -> estimate -> selective range hydration
 ```
 
-The capture host does not run a ClickHouse client, compute summaries, or
-coordinate two durable writes. Object-created notifications reduce indexing
-latency, while periodic listing and reconciliation provide completeness.
+The capture path never makes the hook wait on either durable write, and it
+never computes summaries. The two writes are not coordinated in one step: a
+pack is uploaded, then indexed, and a pack that is uploaded but not yet
+indexed is retried in-process and reconciled from the bucket after a crash.
+While such a pack is owed, the service uploads nothing new, so a catalog
+outage leaves later packs in the durable spool.
+Where the indexer runs is a deployment choice. With
+`MonitoringConfig.capture_storage_config` the capture process itself runs the
+native storage service (`dmi.storage.native_capture`), so it DOES run a
+ClickHouse client, off the hook path, on a background thread. The catalog
+admits one publisher at a time per `(database, table_prefix)`, so that shape
+serves one capture process per catalog; multi-rank deployments need an
+upload-only role with a single publisher, which is planned but not built.
 
 ### The other sink, and how one is chosen
 
 This document describes ONE of two storage paths, and they are mutually
 exclusive per record runtime:
 
-| | native path | capture path (this document) |
+| | in-memory path | persistent path (this document) |
 |---|---|---|
-| Sink | `ClickHouseRecordSink` (C++) | `ReferencePythonCaptureSink` (C++ bridge) → `CapturePackReferenceSink` (Python) |
+| Sink | `ClickHouseRecordSink` (C++), until the in-memory consumer interface exists | `NativePackSink` (C++), the default writer; the Python `CapturePackReferenceSink` remains as the reference and rollback, passed explicitly as `record_sink` |
 | Durable form | one ClickHouse row per record, tensor bytes inline | immutable packs in object storage |
 | ClickHouse role | the store itself | a rebuildable index over the packs |
 | ClickHouse footprint | one configured table (`offload` by default) | `{prefix}_*` (`dmi_*` by default) |
-| Selected by | `create_record_runtime(fmt)` with no `record_sink`, plus a `host_engine`/`db_config` on the engine | `create_record_runtime(fmt, record_sink=reference.native_sink)` |
-| Declared by | `MonitoringConfig(storage_backend="native")` | `MonitoringConfig(storage_backend="capture")` |
-| Status | production | explicitly reference-only; production sinks remain native-only |
+| Selected by | `create_record_runtime(fmt)` with no `record_sink`, plus a `host_engine`/`db_config` on the engine | `create_record_runtime(fmt)` with `capture_sink_config` in the config (the native writer), plus `capture_storage_config` to upload and index in-process |
+| Declared by | `MonitoringConfig(storage_backend="in-memory")` (formerly `"native"`) | `MonitoringConfig(storage_backend="persistent")` (formerly `"capture"`) |
+| Status | production | production native writer and storage service; the Python sink is reference-only |
 
 Both are `ring::RecordSink` implementations and the record engine takes exactly
 one of them: `RingEngine.create_record` is handed either the host engine or a
@@ -118,7 +128,7 @@ ClickHouse insert pipeline started, connected and never fed.
 
 ```python
 engine = MonitoringEngine(
-    config=MonitoringConfig(storage_backend="capture"),
+    config=MonitoringConfig(storage_backend="persistent"),
     model_id="...",
     ring_config=ring_config,
 )                                    # a host_engine here is now refused
@@ -128,11 +138,12 @@ runtime = engine.create_record_runtime(
 )
 ```
 
-`"native"` is the mirror image: it requires a host engine and refuses an
-explicit sink. `"none"` is capture and transport with no persistence at all.
-The default is `"auto"`, which infers the backend from what was passed -- what
-every caller did before the field existed, so nothing that predates it
-changes.
+`"in-memory"` is the mirror image: it requires a host engine and refuses an
+explicit sink. `"none"` turns capture off entirely: no ring is allocated, and
+nothing that would capture can be attached. The default is `"auto"`, which
+infers the backend from what was passed -- what every caller did before the
+field existed, so nothing that predates it changes. The earlier names
+`"native"` and `"capture"` still work, with a `DeprecationWarning`.
 
 Their ClickHouse footprints are disjoint, so the two can share one server: the
 catalog's schema guard only ever names `{prefix}_*` objects, and `drop_schema`

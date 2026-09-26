@@ -153,6 +153,12 @@ class PackSink {
   // Latched async failure, if any (for RecordSink::rethrow_if_failed).
   std::string LastError() const;
 
+  // Test seam: the sink's spool, so a test can park a stager inside
+  // Spool::Stage through Spool::SetStageHookForTesting and wedge the
+  // pipeline deterministically (tests/native/test_pack_sink_timeout.cpp).
+  // Valid only after Start(); stagers call Stage() on it concurrently.
+  dmi_store::Spool& SpoolForTesting() { return spool_; }
+
  private:
   using Item = std::variant<SinkRecord, std::shared_ptr<FlushBarrier>>;
 

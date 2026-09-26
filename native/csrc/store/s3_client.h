@@ -14,6 +14,7 @@
 #ifndef DMI_STORE_S3_CLIENT_H_
 #define DMI_STORE_S3_CLIENT_H_
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -31,10 +32,18 @@ struct S3Config {
   std::string secret_key;
   std::string session_token;  // empty when unused
   bool allow_insecure_http = false;
+  // https only: trust a private CA. ca_file is a PEM bundle
+  // (CURLOPT_CAINFO), ca_path an OpenSSL-hashed certificate directory
+  // (CURLOPT_CAPATH). Both empty uses libcurl's default trust store. Either
+  // way https always verifies the peer and the host name.
+  std::string ca_file;
+  std::string ca_path;
   int connect_timeout_s = 5;
   int read_timeout_s = 120;
   int max_attempts = 4;
   uint64_t multipart_threshold_bytes = 64ull * 1024 * 1024;
+  // The size of every part but the last. S3 refuses a smaller non-final
+  // part (EntityTooSmall), so the client refuses one under kMinMultipartPartBytes.
   uint64_t multipart_chunk_bytes = 16ull * 1024 * 1024;
   std::string user_agent = "dmi-native-store/1";
 };
@@ -69,9 +78,18 @@ struct ListResult {
   std::vector<ListedObject> objects;
 };
 
+// S3's minimum size for every part of a multipart upload but the last.
+inline constexpr uint64_t kMinMultipartPartBytes = 5ull * 1024 * 1024;
+
 class S3Client {
  public:
+  // An invalid config (see ValidateConfig) does not throw: the client
+  // refuses every request with the reason, before anything goes out.
   explicit S3Client(S3Config config);
+
+  // Empty when `config` is usable; otherwise why not. Callers with an error
+  // channel of their own (the Python bindings) check it at construction.
+  static std::string ValidateConfig(const S3Config& config);
   ~S3Client();
 
   S3Client(const S3Client&) = delete;
@@ -79,7 +97,7 @@ class S3Client {
 
   const S3Config& config() const { return config_; }
   // Attempts actually made by the last call (1 + retries), for tests.
-  int last_attempts() const { return last_attempts_; }
+  int last_attempts() const { return last_attempts_.load(std::memory_order_relaxed); }
 
   // HEAD /bucket/key. 404 → {found=false}, no error.
   ObjectHead HeadObject(const std::string& key, std::string* error);
@@ -115,10 +133,13 @@ class S3Client {
 
  private:
   S3Config config_;
+  std::string config_error_;  // non-empty: every request is refused
   std::string host_;    // endpoint host (with :port when non-default)
   std::string scheme_;
   bool is_https_ = false;
-  int last_attempts_ = 0;
+  // Atomic because SpoolUploader shares one client across its worker
+  // threads, and every request writes this; a plain int was a data race.
+  std::atomic<int> last_attempts_{0};
 
   // Multipart primitives (single PUT when under threshold).
   bool PutSingle(const std::string& key, const uint8_t* data, size_t n,

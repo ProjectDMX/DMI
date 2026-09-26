@@ -82,7 +82,9 @@ public:
 
     // Launch producer kernel unconditionally (no condition gating).
     // Space must be guaranteed by pre-forward capacity check.
-    // Three variants matching the three torch ops.
+    // Three variants matching the three torch ops.  Legacy rings only:
+    // each throws std::logic_error on a record ring, as push_step does, and
+    // so do prepare_step, reserve_one and submit_cpu_direct below.
 
     // Static: copies all `nbytes`; today's behavior.
     void hook_no_notify(uint64_t d_ptr, uint64_t nbytes,

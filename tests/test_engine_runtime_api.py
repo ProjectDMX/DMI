@@ -642,18 +642,60 @@ def test_storage_backend_rejects_an_unknown_name():
         MonitoringConfig(storage_backend="object-store")
 
 
+@pytest.mark.parametrize("backend", ["auto", "in-memory", "none"])
+def test_a_sink_config_under_a_backend_that_cannot_use_it_is_refused(
+    backend: str,
+):
+    """The combination that used to write nothing and say nothing.
+
+    ``capture_sink_config`` is consumed in exactly one branch, guarded by
+    ``storage_backend == "persistent"``. Under any other backend -- the DEFAULT
+    "auto" included, which is never resolved into "persistent" anywhere -- the
+    config passed the engine's type check and then fell through
+    ``create_record_runtime`` with ``record_sink=None``: no packs written, no
+    diagnostic. A startup error instead, naming both fields.
+    """
+    from dmi.config import MonitoringConfig
+    from dmi.storage.capture.native_sink import NativeSinkConfig
+
+    with pytest.raises(ValueError) as caught:
+        MonitoringConfig(
+            storage_backend=backend,
+            capture_sink_config=NativeSinkConfig(spool_root="/tmp/unused"),
+        )
+    message = str(caught.value)
+    assert "capture_sink_config" in message
+    assert "storage_backend" in message
+    assert repr(backend) in message
+
+
+def test_the_capture_backend_still_takes_its_sink_config():
+    """The control: the one combination that works keeps working."""
+    from dmi.config import MonitoringConfig
+    from dmi.storage.capture.native_sink import NativeSinkConfig
+
+    sink_config = NativeSinkConfig(spool_root="/tmp/unused")
+    config = MonitoringConfig(
+        storage_backend="persistent", capture_sink_config=sink_config
+    )
+    assert config.capture_sink_config is sink_config
+    # And a bare config is untouched: the refusal is about a sink config that
+    # was actually passed, not about the backend on its own.
+    assert MonitoringConfig(storage_backend="none").capture_sink_config is None
+
+
 def test_native_backend_requires_a_host_engine():
     """Declaring the C++ path without one is a configuration error, not a
     silently transport-only engine."""
     with pytest.raises(ValueError, match="needs a host engine"):
         MonitoringEngine(
-            config=_config("native"),
+            config=_config("in-memory"),
             model_id="m",
             enable_ring_transport=False,
         )
 
 
-@pytest.mark.parametrize("backend", ["capture", "none"])
+@pytest.mark.parametrize("backend", ["persistent", "none"])
 def test_a_non_native_backend_refuses_a_host_engine(backend: str):
     """Configured together, the host engine starts, connects and is never fed.
 
@@ -675,7 +717,7 @@ def test_capture_backend_requires_the_sink_that_selects_it(monkeypatch):
     the one that actually routes the records."""
     engine, _old, _ring = _engine_with_fake_ring()
     engine._ring_config = object()
-    engine._storage_backend = "capture"
+    engine._storage_backend = "persistent"
 
     with pytest.raises(ValueError, match="capture_sink_config"):
         engine.create_record_runtime(_explicit_sink_format())
@@ -684,7 +726,7 @@ def test_capture_backend_requires_the_sink_that_selects_it(monkeypatch):
 def test_native_backend_refuses_an_explicit_sink(monkeypatch):
     engine, _old, _ring = _engine_with_fake_ring()
     engine._ring_config = object()
-    engine._storage_backend = "native"
+    engine._storage_backend = "in-memory"
 
     fake_native_module = ModuleType("dmi.transport.native")
 
@@ -729,7 +771,7 @@ def test_capture_backend_defaults_to_the_native_pack_sink(monkeypatch, tmp_path)
     engine, _old_transport, old_ring = _engine_with_fake_ring()
     ring_config = object()
     engine._ring_config = ring_config
-    engine._storage_backend = "capture"
+    engine._storage_backend = "persistent"
 
     sink_config = NativeSinkConfig(spool_root=str(tmp_path / "spool"))
 

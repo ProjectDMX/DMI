@@ -100,6 +100,22 @@ FlushClock::time_point record_flush_deadline(uint64_t timeout_ms) {
     return now + std::chrono::milliseconds(timeout_ms);
 }
 
+// The legacy producer protocol -- a step reservation, then producers whose
+// payloads the drain pairs with pushed TensorMetas -- and the record
+// protocol share one ring but not its bookkeeping. A legacy reservation on
+// a record ring advances the CPU heads with no record publication behind
+// it, so the space is never reclaimed and every later reserve_record's
+// reclaim sequence is off by the phantom task count. A legacy payload
+// carries no record descriptor, so the record consumer pairs it with the
+// next record's descriptor, or fails the ring when none is queued. Refuse
+// before either happens, as push_step refuses legacy metadata.
+void refuse_on_record_ring(bool record_mode, const char* what) {
+    if (record_mode) {
+        throw std::logic_error(
+            std::string(what) + " cannot be used on a record ring");
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -222,12 +238,14 @@ void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {
 // hook_no_notify (3 variants) -- unconditional producer launches.
 //
 // No condition gating.  Space is guaranteed by the pre-forward capacity
-// check in Python.  Each variant maps to one torch op.
+// check in Python.  Each variant maps to one torch op.  Legacy rings only:
+// a record ring's producers are the record_no_notify* family.
 // ---------------------------------------------------------------------------
 void RingEnginePy::hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
                                   uint32_t hook_type,
                                   uint64_t stream_handle)
 {
+    refuse_on_record_ring(impl_->record_mode, "legacy producer");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     RING_DBG("[hook_no_notify_static] idx=%u nbytes=%lu\n",
             impl_->current_hook_idx, (unsigned long)nbytes);
@@ -244,6 +262,7 @@ void RingEnginePy::hook_no_notify_prefix(uint64_t d_ptr, uint64_t nbytes_upper,
                                           uint32_t hook_type,
                                           uint64_t stream_handle)
 {
+    refuse_on_record_ring(impl_->record_mode, "legacy producer");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     RING_DBG("[hook_no_notify_prefix] idx=%u nbytes_upper=%lu row_bytes=%lu\n",
             impl_->current_hook_idx, (unsigned long)nbytes_upper,
@@ -264,6 +283,7 @@ void RingEnginePy::hook_no_notify_chunked(uint64_t d_ptr, uint64_t nbytes_upper,
                                            uint32_t hook_type,
                                            uint64_t stream_handle)
 {
+    refuse_on_record_ring(impl_->record_mode, "legacy producer");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     RING_DBG("[hook_no_notify_chunked] idx=%u nbytes_upper=%lu K=%u\n",
             impl_->current_hook_idx, (unsigned long)nbytes_upper, K);
@@ -376,6 +396,8 @@ void RingEnginePy::notify_drain() {
 int RingEnginePy::prepare_step(uint64_t step_total_bytes,
                                uint32_t num_hooks)
 {
+    // Record rings reserve through reserve_record.
+    refuse_on_record_ring(impl_->record_mode, "legacy step reservation");
     impl_->current_hook_idx = 0;
     if (step_total_bytes % ring::PAYLOAD_ALIGN != 0) {
         throw std::invalid_argument(
@@ -578,6 +600,8 @@ bool RingEnginePy::flush_records_and_wait(uint64_t timeout_ms) {
 }
 
 void RingEnginePy::submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes) {
+    // Record rings submit through submit_record_cpu_direct.
+    refuse_on_record_ring(impl_->record_mode, "legacy CPU submission");
     impl_->engine.drain_thread().submit_cpu_direct(std::move(cpu_tensor), tensor_bytes);
 }
 
@@ -641,6 +665,7 @@ uint64_t RingEnginePy::available_capacity() const {
 // upcoming producer kernel launch.  Caller must have checked
 // available_capacity() first.  drain.reserve takes mgmt_mu_ internally.
 void RingEnginePy::reserve_one(uint64_t nbytes) {
+    refuse_on_record_ring(impl_->record_mode, "legacy per-hook reservation");
     impl_->engine.drain_thread().reserve(
         ring::align_up(nbytes, ring::PAYLOAD_ALIGN), 1);
 }

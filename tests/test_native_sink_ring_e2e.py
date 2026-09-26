@@ -278,7 +278,7 @@ def test_graph_replays_preserve_payloads_across_ring_wraps(tmp_path: Path, dtype
 
 
 def test_the_capture_backend_selects_the_native_sink_by_config(tmp_path: Path):
-    """The automatic entry point: storage_backend="capture" + capture_sink_config."""
+    """The automatic entry point: storage_backend="persistent" + capture_sink_config."""
     from dmi.api.v1 import (
         HookPointV1, HookSpecV1, MonitoringEngine, TransportSpec,
     )
@@ -288,7 +288,7 @@ def test_the_capture_backend_selects_the_native_sink_by_config(tmp_path: Path):
 
     spool_root = tmp_path / "spool"
     config = MonitoringConfig(
-        storage_backend="capture",
+        storage_backend="persistent",
         capture_sink_config=NativeSinkConfig(
             spool_root=str(spool_root), max_pack_records=8,
             max_linger_ns=1_000_000_000),

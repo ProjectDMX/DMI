@@ -245,7 +245,7 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
     // and returned a partial index reporting success.
     if (estimated_bytes + pack_bytes > config_.max_estimated_bytes) {
       throw CatalogError(
-          CatalogError::Kind::kValue,
+          CatalogError::Kind::kBatchTooLarge,
           "catalog batch exceeds max_estimated_bytes: " +
               std::to_string(estimated_bytes + pack_bytes) + " > " +
               std::to_string(config_.max_estimated_bytes));

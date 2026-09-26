@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -53,6 +54,8 @@ from tests.test_native_s3_client import (  # noqa: E402
     _base as _client_base,
     _call as _store_call,
     fake_s3,
+    fake_s3_tls,
+    private_ca,
 )
 
 
@@ -370,6 +373,65 @@ def test_mixed_batch_reports_oversized_pack_at_its_position(fake_s3, tmp_path):
         store.close()
 
 
+def test_a_pack_conflict_reports_why_it_will_not_overwrite(fake_s3, tmp_path):
+    """The one non-retryable failure must reach the caller as WORDS.
+
+    A different object already at the key is the only outcome that means
+    "someone else's immutable object is here, do not overwrite". UploadOne
+    composed that diagnostic into `last_error` and then returned straight
+    out of the loop, skipping the `*error = last_error` at the end of the
+    function -- so UploadPending recorded the failure with an empty error
+    string and an attempt count of zero, and an operator saw a pack that
+    had simply stopped uploading for no stated reason.
+    """
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        spool_root = tmp_path / "spool"
+        staged = _stage(sink, spool_root, 7)
+        # A DIFFERENT object at this key: neither its size nor its
+        # dmi-sha256 agrees with the staged pack.
+        squatter = b"someone else's pack" * 7
+        assert squatter != Path(staged["path"]).read_bytes()
+        put = _store_call(
+            "put", **_client_base(fake_s3), key=staged["object_key"],
+            data_b64=base64.b64encode(squatter).decode(),
+            metadata={"dmi-format": "dmi-pack-v1", "dmi-sha256": "ab" * 32},
+            content_type="application/vnd.dmi.pack",
+        )
+        assert put["ok"], put
+        puts_before = sum(
+            1 for c in STATE.calls
+            if c["method"] == "PUT" and staged["object_key"] in c["path"]
+        )
+
+        result = _upload_pending(store, fake_s3, spool_root)
+        assert result["ok"], result
+        assert result["snapshot"]["failed_packs"] == 1
+        assert result["snapshot"]["uploaded_packs"] == 0
+        failure = result["failures"][0]
+        assert failure["pack_id"] == staged["pack_id"], failure
+        assert failure["object_key"] == staged["object_key"], failure
+        assert "pack conflict" in failure["error"], failure
+        assert staged["object_key"] in failure["error"], failure
+        assert "do not overwrite" in failure["error"], failure
+        # Counted like every other attempted failure: the HEAD that found
+        # the conflict was an attempt, and it is not retried.
+        assert failure["attempts"] == 1, failure
+
+        # The refusal is real: nothing was written over the existing object,
+        # and the staged pack is still there to inspect.
+        puts_after = sum(
+            1 for c in STATE.calls
+            if c["method"] == "PUT" and staged["object_key"] in c["path"]
+        )
+        assert puts_after == puts_before
+        assert Path(staged["path"]).exists()
+    finally:
+        sink.close()
+        store.close()
+
+
 def test_uploader_head_to_head_with_python_reference(fake_s3, tmp_path):
     """Same staged bytes through both uploaders; identical objects land.
 
@@ -533,3 +595,106 @@ def test_upload_pending_keeps_the_64_bit_limits(fake_s3, tmp_path):
     finally:
         sink.close()
         store.close()
+
+
+# --- a large pack over https with a private CA ----------------------------------
+
+MIB = 1024 * 1024
+
+
+def _stage_large_pack(root: Path, records: int, record_bytes: int) -> dict:
+    """One pack of `records` random payloads, staged by the native sink."""
+    sink = DriverSession(SINK_DRIVER)
+    try:
+        assert sink.call(
+            op="open", root=str(root), max_bytes=1 << 40,
+            max_queue_records=records, max_queue_bytes=2 * records * record_bytes,
+            max_pack_bytes=2 * records * record_bytes,
+            max_pack_records=records, max_linger_ns=60_000_000_000,
+            overload="drop_newest", admission_timeout=-1,
+        )["ok"]
+        for index in range(records):
+            meta = CaptureMetadata(
+                capture_id=f"large-{index:04d}", tenant_id="t",
+                experiment_id="e", run_id="r", session_id="s",
+                request_id=f"q{index}", sequence_id=f"n{index}", model_id="m",
+                model_revision="mr", adapter_revision=None,
+                capture_policy_version="v", hook_name="h", layer_number=0,
+                producer_rank=0, step_number=index, token_start=index,
+                token_end=index + 1, batch_position=0, dtype="uint8",
+                shape=(record_bytes,),
+                captured_at_ns=1_700_000_000_000_000_000 + index,
+            )
+            # Random bytes: nothing in the path can shrink the pack below
+            # the multipart threshold.
+            payload = random.Random(index).randbytes(record_bytes)
+            response = sink.call(op="submit", metadata=meta.to_mapping(),
+                                 payload_b64=base64.b64encode(payload).decode())
+            assert response["admission"] == "accepted", response
+        assert sink.call(op="flush", timeout=60)["ok"]
+        snapshot = sink.call(op="close", timeout=60)["snapshot"]
+        assert snapshot["persisted_records"] == records, snapshot
+    finally:
+        sink.close()
+    recover = subprocess.run(
+        [str(STORE_DRIVER.parent / "conformance_spool")],
+        input=json.dumps({"op": "recover", "root": str(root),
+                          "max_bytes": 1 << 40}) + "\n",
+        capture_output=True, text=True, timeout=60,
+    )
+    entries = json.loads(recover.stdout.strip())["staged"]
+    assert len(entries) == 1, entries
+    return entries[0]
+
+
+def test_a_64_mib_pack_uploads_multipart_over_https_with_a_private_ca(
+        fake_s3_tls, private_ca, tmp_path):
+    """The uploader's default multipart shape, over TLS to a private CA.
+
+    17 x 4 MiB records make one pack over the client's 64 MiB threshold, so
+    it goes up as 16 MiB parts, verified end to end: the server checks every
+    part's signature, and the object reads back over the same TLS byte for
+    byte. Without the CA the upload is refused and the pack stays staged.
+    """
+    ca_file, _ca_path, _cert, _key = private_ca
+    root = tmp_path / "spool"
+    staged = _stage_large_pack(root, records=17, record_bytes=4 * MIB)
+    assert staged["object_bytes"] >= 64 * MIB, staged
+    staged_bytes = Path(staged["path"]).read_bytes()
+    assert len(staged_bytes) == staged["object_bytes"]
+
+    store = DriverSession(STORE_DRIVER)
+    try:
+        untrusted = _upload_pending(store, fake_s3_tls, root, insecure=False,
+                                    upload_max_attempts=1)
+        # refs[i] pairs with failures[i]; exactly one of them is set.
+        assert untrusted["ok"], untrusted
+        [failure] = untrusted["failures"]
+        assert untrusted["refs"][0]["pack_id"] == "", untrusted
+        assert failure["pack_id"] == staged["pack_id"], failure
+        assert "certificate" in failure["error"].lower(), failure
+        assert STATE.calls == [] and STATE.objects == {}
+        assert Path(staged["path"]).exists()
+
+        trusted = _upload_pending(store, fake_s3_tls, root, insecure=False,
+                                  ca_file=ca_file)
+        assert trusted["ok"], trusted
+        assert trusted["failures"][0]["pack_id"] == "", trusted
+        [ref] = trusted["refs"]
+        assert ref["pack_id"] == staged["pack_id"], ref
+        assert ref["checksum"] == staged["checksum"]
+        assert ref["object_bytes"] == staged["object_bytes"]
+        assert not Path(staged["path"]).exists()
+    finally:
+        store.close()
+
+    parts = [call["body_len"] for call in STATE.calls
+             if call["method"] == "PUT" and "partNumber=" in call["path"]]
+    full, tail = divmod(staged["object_bytes"], 16 * MIB)
+    assert parts == [16 * MIB] * full + ([tail] if tail else []), parts
+
+    fetched = _store_call(
+        "get", **_client_base(fake_s3_tls, insecure=False, ca_file=ca_file),
+        key=staged["object_key"], offset=0, length=staged["object_bytes"])
+    assert fetched["ok"], {k: v for k, v in fetched.items() if k != "data_b64"}
+    assert base64.b64decode(fetched["data_b64"]) == staged_bytes

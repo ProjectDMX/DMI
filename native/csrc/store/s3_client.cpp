@@ -1,12 +1,15 @@
 #include "s3_client.h"
 
 #include <curl/curl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cstring>
 #include <ctime>
 #include <thread>
 
+#include "../common/curl_init.h"
 #include "s3_sign.h"
 
 namespace dmi_store {
@@ -108,9 +111,56 @@ std::string XmlTag(const std::string& xml, const std::string& tag) {
   return xml.substr(start, end - start);
 }
 
+// Checked when the client is built, so a mistyped path fails with its name
+// rather than as libcurl's "problem with the SSL CA cert" at the first
+// request.
+bool IsReadableFile(const std::string& path) {
+  struct stat st {};
+  return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
+         ::access(path.c_str(), R_OK) == 0;
+}
+
+bool IsDirectory(const std::string& path) {
+  struct stat st {};
+  return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 }  // namespace
 
+std::string S3Client::ValidateConfig(const S3Config& config) {
+  const bool https = config.endpoint.compare(0, 8, "https://") == 0;
+  if (https && config.allow_insecure_http) {
+    // Silently downgrading TLS was never the intent of the flag -- it gates
+    // plain http:// endpoints for local Garage.
+    return "https endpoint with allow_insecure_http is refused";
+  }
+  if (!https && (!config.ca_file.empty() || !config.ca_path.empty())) {
+    // A CA on a plain-http endpoint would read as "this is TLS" while every
+    // byte, credentials included, goes in the clear.
+    return "ca_file and ca_path apply only to an https endpoint";
+  }
+  if (!config.ca_file.empty() && !IsReadableFile(config.ca_file)) {
+    return "ca_file is not a readable file: " + config.ca_file;
+  }
+  if (!config.ca_path.empty() && !IsDirectory(config.ca_path)) {
+    return "ca_path is not a directory: " + config.ca_path;
+  }
+  if (config.multipart_chunk_bytes < kMinMultipartPartBytes) {
+    // The Python store refuses the same (s3.py _MIN_MULTIPART_BYTES). Left
+    // to the server, the upload fails only at CompleteMultipartUpload, after
+    // every part was sent.
+    return "multipart_chunk_bytes must be at least " +
+           std::to_string(kMinMultipartPartBytes) + " (S3's minimum part size)";
+  }
+  return "";
+}
+
 S3Client::S3Client(S3Config config) : config_(std::move(config)) {
+  // Explicit, rather than leaning on the implicit init inside
+  // curl_easy_init: that implicit path carries libcurl's thread-safety
+  // caveat, and Exchange() runs on the uploader's worker threads. Once per
+  // process, and never torn down. See common/curl_init.h.
+  dmi_common::EnsureCurlGlobalInit();
   // endpoint := scheme://host[:port]; bucket and key are appended per call
   // (path style, matching the Python store's addressing_style="path").
   std::string rest = config_.endpoint;
@@ -126,11 +176,7 @@ S3Client::S3Client(S3Config config) : config_(std::move(config)) {
   }
   while (!rest.empty() && rest.back() == '/') rest.pop_back();
   host_ = rest;
-  if (is_https_ && config_.allow_insecure_http) {
-    // Refused at construction: silently downgrading TLS was never the intent
-    // of the flag — it gates plain http:// endpoints for local Garage.
-    host_.clear();
-  }
+  config_error_ = ValidateConfig(config_);
 }
 
 S3Client::~S3Client() = default;
@@ -141,19 +187,17 @@ S3Response S3Client::Exchange(
     const std::map<std::string, std::string>& extra_headers,
     const uint8_t* body, size_t body_len, const std::string& body_hash_hex) {
   S3Response response;
-  if (host_.empty()) {
-    response.error = "https endpoint with allow_insecure_http is refused";
+  if (!config_error_.empty()) {
+    last_attempts_ = 0;
+    response.error = config_error_;
     return response;
   }
-  const std::string amz_date = AmzDate(std::time(nullptr));
-  const std::string datestamp = Datestamp(amz_date);
-
   const std::string encoded_resource = "/" + config_.bucket + "/" + key;
   const std::string encoded_path = UriEncode(encoded_resource, true);
 
+  // Every signed header except x-amz-date, which each attempt stamps.
   std::map<std::string, std::string> headers;
   headers["host"] = host_;
-  headers["x-amz-date"] = amz_date;
   headers["x-amz-content-sha256"] = body_hash_hex;
   if (!config_.session_token.empty()) {
     headers["x-amz-security-token"] = config_.session_token;
@@ -161,10 +205,6 @@ S3Response S3Client::Exchange(
   for (const auto& [name, value] : extra_headers) {
     headers[LowerHeader(name)] = value;
   }
-  const std::string authz = AuthorizationHeader(
-      config_.access_key, config_.secret_key, datestamp, amz_date,
-      config_.region, "s3", method, encoded_path, query, headers,
-      body_hash_hex);
 
   // Canonical query string for the URL (same encoding the signer used).
   std::string query_text;
@@ -190,6 +230,16 @@ S3Response S3Client::Exchange(
   last_attempts_ = 0;
   for (int attempt = 0; attempt < config_.max_attempts; ++attempt) {
     ++last_attempts_;
+    // Signed per attempt, not once before the loop: SigV4 binds the
+    // signature to x-amz-date, and S3 refuses a date more than 15 minutes
+    // off. Replaying the first attempt's date let a slow first attempt (up
+    // to read_timeout_s each, plus backoff) age every retry after it.
+    const std::string amz_date = AmzDate(std::time(nullptr));
+    headers["x-amz-date"] = amz_date;
+    const std::string authz = AuthorizationHeader(
+        config_.access_key, config_.secret_key, Datestamp(amz_date), amz_date,
+        config_.region, "s3", method, encoded_path, query, headers,
+        body_hash_hex);
     CURL* curl = curl_easy_init();
     if (!curl) {
       response.error = "curl_easy_init failed";
@@ -212,15 +262,24 @@ S3Response S3Client::Exchange(
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, config_.connect_timeout_s);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, config_.read_timeout_s);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    if (!is_https_) {
-      // Plain http only by explicit opt-in (local Garage); https always
-      // verifies (no CURLOPT_SSL_VERIFYPEER toggle exists anywhere here).
-      if (!config_.allow_insecure_http) {
-        response.error = "plain http endpoint requires allow_insecure_http";
-        curl_slist_free_all(chunk);
-        curl_easy_cleanup(curl);
-        return response;
+    if (is_https_) {
+      // https always verifies: peer and host name, stated explicitly rather
+      // than left to libcurl's defaults, and never switched off. A private
+      // CA adds trust; it does not relax the check.
+      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+      if (!config_.ca_file.empty()) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, config_.ca_file.c_str());
       }
+      if (!config_.ca_path.empty()) {
+        curl_easy_setopt(curl, CURLOPT_CAPATH, config_.ca_path.c_str());
+      }
+    } else if (!config_.allow_insecure_http) {
+      // Plain http only by explicit opt-in (local Garage).
+      response.error = "plain http endpoint requires allow_insecure_http";
+      curl_slist_free_all(chunk);
+      curl_easy_cleanup(curl);
+      return response;
     }
     std::string response_body;
     std::map<std::string, std::string> response_headers;
