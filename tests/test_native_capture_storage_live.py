@@ -773,6 +773,63 @@ def test_the_lease_holds_through_an_object_store_outage(tmp_path):
     assert snapshot["lease_renewals"] >= 3, snapshot
 
 
+def test_capture_round_trips_through_a_verified_tls_catalog(fake_s3, tmp_path):
+    """The whole path -- schema, lease, index, publish, search, resolve --
+    over https to the catalog, verified against a private CA.
+
+    A TLS terminator with a freshly generated CA stands in front of the local
+    ClickHouse HTTP port, so the server itself is untouched. The same catalog
+    refuses the service when the client is not given that CA: https never
+    falls back to trusting whatever answers."""
+    from tests._private_ca import TlsTerminator, make_private_ca
+
+    ca = make_private_ca(tmp_path / "ca")
+    terminator = TlsTerminator(ca, (CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT))
+    spool_root = tmp_path / "spool"
+    tensors = _stage(spool_root, range(4))
+    try:
+        with _catalog() as (_client, catalog):
+            tls = dict(clickhouse_scheme="https", clickhouse_host="127.0.0.1",
+                       clickhouse_port=terminator.port,
+                       # The local server's passwordless `default`, named so
+                       # the credential headers are on every request.
+                       clickhouse_user="default")
+
+            untrusted = _storage_config(fake_s3, catalog.table_prefix, **tls)
+            with pytest.raises(RuntimeError, match="(?i)certificate"):
+                _service(untrusted, spool_root).start()
+            # Counted on the terminator's thread, which may learn of the
+            # refused handshake a moment after the client has given up.
+            deadline = time.monotonic() + 5.0
+            while (terminator.failed_handshakes < 1
+                   and time.monotonic() < deadline):
+                time.sleep(0.01)
+            assert terminator.failed_handshakes >= 1
+
+            config = _storage_config(fake_s3, catalog.table_prefix,
+                                     clickhouse_ca_file=str(ca.ca_file), **tls)
+            service = _service(config, spool_root)
+            service.start()
+            try:
+                service.flush(30.0)
+                snapshot = service.snapshot()
+            finally:
+                service.stop()
+            assert snapshot["indexed_packs"] == 2, snapshot
+            assert snapshot["indexed_rows"] == 4, snapshot
+
+            captures = _read_all(config)
+            assert sorted(captures) == sorted(tensors)
+            for capture_id, tensor in tensors.items():
+                assert captures[capture_id].payload == tensor.numpy().tobytes()
+            # The CA as a hashed directory reaches the same catalog.
+            by_path = _storage_config(fake_s3, catalog.table_prefix,
+                                      clickhouse_ca_path=str(ca.ca_path), **tls)
+            assert sorted(_read_all(by_path)) == sorted(tensors)
+    finally:
+        terminator.close()
+
+
 # --- the publisher lease through ClickHouse errors and restarts ---------------
 
 
