@@ -35,10 +35,11 @@ nvidia-smi
 
 ## 1. Clone the repository
 
-The repo uses four git submodules: the DMI HuggingFace integration, the
-version-matched DMI-vLLM integration, the version-matched DMI-Megatron
-integration, and the `clickhouse-cpp` C++ client. The commands below fetch all
-four repositories; they do not install any Python integration.
+The repo uses five git submodules: the DMI HuggingFace integration, the
+version-matched DMI-vLLM integration, the version-matched DMI-SGLang
+integration, the version-matched DMI-Megatron integration, and the
+`clickhouse-cpp` C++ client. The commands below fetch all five repositories;
+they do not install any Python integration.
 
 The command below creates one backend checkout. If you plan to use multiple
 backends, repeat it with distinct target directories such as `DMI-hf`,
@@ -79,6 +80,7 @@ Expected submodule paths:
 
 - `third_party/transformers/` — modified HF Transformers (`gpt2_p`, `qwen3_p`, `llama_p`)
 - `third_party/vllm-integration/` — DMI integration for an unmodified official vLLM installation
+- `third_party/sglang-integration/` — DMI integration for an unmodified official SGLang installation
 - `third_party/DMI-Megatron-Integration/` — DMI integration with its pinned Megatron-LM fork at `third_party/DMI-Megatron-Integration/third_party/megatron-lm/`
 - `third_party/clickhouse-cpp/` — ClickHouse C++ client linked into the native backend
 
@@ -296,7 +298,7 @@ ClickHouse; use the host benchmark separately with a running server.
 ## 6. Choose one backend
 
 Continue with the [HuggingFace guide](huggingface.md), [vLLM guide](vllm.md),
-or [Megatron-LM guide](megatron.md). Use a separate environment and checkout
+[SGLang guide](sglang.md), or [Megatron-LM guide](megatron.md). Use a separate environment and checkout
 for each backend. The HuggingFace path installs a modified Transformers
 checkout, the vLLM path installs its own official dependency set, and the
 Megatron-LM path installs its version-matched integration and pinned fork. Do
