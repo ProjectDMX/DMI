@@ -2689,3 +2689,94 @@ def test_native_pages_resolve_argmax_for_their_own_keys_and_match_python():
                 assert query.count(" LIMIT ") == 2, query
         finally:
             driver.close()
+
+
+def test_a_page_walk_skips_unpublished_keys_without_ending_early():
+    """Every member capture comes back once, however unpublished keys interleave.
+
+    The two-phase page is correct only while its inner key query and its outer
+    resolution query filter alike. Let the inner one drop a filter the outer one
+    keeps -- snapshot membership, a hook filter -- and its LIMIT fills with keys
+    the outer query then discards: the page comes back short, a short page owes
+    no cursor, and the walk stops early while reporting success. The other tests
+    cannot see that, because every row they stage is a member that matches the
+    filter, so dropping the inner membership filter left them all passing.
+
+    Here a published pack holds ten captures whose hooks alternate, and an
+    unpublished pack -- written at version 8 and never published, as a crashed
+    indexer leaves one -- holds two keys between each pair of member keys, all
+    under the filtered hook. It also re-describes two members, and only
+    membership keeps that later version from winning their argMax. Walked in
+    pages of 2 (an inner LIMIT of 3, so the first page alone crosses two
+    unpublished keys), with and without a hook filter, the native reader must
+    return exactly the member captures, in order and resolved to the published
+    pack, and agree with the Python reader.
+    """
+    from dmi.storage.capture.clickhouse_reader import _RESOLVED
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            published_pack = "018f0000-0000-7000-8000-00000000a001"
+            unpublished_pack = "018f0000-0000-7000-8000-00000000b002"
+            # captured_at_ns rises with the index, so the index is sort order.
+            members, unpublished = [], []
+            for index, entry in enumerate(_descriptor_dicts(30)):
+                if index % 3 == 0:
+                    hook = "resid_pre" if index % 6 == 0 else "other_hook"
+                    members.append(
+                        dict(entry, pack_id=published_pack, hook_name=hook))
+                else:
+                    unpublished.append(
+                        dict(entry, pack_id=unpublished_pack,
+                             hook_name="resid_pre"))
+            unpublished += [dict(members[i], pack_id=unpublished_pack)
+                            for i in (1, 4)]
+            _publish_native(driver, prefix, members, 7)
+            written = driver.call(op="write_descriptors",
+                                  descriptors=unpublished, index_version=8)
+            assert written["ok"], written
+            assert driver.call(op="current_watermark")["watermark"] == "7"
+
+            reader = _python_reader(client, config)
+            pages = len(members) + len(unpublished) + 2  # a walk that loops fails
+
+            def walk_native(**filters):
+                rows, cursor = [], None
+                for _ in range(pages):
+                    page = driver.call(
+                        op="search", limit=2, **filters,
+                        **({"cursor": cursor} if cursor else {}))
+                    assert page["ok"], page
+                    rows += page["items"]
+                    cursor = page["next_cursor"]
+                    if cursor is None:
+                        return rows
+                raise AssertionError(f"native walk did not end: {filters}")
+
+            def walk_python(**filters):
+                items, cursor = [], None
+                for _ in range(pages):
+                    page = _python_page_items(
+                        reader, limit=2, cursor=cursor, **filters)
+                    items += page.items
+                    cursor = page.next_cursor
+                    if cursor is None:
+                        return items
+                raise AssertionError(f"python walk did not end: {filters}")
+
+            pack_at = 5 + list(_RESOLVED).index("pack_id")
+            for native_filters, python_filters, expected in (
+                ({}, {}, [m["capture_id"] for m in members]),
+                ({"hook_names": ["resid_pre"]}, {"hook_names": ("resid_pre",)},
+                 [m["capture_id"] for m in members
+                  if m["hook_name"] == "resid_pre"]),
+            ):
+                native = walk_native(**native_filters)
+                assert [row[4] for row in native] == expected, native_filters
+                assert {row[pack_at] for row in native} == {published_pack}
+                python = walk_python(**python_filters)
+                assert _normalize(native) == _normalize(python), native_filters
+        finally:
+            driver.close()
