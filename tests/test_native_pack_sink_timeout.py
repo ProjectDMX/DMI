@@ -9,6 +9,11 @@ on space that provably cannot free, times out, and must return kTimedOut
 with timed_out_records == 1. No admission along the way ever depends on
 where the packer thread happens to be.
 
+A second case slows the stager instead of wedging it and submits one
+envelope of rows through EnvelopeAdmission, the path NativePackSink::submit
+takes: the whole envelope must time out within one admission_timeout_s,
+not one per row.
+
 This is the native-tier coverage of the deadline wait loop in
 PackSink::Submit; the conformance-driver suite (test_native_pack_sink.py)
 covers the admission bounds around it.
@@ -53,6 +58,8 @@ def test_blocked_pipeline_times_out_and_counts_it(tmp_path):
             *extra,
             str(source),
             str(csrc / "sink" / "pack_sink.cpp"),
+            str(csrc / "sink" / "record_row.cpp"),
+            str(csrc / "common" / "json.cpp"),
             str(csrc / "sink" / "object_key.cpp"),
             str(csrc / "pack" / "pack_builder.cpp"),
             str(csrc / "store" / "spool.cpp"),

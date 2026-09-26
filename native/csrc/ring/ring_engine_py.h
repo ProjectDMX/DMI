@@ -15,6 +15,7 @@
 
 #include "ring/tensor_meta.h"   // TensorMeta, TensorMetaFifo
 #include "ring/record_descriptor.h"
+#include "ring/record_failure_policy.h"
 
 // Forward-declare ATen and the generic sink so this plain interface does not
 // expose their implementation headers.
@@ -45,6 +46,53 @@ struct RingConfig {
     uint64_t insert_queue_max_items     = 65536;
 };
 
+// How a record ring treats a sink that refuses or stalls.  Fixed for the
+// ring's lifetime.
+struct RecordRuntimeOptions {
+    ring::RecordFailurePolicy failure_policy =
+        ring::RecordFailurePolicy::kRaiseAtProducer;
+    // Cap on the time the record reservations of one step may wait for the
+    // drain to free ring space.  A step starts at begin_record_step(), which
+    // the integration calls once per model step: the record ring sees no
+    // step boundary of its own (see begin_record_step), so with a budget a
+    // reservation before the first begin_record_step() is refused.  Past
+    // the budget the step's remaining records and every record still queued
+    // for the sink, from any step, are discarded (counted in discarded_*,
+    // skipped_steps and steps_with_discards), and capture resumes at the
+    // next step; under kRaiseAtProducer the exhaustion is then raised at the
+    // next begin_record_step() and at flush.  The skip still waits for the
+    // one envelope the sink is admitting, so a budget needs a sink with an
+    // admission bound (RecordSink::admission_bound) and construction
+    // refuses one without; past that bound plus ring::record_drain_grace
+    // the reservation fails the ring.  0 waits without bound, as before the
+    // budget existed.
+    uint64_t step_stall_budget_ms = 0;
+};
+
+// The record runtime's failure state and forward-side stall counters.
+struct RecordCaptureStatus {
+    ring::RecordFailurePolicy failure_policy =
+        ring::RecordFailurePolicy::kRaiseAtProducer;
+    bool failed = false;
+    std::string failure;
+    uint64_t discarded_descriptors = 0;
+    uint64_t discarded_payloads = 0;
+    uint64_t step_stall_budget_ms = 0;
+    uint64_t stall_budget_exhaustions = 0;
+    // Steps whose budget ran out; always equal to stall_budget_exhaustions.
+    // Each such skip also discards every record still queued for the sink,
+    // earlier steps' too, so steps_with_discards can exceed it.
+    uint64_t skipped_steps = 0;
+    // Distinct steps that lost at least one record to a spent budget: the
+    // skipped steps plus the earlier steps whose records were still queued.
+    uint64_t steps_with_discards = 0;
+    // Time record reservations spent waiting for the drain, in total and
+    // for the worst step.  The producer-stream synchronisation before each
+    // wait is not included: that is the forward's own GPU work.
+    uint64_t reserve_wait_ns = 0;
+    uint64_t max_step_wait_ns = 0;
+};
+
 // Called by the p2p thread for each per-request tensor slice.
 using SubmitFn = std::function<void(
     const std::string& model_id,
@@ -61,9 +109,11 @@ class RingEnginePy {
 public:
     explicit RingEnginePy(RingConfig cfg, SubmitFn submit_fn);
     explicit RingEnginePy(RingConfig cfg,
-                          std::shared_ptr<ring::RecordSink> sink);
+                          std::shared_ptr<ring::RecordSink> sink,
+                          RecordRuntimeOptions options = {});
     explicit RingEnginePy(RingConfig cfg,
-                          std::shared_ptr<ring::RecordSinkLease> lease);
+                          std::shared_ptr<ring::RecordSinkLease> lease,
+                          RecordRuntimeOptions options = {});
     ~RingEnginePy();
 
     RingEnginePy(const RingEnginePy&)            = delete;
@@ -171,8 +221,22 @@ public:
     int prepare_step(uint64_t step_total_bytes, uint32_t num_hooks);
 
     // Each item is (aligned upper bound, needs actual-byte reconciliation).
+    // When the ring has no room, waits for the drain within the step's
+    // remaining stall budget; see RecordRuntimeOptions.
     int reserve_record(
         const std::vector<std::pair<uint64_t, bool>>& reservation_items);
+
+    // Start a new step for the stall budget: the reservations after this
+    // call share one fresh budget, and a step skipped for a spent budget
+    // ends.  Under kRaiseAtProducer it first raises a failure latched
+    // during the previous step, including a spent budget, so the error
+    // surfaces here, outside the forward.  Explicit because the ring has no
+    // reliable step boundary of its own: eager hooks reserve per output
+    // (and output ids repeat within a step), and a CUDA-graph step replays
+    // one plan, or several with piecewise graphs.
+    void begin_record_step();
+
+    RecordCaptureStatus record_capture_status() const;
 
     void push_record_descriptors(std::vector<ring::RecordDescriptor> descriptors);
     void submit_record_cpu_direct(at::Tensor cpu_tensor,

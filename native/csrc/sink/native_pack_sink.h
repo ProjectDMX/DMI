@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "../pack/pack_builder.h"
@@ -34,9 +35,22 @@ class NativePackSink final : public ring::RecordSink {
   NativePackSink(const NativePackSink&) = delete;
   NativePackSink& operator=(const NativePackSink&) = delete;
 
+  // Admits the envelope's rows against one admission deadline
+  // (EnvelopeAdmission). Refuses it first if the pipeline has latched a
+  // failure or lost an admitted record (see rethrow_if_failed).
   void submit(ring::RecordEnvelope envelope) override;
+  // Also fails, after a completed flush, when a record admitted since
+  // construction was lost instead of persisted -- the reference adapter's
+  // loss check (record_adapter.py _LOSS_COUNTERS) -- or when fewer records
+  // were persisted than admitted.
   bool flush_and_wait(Duration timeout) override;
+  // Throws on a latched pipeline failure, and on any loss counter
+  // (dropped, timed out, oversized, duplicate, rejected-closed, failures)
+  // that has moved since construction.
   void rethrow_if_failed() const override;
+  // kDropNewest: zero (a full queue refuses at once). kBlock: the
+  // admission timeout, now one per envelope; none when it waits forever.
+  std::optional<Duration> admission_bound() const override;
 
   const PackSink& sink() const { return *sink_; }
   const std::string& layout() const { return layout_; }
@@ -46,8 +60,15 @@ class NativePackSink final : public ring::RecordSink {
   void on_engine_release() noexcept override {}
 
  private:
+  // "NativePackSink: pipeline reported ..." for the loss counters that
+  // moved since baseline_; empty when none did.
+  std::string LossError() const;
+
   std::unique_ptr<PackSink> sink_;
   const std::string layout_;
+  // Counters at construction. Losses are judged against it, as the
+  // reference adapter judges them against its pipeline's baseline.
+  SinkSnapshot baseline_;
 };
 
 }  // namespace dmi_sink

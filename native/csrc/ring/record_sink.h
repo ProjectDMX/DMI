@@ -10,6 +10,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 
 namespace ring {
@@ -38,6 +39,14 @@ public:
     virtual void submit(RecordEnvelope envelope) = 0;
     virtual bool flush_and_wait(Duration timeout) = 0;
     virtual void rethrow_if_failed() const = 0;
+
+    // The longest one submit() can block waiting for the sink to admit an
+    // envelope, or nullopt when that wait has no bound (or the sink cannot
+    // say).  A record ring with a step stall budget waits for one in-flight
+    // submit after the budget is spent, so it refuses a sink without one.
+    virtual std::optional<Duration> admission_bound() const {
+        return std::nullopt;
+    }
 
     bool engine_owned() const {
         std::lock_guard<std::mutex> lock(engine_mu_);

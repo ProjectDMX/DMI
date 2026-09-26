@@ -19,7 +19,8 @@ not a dependency of it.
 
 Deployment shape: the catalog has ONE publisher lease per (``database``,
 ``table_prefix``), so run one capture process per catalog. A second engine
-on the same catalog fails at ``create_record_runtime`` with the lease held.
+on the same catalog waits ``start_lease_wait_s`` for the lease, then fails
+at ``create_record_runtime`` with the lease held, naming the holder.
 """
 
 from __future__ import annotations
@@ -27,9 +28,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import socket
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from typing import Any, Optional, Sequence
 
 
@@ -53,6 +55,122 @@ def _load_native_store_extension() -> Any:
             "`make -C native build/_dmi_native_store "
             "PYTHON=<venv>/bin/python`."
         ) from exc
+
+
+# A bare host name or IPv4 address, or a bracketed IPv6 address. Anything
+# else would change what the URL the native client builds means.
+_BARE_HOST = re.compile(r"[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\]")
+
+
+def _text(name: str, value: Any) -> None:
+    if type(value) is not str:
+        raise TypeError(f"{name} must be str")
+    # Credentials travel as HTTP headers; a line break would end the header.
+    if any(c in value for c in "\r\n\x00"):
+        raise ValueError(f"{name} must not contain CR, LF or NUL")
+
+
+def _finite(name: str, value: Any) -> None:
+    if type(value) not in (int, float):
+        raise TypeError(f"{name} must be float")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+
+
+def _ns(seconds: float) -> int:
+    return int(round(seconds * 1_000_000_000))
+
+
+# The native writer's MINIMUM_FENCE_MARGIN_NS: what must remain of the lease
+# once the publish statement cap and the skew bound are spent.
+_FENCE_MARGIN_NS = 100_000_000
+
+
+# The sink's admission policies (native/csrc/sink/pack_sink.h Overload).
+SINK_OVERLOAD_POLICIES = ("block", "drop_newest")
+
+
+@dataclass(frozen=True, slots=True)
+class NativeSinkConfig:
+    """Bounds and admission policy for the native pack sink.
+
+    The sink runs on the ring's record worker: every record the forward
+    captures is admitted here, into a bounded queue ahead of pack assembly.
+    ``overload`` decides what a full queue does. ``"block"`` waits for room
+    for up to ``admission_timeout_s`` (``None`` waits without bound) and
+    then refuses the record as timed out; the rows of one ring record (one
+    envelope) share that one deadline. ``"drop_newest"`` refuses it at
+    once, and ``admission_timeout_s`` is not used. Either refusal latches
+    the record runtime (see ``create_record_runtime``'s failure policy),
+    and so does a record lost after admission. A ``step_stall_budget_ms``
+    needs a bounded admission, so it is refused with block and no timeout.
+
+    The default, block with 2 s, absorbs a burst larger than the queue at
+    the cost of stalling the record worker, and so the ring, while the sink
+    catches up. The C++ ``SinkConfig`` keeps drop_newest with no timeout,
+    the reference pipeline's default; this config is what the ring-fed sink
+    is built from.
+
+    A record larger than ``max_queue_bytes`` or ``max_pack_bytes`` can
+    never be admitted; ``validate_capture_bounds`` refuses such a bound at
+    attach, before any forward runs.
+    """
+
+    spool_root: str
+    spool_max_bytes: int = 1 << 40
+    num_workers: int = 1
+    max_queue_records: int = 256
+    max_queue_bytes: int = 16 * 1024 * 1024
+    max_pack_bytes: int = 128 * 1024 * 1024
+    max_pack_records: int = 10_000
+    max_linger_ns: int = 1_000_000_000
+    overload: str = "block"
+    admission_timeout_s: Optional[float] = 2.0
+
+    def __post_init__(self) -> None:
+        if not self.spool_root:
+            raise ValueError("spool_root is required")
+        for name in (
+            "spool_max_bytes",
+            "num_workers",
+            "max_queue_records",
+            "max_queue_bytes",
+            "max_pack_bytes",
+            "max_pack_records",
+            "max_linger_ns",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.overload not in SINK_OVERLOAD_POLICIES:
+            raise ValueError(
+                f"overload must be one of {SINK_OVERLOAD_POLICIES}, "
+                f"got {self.overload!r}")
+        if self.admission_timeout_s is not None:
+            _positive("admission_timeout_s", self.admission_timeout_s, float)
+
+
+def _native_sink_config_setstate(self: NativeSinkConfig, state: Any) -> None:
+    # A frozen slots dataclass pickles its field values as a list, and the
+    # generated __setstate__ zips them with the current fields, leaving any
+    # the pickle predates unset. A config pickled before the admission
+    # fields existed (the old class, at the path that now re-exports this
+    # one) gets their defaults instead.
+    names = fields(NativeSinkConfig)
+    if len(state) > len(names):
+        raise TypeError(
+            f"NativeSinkConfig state has {len(state)} values, expected at "
+            f"most {len(names)}")
+    for item, value in zip(names, state):
+        object.__setattr__(self, item.name, value)
+    for item in names[len(state):]:
+        if item.default is MISSING:
+            raise TypeError(
+                f"NativeSinkConfig state is missing {item.name!r}")
+        object.__setattr__(self, item.name, item.default)
+
+
+NativeSinkConfig.__setstate__ = _native_sink_config_setstate  # type: ignore[method-assign]
 
 
 def _positive(name: str, value: Any, kind: type) -> None:
@@ -81,11 +199,37 @@ class NativeCaptureStorageConfig:
     s3_session_token: str = field(default="", repr=False)
     # Plain-HTTP endpoints (a local Garage or MinIO) must be opted into.
     s3_allow_insecure_http: bool = False
+    # https only: trust a private CA, as a PEM bundle (s3_ca_file) or an
+    # OpenSSL-hashed certificate directory (s3_ca_path). Empty uses the
+    # system trust store. https always verifies the peer either way.
+    s3_ca_file: str = ""
+    s3_ca_path: str = ""
     # The name packs are indexed under; readers resolve it to this store.
     store_id: str = "s3"
 
-    clickhouse_host: str = "127.0.0.1"
-    clickhouse_port: int = 8123  # the HTTP interface
+    clickhouse_host: str = "127.0.0.1"  # a bare host: no scheme, port or user
+    clickhouse_port: int = 8123  # the HTTP interface (8443 for its TLS port)
+    # "https" always verifies the server's certificate and name, against
+    # libcurl's built-in CA bundle/directory, or a private CA given as
+    # clickhouse_ca_file (a PEM bundle) or clickhouse_ca_path (an OpenSSL
+    # hashed directory). Each REPLACES libcurl's default for that option:
+    # whether the system roots still count depends on the libcurl build
+    # (kept on Debian/Ubuntu, dropped by bundle-only builds such as RHEL).
+    clickhouse_scheme: str = "http"
+    # Sent as X-ClickHouse-User / X-ClickHouse-Key headers, never in a URL.
+    # Empty: no credentials, which ClickHouse reads as its `default` user.
+    clickhouse_user: str = ""
+    clickhouse_password: str = field(default="", repr=False)
+    clickhouse_ca_file: str = ""
+    clickhouse_ca_path: str = ""
+    # A password over plain http must be opted into, as for s3.
+    clickhouse_allow_insecure_http: bool = False
+    # An optional separate account for NativeCaptureReader, typically one
+    # limited with GRANT SELECT (or a readonly=2 profile) -- not readonly=1,
+    # which refuses the query-limit settings every read sends (Code 164).
+    # Empty: the reader uses clickhouse_user.
+    clickhouse_reader_user: str = ""
+    clickhouse_reader_password: str = field(default="", repr=False)
     # Every catalog request is bounded, so a server that stops answering
     # cannot hold a flush, a publish or the lease renewal indefinitely.
     clickhouse_connect_timeout_s: float = 10.0
@@ -108,6 +252,29 @@ class NativeCaptureStorageConfig:
     # engine.close()'s total budget for draining capture: sealing the sink's
     # open pack, then getting every staged pack into the catalog.
     close_flush_timeout_s: float = 60.0
+    # Bytes of packs the uploader holds in flight at once. A staged pack
+    # larger than this is never uploaded, so the sink's max_pack_bytes must
+    # not exceed it (validate_capture_bounds). The native default.
+    uploader_max_in_flight_bytes: int = 256 * 1024 * 1024
+
+    # The publisher lease. A crashed process holds the catalog for up to
+    # lease_ttl_s; a ClickHouse error of unknown outcome sets the lease aside
+    # for as long, after which the service takes a fresh one. The TTL must
+    # exceed publish_timeout_s + clock_skew_s by at least 0.1 s: that margin
+    # is what keeps a publish statement from outliving its lease.
+    lease_ttl_s: float = 15.0
+    # The server-side cap on each fenced publish statement, whole seconds.
+    publish_timeout_s: float = 5.0
+    # The bound on host clock disagreement across a replicated catalog.
+    clock_skew_s: float = 0.0
+    # How long start() waits for a predecessor's lease to expire before
+    # failing with it held. None waits lease_ttl_s + publish_timeout_s +
+    # clock_skew_s, enough to outlast a crashed predecessor that ran with the
+    # same knobs; 0 fails at once. A predecessor with a longer TTL (the
+    # native default is 30 s, which processes predating these knobs used)
+    # can outlast it: set this explicitly for the first restart after such
+    # a process.
+    start_lease_wait_s: Optional[float] = None
 
     def __post_init__(self) -> None:
         for name in ("s3_endpoint", "s3_bucket", "s3_access_key",
@@ -131,6 +298,16 @@ class NativeCaptureStorageConfig:
                     "never downgrades TLS; leave it False for https://")
         else:
             raise ValueError("s3_endpoint must start with http:// or https://")
+        for name in ("s3_ca_file", "s3_ca_path"):
+            value = getattr(self, name)
+            if type(value) is not str:
+                raise TypeError(f"{name} must be a str (empty for the system "
+                                "trust store)")
+            # The native client refuses the same pairing: a CA on http://
+            # reads as "this is TLS" while credentials go in the clear.
+            if value and not self.s3_endpoint.startswith("https://"):
+                raise ValueError(f"{name} applies only to an https:// "
+                                 "s3_endpoint")
         if type(self.clickhouse_port) is not int or not 0 < self.clickhouse_port < 65536:
             raise ValueError("clickhouse_port must be in 1..65535")
         _positive("poll_interval_s", self.poll_interval_s, float)
@@ -141,13 +318,110 @@ class NativeCaptureStorageConfig:
                   self.clickhouse_connect_timeout_s, float)
         _positive("clickhouse_request_timeout_s",
                   self.clickhouse_request_timeout_s, float)
+        self._validate_clickhouse_connection()
         _positive("close_flush_timeout_s", self.close_flush_timeout_s, float)
+        if (type(self.uploader_max_in_flight_bytes) is not int
+                or self.uploader_max_in_flight_bytes <= 0):
+            raise ValueError("uploader_max_in_flight_bytes must be positive")
         if type(self.reconcile_interval_s) not in (int, float):
             raise TypeError("reconcile_interval_s must be float")
         if not math.isfinite(self.reconcile_interval_s):
             raise ValueError("reconcile_interval_s must be finite")
         if self.reconcile_interval_s < 0:
             raise ValueError("reconcile_interval_s must be non-negative")
+        self._validate_lease()
+        # A publish runs server-side for up to publish_timeout_s. A client
+        # that gives up first reports an outcome it does not know, and the
+        # writer quarantines itself over a statement that may have committed.
+        minimum = 2 * float(self.publish_timeout_s)
+        if self.clickhouse_request_timeout_s < minimum:
+            raise ValueError(
+                "clickhouse_request_timeout_s must be at least "
+                f"{minimum:g} s: twice publish_timeout_s "
+                f"({float(self.publish_timeout_s):g} s), so a publish is "
+                "never abandoned while the server may still commit it")
+
+    def _validate_lease(self) -> None:
+        for name in ("lease_ttl_s", "publish_timeout_s", "clock_skew_s"):
+            _finite(name, getattr(self, name))
+        if self.start_lease_wait_s is not None:
+            _finite("start_lease_wait_s", self.start_lease_wait_s)
+            if self.start_lease_wait_s < 0:
+                raise ValueError("start_lease_wait_s must be non-negative")
+        _positive("lease_ttl_s", self.lease_ttl_s, float)
+        _positive("publish_timeout_s", self.publish_timeout_s, float)
+        if self.clock_skew_s < 0:
+            raise ValueError("clock_skew_s must be non-negative")
+        if float(self.publish_timeout_s) != int(self.publish_timeout_s):
+            raise ValueError(
+                "publish_timeout_s must be a whole number of seconds: the "
+                "catalog sends it as max_execution_time in seconds, where a "
+                "fraction truncates and 0 means no limit")
+        # In nanoseconds, as the native writer checks it, so a pairing
+        # accepted here is never refused at start().
+        margin = (_ns(self.lease_ttl_s) - _ns(self.publish_timeout_s)
+                  - _ns(self.clock_skew_s))
+        if margin < _FENCE_MARGIN_NS:
+            raise ValueError(
+                "lease_ttl_s must exceed publish_timeout_s + clock_skew_s by "
+                "at least 0.1 s, or a publish statement can still be running "
+                "when its lease becomes takeable")
+
+    def _lease_native(self) -> dict[str, int]:
+        wait = self.start_lease_wait_s
+        if wait is None:
+            wait = (self.lease_ttl_s + self.publish_timeout_s
+                    + self.clock_skew_s)
+        return {
+            "lease_ttl_ns": _ns(self.lease_ttl_s),
+            "publish_timeout_ns": _ns(self.publish_timeout_s),
+            "clock_skew_ns": _ns(self.clock_skew_s),
+            "start_lease_wait_ns": _ns(wait),
+        }
+
+    def _validate_clickhouse_connection(self) -> None:
+        """What the native client refuses, refused here with field names."""
+        for name in ("clickhouse_scheme", "clickhouse_host", "clickhouse_user",
+                     "clickhouse_password", "clickhouse_ca_file",
+                     "clickhouse_ca_path", "clickhouse_reader_user",
+                     "clickhouse_reader_password"):
+            _text(name, getattr(self, name))
+        if type(self.clickhouse_allow_insecure_http) is not bool:
+            raise TypeError("clickhouse_allow_insecure_http must be bool")
+        if self.clickhouse_scheme not in ("http", "https"):
+            raise ValueError('clickhouse_scheme must be "http" or "https"')
+        # The value is never repeated: the likeliest mistake here is a URL
+        # with a password in it.
+        if "@" in self.clickhouse_host:
+            raise ValueError(
+                "clickhouse_host must not carry userinfo (user:password@); "
+                "set clickhouse_user and clickhouse_password instead")
+        if _BARE_HOST.fullmatch(self.clickhouse_host) is None:
+            raise ValueError(
+                "clickhouse_host must be a bare host name or address; the "
+                "scheme and port have their own fields")
+        for user, password in (
+                ("clickhouse_user", "clickhouse_password"),
+                ("clickhouse_reader_user", "clickhouse_reader_password")):
+            if getattr(self, password) and not getattr(self, user):
+                raise ValueError(f"{password} needs {user}: name the account "
+                                 "it belongs to")
+        if self.clickhouse_scheme == "http":
+            for name in ("clickhouse_ca_file", "clickhouse_ca_path"):
+                if getattr(self, name):
+                    raise ValueError(
+                        f"{name} needs clickhouse_scheme='https'; over http "
+                        "it would verify nothing")
+            if ((self.clickhouse_password or self.clickhouse_reader_password)
+                    and not self.clickhouse_allow_insecure_http):
+                raise ValueError(
+                    "a ClickHouse password over plain http is refused: set "
+                    "clickhouse_scheme='https', or clickhouse_allow_insecure_http"
+                    "=True to send it in the clear")
+        elif self.clickhouse_allow_insecure_http:
+            raise ValueError(
+                "clickhouse_allow_insecure_http admits plain http and never "
+                "downgrades TLS; leave it False for https")
 
     def _native_dict(self) -> dict[str, Any]:
         return {
@@ -158,14 +432,87 @@ class NativeCaptureStorageConfig:
             "s3_secret_key": self.s3_secret_key,
             "s3_session_token": self.s3_session_token,
             "s3_allow_insecure_http": self.s3_allow_insecure_http,
+            "s3_ca_file": self.s3_ca_file,
+            "s3_ca_path": self.s3_ca_path,
             "store_id": self.store_id,
+            "clickhouse_scheme": self.clickhouse_scheme,
             "clickhouse_host": self.clickhouse_host,
             "clickhouse_port": self.clickhouse_port,
+            "clickhouse_user": self.clickhouse_user,
+            "clickhouse_password": self.clickhouse_password,
+            "clickhouse_ca_file": self.clickhouse_ca_file,
+            "clickhouse_ca_path": self.clickhouse_ca_path,
+            "clickhouse_allow_insecure_http": self.clickhouse_allow_insecure_http,
             "clickhouse_connect_timeout_s": float(self.clickhouse_connect_timeout_s),
             "clickhouse_request_timeout_s": float(self.clickhouse_request_timeout_s),
             "database": self.database,
             "table_prefix": self.table_prefix,
+            "uploader_max_in_flight_bytes": self.uploader_max_in_flight_bytes,
         }
+
+    def _native_reader_dict(self) -> dict[str, Any]:
+        """The reader's native config: the reader account, when one is set."""
+        native = self._native_dict()
+        if self.clickhouse_reader_user:
+            native["clickhouse_user"] = self.clickhouse_reader_user
+            native["clickhouse_password"] = self.clickhouse_reader_password
+        return native
+
+
+# What an empty pack needs besides one record's payload: the 64-byte header
+# and trailer, up to 63 bytes of payload alignment, and that record's footer
+# row (its metadata as JSON, well under a kilobyte for real identifiers).
+# Generous on purpose: undershooting it lets a record through that the pack
+# worker then counts as oversized and drops.
+PACK_FRAMING_RESERVE_BYTES = 64 * 1024
+
+
+def validate_capture_bounds(
+    sink_config: NativeSinkConfig,
+    max_record_bytes: int,
+    *,
+    storage_config: Optional[NativeCaptureStorageConfig] = None,
+) -> None:
+    """Refuse capture bounds under which a record or pack cannot be stored.
+
+    ``max_record_bytes`` is the largest single record (one captured row's
+    payload) the caller will emit. Checked here, at attach, these refusals
+    never reach the forward:
+
+    - ``max_queue_bytes`` below it: the sink refuses the record outright.
+    - ``max_pack_bytes`` below it plus ``PACK_FRAMING_RESERVE_BYTES``: the
+      sink admits the record and the pack worker then drops it as oversized.
+    - ``max_pack_bytes`` above ``uploader_max_in_flight_bytes``: a full pack
+      is staged and never uploaded.
+
+    Raises ``ConfigurationError`` naming the bound to raise.
+    """
+    if not isinstance(sink_config, NativeSinkConfig):
+        raise TypeError("sink_config must be a NativeSinkConfig")
+    if type(max_record_bytes) is not int or max_record_bytes <= 0:
+        raise ValueError("max_record_bytes must be a positive int")
+    from ..configuration.errors import ConfigurationError
+
+    if sink_config.max_queue_bytes < max_record_bytes:
+        raise ConfigurationError(
+            f"a {max_record_bytes}-byte record exceeds the sink's "
+            f"max_queue_bytes ({sink_config.max_queue_bytes}); raise "
+            "max_queue_bytes to at least the largest record")
+    needed = max_record_bytes + PACK_FRAMING_RESERVE_BYTES
+    if sink_config.max_pack_bytes < needed:
+        raise ConfigurationError(
+            f"a {max_record_bytes}-byte record does not fit an empty pack of "
+            f"max_pack_bytes ({sink_config.max_pack_bytes}); raise "
+            f"max_pack_bytes to at least {needed} (the record plus "
+            f"{PACK_FRAMING_RESERVE_BYTES} bytes of pack framing)")
+    if (storage_config is not None and sink_config.max_pack_bytes
+            > storage_config.uploader_max_in_flight_bytes):
+        raise ConfigurationError(
+            f"the sink's max_pack_bytes ({sink_config.max_pack_bytes}) "
+            "exceeds the storage service's uploader_max_in_flight_bytes "
+            f"({storage_config.uploader_max_in_flight_bytes}), so a full "
+            "pack would never be uploaded; lower max_pack_bytes or raise "
+            "uploader_max_in_flight_bytes")
 
 
 class NativeCaptureStorage:
@@ -193,12 +540,17 @@ class NativeCaptureStorage:
             reconcile_prefix=config.reconcile_prefix,
             reconcile_interval_ns=int(config.reconcile_interval_s * 1e9),
             sweep_spool_on_start=sweep_spool,
+            **config._lease_native(),
         )
         self._config = config
         self._service = module.StorageService(native)
 
     def start(self) -> None:
-        """Sweep the spool, ensure the catalog schema, take the lease."""
+        """Ensure the catalog schema, take the lease, sweep the spool.
+
+        Waits up to ``start_lease_wait_s`` for another holder's lease to
+        expire, then raises naming the holder.
+        """
         self._service.start()
 
     def flush(self, timeout_s: float) -> None:
@@ -282,7 +634,7 @@ class NativeCaptureReader:
         if not isinstance(config, NativeCaptureStorageConfig):
             raise TypeError("config must be a NativeCaptureStorageConfig")
         module = _load_native_store_extension()
-        native = config._native_dict()
+        native = config._native_reader_dict()
         native["max_coalesce_gap_bytes"] = max_coalesce_gap_bytes
         self._columns: tuple[str, ...] = tuple(module.SEARCH_ITEM_COLUMNS)
         self._reader = module.CaptureReader(native)
@@ -415,10 +767,14 @@ class NativeCaptureReader:
 
 
 __all__ = [
+    "PACK_FRAMING_RESERVE_BYTES",
+    "SINK_OVERLOAD_POLICIES",
+    "NativeSinkConfig",
     "NativeCapture",
     "NativeCapturePage",
     "NativeCaptureReader",
     "NativeCaptureSelection",
     "NativeCaptureStorage",
     "NativeCaptureStorageConfig",
+    "validate_capture_bounds",
 ]

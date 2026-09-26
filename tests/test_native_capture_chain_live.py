@@ -204,10 +204,14 @@ def _storage_config(endpoint, bucket, access, secret, prefix):
         table_prefix=prefix, poll_interval_s=0.05)
 
 
-def _run_chain(config, spool_root: Path, envelopes, *, sink_overrides=None):
+def _run_chain(config, spool_root: Path, envelopes, *, sink_overrides=None,
+               sink_config=None):
     """Service first, as the engine orders it (its start sweeps the spool,
     which is safe only while no sink writes there), then the sink; flush
-    both, and return the snapshots and what the reader reads back."""
+    both, and return the snapshots and what the reader reads back.
+
+    The sink is the raw binding with `sink_overrides`, or, given a
+    NativeSinkConfig, the one the engine builds from it."""
     from dmi.storage.native_capture import (
         NativeCaptureReader, NativeCaptureStorage,
     )
@@ -216,7 +220,15 @@ def _run_chain(config, spool_root: Path, envelopes, *, sink_overrides=None):
                                    spool_max_bytes=1 << 40, sweep_spool=True)
     service.start()
     try:
-        sink, _lease = _open_sink(spool_root, **(sink_overrides or {}))
+        if sink_config is None:
+            sink, _lease = _open_sink(spool_root, **(sink_overrides or {}))
+        else:
+            from dmi.storage.capture.native_sink import (
+                create_native_pack_sink,
+            )
+
+            sink = create_native_pack_sink(sink_config).native_sink
+            _lease = sink.attach()
         for envelope in envelopes:
             sink.submit_envelope(LAYOUT, envelope.rows, envelope.payload())
         assert sink.flush_and_wait(120.0)
@@ -373,3 +385,78 @@ def test_a_multipart_pack_through_the_fake_s3(fake_s3, tmp_path):
     assert all(size >= S3_MIN_PART for size in parts[:-1]), parts
     assert STATE.objects[key]["etag"].endswith('-multipart"')
     _assert_read_back_exactly(captures, envelopes)
+
+
+# --- B2: sizes and bursts are stored, or refused at configuration time -------
+
+
+def test_a_row_over_16_mib_is_refused_at_configuration_or_stored(
+        fake_s3, tmp_path):
+    """A 17 MiB prefill row against the default 16 MiB sink queue.
+
+    The default bounds cannot admit it, and validate_capture_bounds says so
+    before any capture runs, naming the bound. With the queue raised the
+    same row goes through the real chain and reads back exactly."""
+    from dmi.configuration.errors import ConfigurationError
+    from dmi.storage.native_capture import (
+        NativeSinkConfig, validate_capture_bounds,
+    )
+
+    row_bytes = 17 * MiB
+    envelope = _Envelope()
+    envelope.add(0, torch_randn(row_bytes // 4, seed=17))
+    spool_root = tmp_path / "spool"
+    with _catalog() as prefix:
+        config = _storage_config(fake_s3, BUCKET, ACCESS, SECRET, prefix)
+        with pytest.raises(ConfigurationError, match="max_queue_bytes"):
+            validate_capture_bounds(
+                NativeSinkConfig(spool_root=str(spool_root)), row_bytes,
+                storage_config=config)
+
+        raised = NativeSinkConfig(spool_root=str(spool_root),
+                                  max_queue_bytes=64 * MiB,
+                                  max_linger_ns=600 * 10**9)
+        validate_capture_bounds(raised, row_bytes, storage_config=config)
+        sink_snapshot, snapshot, captures = _run_chain(
+            config, spool_root, [envelope], sink_config=raised)
+
+    assert sink_snapshot["persisted_records"] == 1, sink_snapshot
+    assert sink_snapshot["oversized_records"] == 0, sink_snapshot
+    assert snapshot["indexed_rows"] == 1, snapshot
+    _assert_read_back_exactly(captures, [envelope])
+
+
+def test_a_burst_of_64_1_mib_rows_is_stored_under_the_default_sink_config(
+        fake_s3, tmp_path):
+    """One envelope of 64 x 1 MiB rows -- four times the default queue --
+    through the sink built from NativeSinkConfig's defaults (block, 2 s).
+    The record worker waits for room rather than dropping: every row is
+    stored and reads back. Under the binding's old drop_newest default the
+    same envelope was refused after 18-25 rows."""
+    from dmi.storage.native_capture import (
+        NativeSinkConfig, validate_capture_bounds,
+    )
+
+    envelope = _Envelope()
+    for index in range(64):
+        envelope.add(index, torch_randn(MiB // 4, seed=index))
+    spool_root = tmp_path / "spool"
+    sink_config = NativeSinkConfig(spool_root=str(spool_root))
+    with _catalog() as prefix:
+        config = _storage_config(fake_s3, BUCKET, ACCESS, SECRET, prefix)
+        validate_capture_bounds(sink_config, MiB, storage_config=config)
+        sink_snapshot, snapshot, captures = _run_chain(
+            config, spool_root, [envelope], sink_config=sink_config)
+
+    assert sink_snapshot["persisted_records"] == 64, sink_snapshot
+    assert sink_snapshot["dropped_records"] == 0, sink_snapshot
+    assert sink_snapshot["timed_out_records"] == 0, sink_snapshot
+    assert snapshot["indexed_rows"] == 64, snapshot
+    assert snapshot["pending_index"] == 0, snapshot
+    _assert_read_back_exactly(captures, [envelope])
+
+
+def torch_randn(elements: int, *, seed: int):
+    import torch
+
+    return torch.randn(elements, generator=torch.Generator().manual_seed(seed))

@@ -283,6 +283,28 @@ def test_oversized_record_is_rejected_up_front(sink, tmp_path):
     assert snapshot["packs_persisted"] == 0
 
 
+def test_a_record_that_fits_no_empty_pack_is_oversized_not_a_failure(
+        sink, tmp_path):
+    """Admission screens the payload against max_pack_bytes; the pack adds a
+    header, the record's footer row and a trailer. A payload of exactly
+    max_pack_bytes clears admission and still fits no empty pack. The
+    oracle's PackAssembler raises OversizedRecordError for it and the
+    pipeline counts the record oversized and keeps going (pipeline.py
+    _run). The native worker instead sealed the empty pack it had just
+    opened for the record, and "cannot seal an empty pack" failed the whole
+    sink, losing everything queued behind it."""
+    _open(sink, tmp_path / "spool", max_pack_bytes=1024)
+    edge = CaptureRecord(
+        metadata=_meta(0, dtype="uint8", shape=(1024,)), payload=bytes(1024))
+    assert _submit(sink, edge) == "accepted"
+    assert _submit(sink, _record(1)) == "accepted"
+    assert sink.call(op="flush", timeout=30)["ok"]
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["oversized_records"] == 1
+    assert snapshot["failures"] == 0
+    assert snapshot["persisted_records"] == 1
+
+
 @pytest.mark.parametrize("overload, timeout", [
     ("drop_newest", -1),
     # A timeout, so a regression cannot hang the suite: under BLOCK with

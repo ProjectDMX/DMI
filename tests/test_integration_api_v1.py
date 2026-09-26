@@ -237,8 +237,10 @@ def test_v1_public_surface_is_documented() -> None:
     assert missing == []
     member_names = {
         "active_hook_specs",
+        "begin_step",
         "bind_hook",
         "capture_enabled",
+        "capture_status",
         "commit_step",
         "create_record_runtime",
         "emit_output",
@@ -248,6 +250,7 @@ def test_v1_public_surface_is_documented() -> None:
         "prepare_replay",
         "ring_capacities",
         "set_capture_enabled",
+        "validate_capture_bounds",
     }
     missing_members = [
         name
