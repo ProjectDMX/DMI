@@ -207,10 +207,16 @@ public:
     // pending drain.  CPU-only read.
     uint64_t available_capacity() const;
 
+    // Free task-ring entries not currently reserved and not pending
+    // drain.  CPU-only read.
+    uint64_t available_task_slots() const;
+
     // Per-hook reservation: claim `nbytes` of payload ring + 1 task entry
     // for an upcoming producer kernel launch.  Used by the safety net
     // when force_eager is on and the spec is dynamic-shape.  Advances
-    // cpu_payload_head/cpu_task_head atomically.
+    // cpu_payload_head/cpu_task_head atomically.  Throws std::logic_error,
+    // reserving nothing, when no task entry is free: the producer would
+    // overwrite an unconsumed READY word.  Callers flush_and_wait() first.
     void reserve_one(uint64_t nbytes);
 
     // Synchronise the current CUDA stream + force drain to process all

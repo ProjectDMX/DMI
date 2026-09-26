@@ -224,6 +224,34 @@ static void test_native_reservation_uses_transport_alignment() {
     EXPECT(before - engine.available_capacity() == 32);
 }
 
+static void test_reserve_one_refuses_without_a_free_task_slot() {
+    banner("reserve_one refuses once every task entry is reserved");
+    // Producers never read the tails, so a reservation past task_cap would
+    // publish over an unread READY word. Payload room is plentiful here:
+    // the task ring is the only limit, as for a STEP_OVERSIZED step whose
+    // hook count exceeds task_ring_entries.
+    ring_py::RingEnginePy engine(make_py_config(), ring_py::SubmitFn{});
+    engine.init();
+    const uint64_t task_cap = engine.task_cap();
+    EXPECT(engine.available_task_slots() == task_cap);
+    for (uint64_t i = 0; i < task_cap; ++i) {
+        engine.reserve_one(16);
+    }
+    EXPECT(engine.available_task_slots() == 0);
+
+    const uint64_t bytes = engine.available_capacity();
+    EXPECT(bytes >= 16);
+    bool refused = false;
+    try {
+        engine.reserve_one(16);
+    } catch (const std::logic_error& error) {
+        refused = std::strstr(error.what(), "task-ring entry") != nullptr;
+    }
+    EXPECT(refused);
+    EXPECT(engine.available_task_slots() == 0);
+    EXPECT(engine.available_capacity() == bytes);
+}
+
 template <typename Fn>
 static bool refuses_as_legacy_on_record_ring(Fn&& call) {
     try {
@@ -784,6 +812,7 @@ int main() {
     std::printf("test_ring_engine (current drain pipeline)\n");
     test_ring_geometry_requires_payload_alignment();
     test_native_reservation_uses_transport_alignment();
+    test_reserve_one_refuses_without_a_free_task_slot();
     test_record_ring_refuses_every_legacy_producer_entry();
     test_static_force_flush();
     test_prefix_force_flush();

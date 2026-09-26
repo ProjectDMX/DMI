@@ -317,9 +317,14 @@ class HookPoint(nn.Module):
                 # min is cached on the transport and shared by every hook --
                 # querying the pair per hook would repeat it for the whole
                 # active set on the first eager forward.
+                # A free task entry is needed too: a step with more hooks
+                # than task entries lands here with the payload ring nearly
+                # empty, and reserving past task_cap makes a producer
+                # overwrite an unread slot. A flush frees both.
                 effective_cap = transport.effective_cap
-                if transport_bytes <= min(engine.available_capacity(),
-                                          effective_cap):
+                if (transport_bytes <= min(engine.available_capacity(),
+                                           effective_cap)
+                        and engine.available_task_slots() > 0):
                     engine.reserve_one(nbytes)
                     dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
                                       self._ring_hook_type, self._ring_hook_id)
