@@ -36,12 +36,19 @@ dmi_store::S3Config s3_config(const py::dict& d) {
   c.secret_key = get<std::string>(d, "s3_secret_key", "");
   c.session_token = get<std::string>(d, "s3_session_token", "");
   c.allow_insecure_http = get<bool>(d, "s3_allow_insecure_http", false);
+  c.ca_file = get<std::string>(d, "s3_ca_file", "");
+  c.ca_path = get<std::string>(d, "s3_ca_path", "");
   c.connect_timeout_s = get<int>(d, "s3_connect_timeout_s", c.connect_timeout_s);
   c.read_timeout_s = get<int>(d, "s3_read_timeout_s", c.read_timeout_s);
   c.max_attempts = get<int>(d, "s3_max_attempts", c.max_attempts);
   if (c.endpoint.empty() || c.bucket.empty()) {
     throw py::value_error("s3_endpoint and s3_bucket are required");
   }
+  // The client would refuse every request of an invalid config (a CA on
+  // http://, a missing CA file, a sub-5 MiB part); raising here makes the
+  // refusal land when the service or reader is built instead.
+  const std::string invalid = dmi_store::S3Client::ValidateConfig(c);
+  if (!invalid.empty()) throw py::value_error("s3: " + invalid);
   return c;
 }
 
@@ -86,6 +93,8 @@ dc::StorageServiceConfig service_config(const py::dict& d) {
   c.writer.publish_timeout_ns =
       get<uint64_t>(d, "publish_timeout_ns", c.writer.publish_timeout_ns);
   c.writer.clock_skew_ns = get<uint64_t>(d, "clock_skew_ns", c.writer.clock_skew_ns);
+  c.start_lease_wait_ns =
+      get<uint64_t>(d, "start_lease_wait_ns", c.start_lease_wait_ns);
   c.indexer.max_packs = get<int>(d, "indexer_max_packs", c.indexer.max_packs);
   c.indexer.max_estimated_bytes =
       get<uint64_t>(d, "indexer_max_estimated_bytes", c.indexer.max_estimated_bytes);
@@ -119,6 +128,12 @@ py::dict snapshot_dict(const dc::StorageServiceSnapshot& s) {
   out["swept_on_start"] = s.swept_on_start;
   out["pending_index"] = s.pending_index;
   out["rejected_packs"] = s.rejected_packs;
+  out["failed"] = s.failed;
+  out["lease_state"] = s.lease_state;
+  // Seconds on the monotonic clock, comparable with time.monotonic() (both
+  // CLOCK_MONOTONIC on Linux); 0.0 when not quarantined.
+  out["quarantined_until"] = static_cast<double>(s.quarantined_until_ns) / 1e9;
+  out["lease_reacquisitions"] = s.lease_reacquisitions;
   out["last_error"] = s.last_error;
   return out;
 }

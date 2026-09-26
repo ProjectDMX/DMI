@@ -515,6 +515,8 @@ std::string respond(const std::string& line, Session* session) {
       s3_config.access_key = jc::FindString(line, "access");
       s3_config.secret_key = jc::FindString(line, "secret");
       s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      s3_config.ca_file = jc::FindString(line, "ca_file");
+      s3_config.ca_path = jc::FindString(line, "ca_path");
       dmi_store::S3Client s3(s3_config);
       dmi_catalog::NativeCaptureReader reader(
           &s3, s3_config.bucket, session->client, rc);
@@ -547,6 +549,8 @@ std::string respond(const std::string& line, Session* session) {
       s3_config.access_key = jc::FindString(line, "access");
       s3_config.secret_key = jc::FindString(line, "secret");
       s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      s3_config.ca_file = jc::FindString(line, "ca_file");
+      s3_config.ca_path = jc::FindString(line, "ca_path");
       dmi_store::S3Client s3(s3_config);
       dmi_catalog::NativeCaptureReader reader(
           &s3, s3_config.bucket, session->client, rc);
@@ -583,6 +587,8 @@ std::string respond(const std::string& line, Session* session) {
       s3_config.access_key = jc::FindString(line, "access");
       s3_config.secret_key = jc::FindString(line, "secret");
       s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      s3_config.ca_file = jc::FindString(line, "ca_file");
+      s3_config.ca_path = jc::FindString(line, "ca_path");
       dmi_store::S3Client s3(s3_config);
       dmi_catalog::NativeCaptureReader reader(
           &s3, s3_config.bucket, session->client, rc);
@@ -990,6 +996,8 @@ std::string respond(const std::string& line, Session* session) {
       s3_config.access_key = jc::FindString(line, "access");
       s3_config.secret_key = jc::FindString(line, "secret");
       s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      s3_config.ca_file = jc::FindString(line, "ca_file");
+      s3_config.ca_path = jc::FindString(line, "ca_path");
       dmi_store::S3Client s3(s3_config);
       std::vector<dmi_catalog::PackRefData> refs;
       for (const std::string& element : jc::SplitElements(

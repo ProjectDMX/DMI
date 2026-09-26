@@ -202,8 +202,8 @@ not use a `readonly=1` profile: the reader sends its query limits
 (`max_rows_to_read`, `max_execution_time`, ...) as settings, which
 `readonly=1` refuses (Code 164, READONLY). The storage service always uses
 `clickhouse_user`. Every catalog request is bounded by
-`clickhouse_request_timeout_s`, which must be at least 10 s (twice the
-catalog's publish timeout). A refused connection is retried for any
+`clickhouse_request_timeout_s`, which must be at least twice
+`publish_timeout_s` (10 s at the default 5 s publish timeout). A refused connection is retried for any
 statement; a reset, or a 5xx that is not a permanent ClickHouse error (such
 as a row limit or a denied grant), for reads only; and a timeout never.
 The schedule's default factory creates a distinct `CaptureSchedule` for each
