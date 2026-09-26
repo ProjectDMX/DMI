@@ -35,7 +35,7 @@ import pytest
 
 # Module-level so the fake-S3 fixture registers in this module.
 from tests.test_native_s3_client import (  # noqa: E402
-    ACCESS, BUCKET, REGION, SECRET, STATE, fake_s3,
+    ACCESS, BUCKET, REGION, SECRET, STATE, fake_s3, fake_s3_tls, private_ca,
 )
 
 REPO = Path(__file__).resolve().parents[1]
@@ -1080,3 +1080,88 @@ def test_a_start_refused_the_lease_leaves_the_spool_unswept(fake_s3, tmp_path):
         second.start()  # the lease is free now, and the sweep runs
         second.stop()
         assert not in_progress.exists()
+
+
+# --- https with a private CA ----------------------------------------------------
+
+
+def test_a_64_mib_pack_over_https_with_a_private_ca_hydrates_exactly(
+        fake_s3_tls, private_ca, tmp_path):
+    """s3_ca_file reaches both halves: the service's upload and the reader.
+
+    17 x 4 MiB records stage as one pack over the client's 64 MiB multipart
+    threshold. The service uploads it over TLS to a store whose certificate
+    only the private CA vouches for, indexes it, and the reader hydrates
+    every capture byte-equal over the same TLS. A reader without the CA is
+    refused by the store's certificate.
+    """
+    import random
+
+    from dmi.storage.capture import CaptureMetadata
+
+    ca_file, _ca_path, _cert, _key = private_ca
+    records, record_bytes = 17, 4 << 20
+    spool_root = tmp_path / "spool"
+    payloads = {}
+    sink = _Driver(SINK_DRIVER)
+    try:
+        assert sink.call(
+            op="open", root=str(spool_root), max_bytes=1 << 40,
+            max_queue_records=records, max_queue_bytes=2 * records * record_bytes,
+            max_pack_bytes=2 * records * record_bytes,
+            max_pack_records=records, max_linger_ns=60_000_000_000,
+            overload="drop_newest", admission_timeout=-1)["ok"]
+        for index in range(records):
+            metadata = CaptureMetadata(
+                capture_id=f"tls-{index:04d}", tenant_id="t",
+                experiment_id="e", run_id="r", session_id="s",
+                request_id=f"q{index}", sequence_id=f"n{index}",
+                model_id="m", model_revision="mr", adapter_revision=None,
+                capture_policy_version="v", hook_name="resid_post",
+                layer_number=0, producer_rank=0, step_number=index,
+                token_start=index, token_end=index + 1, batch_position=0,
+                dtype="uint8", shape=(record_bytes,),
+                captured_at_ns=1_700_000_000_000_000_000 + index)
+            payload = random.Random(index).randbytes(record_bytes)
+            response = sink.call(op="submit", metadata=metadata.to_mapping(),
+                                 payload_b64=base64.b64encode(payload).decode())
+            assert response["admission"] == "accepted", response
+            payloads[metadata.capture_id] = payload
+        assert sink.call(op="flush", timeout=60)["ok"]
+        assert sink.call(op="close", timeout=60)["snapshot"][
+            "persisted_records"] == records
+    finally:
+        sink.close()
+    [pack] = _ready(spool_root)
+    assert pack.stat().st_size >= 64 << 20
+
+    with _catalog() as (_client, catalog):
+        config = _storage_config(fake_s3_tls, catalog.table_prefix,
+                                 s3_allow_insecure_http=False,
+                                 s3_ca_file=ca_file)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            service.flush(60.0)
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+        assert snapshot["uploaded_packs"] == 1, snapshot
+        assert snapshot["indexed_rows"] == records, snapshot
+        parts = [call for call in STATE.calls
+                 if call["method"] == "PUT" and "partNumber=" in call["path"]]
+        assert len(parts) >= 5, len(parts)  # multipart, 16 MiB parts
+
+        reader = _reader(config)
+        selection = reader.select(tenant_id="t")
+        captures = {capture.descriptor["capture_id"]: capture.payload
+                    for capture in reader.read(selection, byte_limit=1 << 30)}
+        assert sorted(captures) == sorted(payloads)
+        for capture_id, payload in payloads.items():
+            assert captures[capture_id] == payload, capture_id
+
+        untrusted = _reader(_storage_config(
+            fake_s3_tls, catalog.table_prefix, s3_allow_insecure_http=False))
+        with pytest.raises(Exception, match="(?i)certificate"):
+            untrusted.read(untrusted.select(tenant_id="t"),
+                           byte_limit=1 << 30)
