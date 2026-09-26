@@ -152,7 +152,8 @@ reader. The script's `measure_snapshot_shapes()` read `max(index_version)` from
 `{prefix}_capture_raw` rather than from `{prefix}_index_watermark`, so the
 "watermark" row timed a descriptor-table aggregate; it used two separate
 per-column `argMax` expressions where the reader resolves one `argMax` over a
-tuple of every column ordered on `(index_version, store_id, pack_id)`; it
+tuple of every column ordered on `(index_version, store_id, pack_id)` (an
+order since changed to `(member_version, store_id, pack_id, index_version)`); it
 carried no manifest membership, which is half of what a pinned read pays for;
 and it pinned at the raw maximum, so the historical case -- a pin below a later
 publish that re-indexed a capture -- never arose. Those numbers established a
