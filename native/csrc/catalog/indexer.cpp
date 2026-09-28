@@ -133,10 +133,6 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
   return commit(&planned);
 }
 
-void NativeIndexer::keep_lease() const {
-  if (config_.keep_lease) config_.keep_lease();
-}
-
 IndexPlan NativeIndexer::plan(const std::vector<PackRefData>& refs) {
   IndexPlan planned;
   IndexResultData& result = planned.result;
@@ -320,13 +316,11 @@ IndexResultData NativeIndexer::commit(IndexPlan* planned) {
   planned->rows.clear();
 
   if (!all_rows.empty() || !indexed.empty()) {
-    keep_lease();
     uint64_t version = allocate_version();
     uint64_t descriptor_inserts = 0;
     const auto write_batches = [&](uint64_t at_version) {
       for (size_t start = 0; start < all_rows.size();
            start += config_.max_rows_per_insert) {
-        keep_lease();
         std::vector<std::string> chunk(
             all_rows.begin() + static_cast<long>(start),
             all_rows.begin() +
@@ -377,7 +371,6 @@ IndexResultData NativeIndexer::commit(IndexPlan* planned) {
         // competitor published, so the head read on the first allocation
         // is stale at exactly the moment the cross-check matters.
         published_version_.reset();
-        keep_lease();
         version = allocate_version();
         write_batches(version);
         continue;
@@ -391,8 +384,6 @@ IndexResultData NativeIndexer::commit(IndexPlan* planned) {
           "could not publish a catalog snapshot after " +
               std::to_string(config_.max_publish_attempts) + " attempts");
     }
-    // No keep_lease() here: the publish has just renewed, and a renewal
-    // that failed now would leave the packs it made visible unrecorded.
     if (!indexed.empty()) {
       writer_->commit_packs(RenderPackRows(indexed), version);
     }

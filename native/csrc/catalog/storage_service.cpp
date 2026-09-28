@@ -83,7 +83,8 @@ class CaptureStorageService::LeaseScope {
       : service_(service),
         lock_(service->lease_mutex_),
         deadline_([service] { return service->writer_.lease_deadline_ns(); },
-                  kLeaseDeadlineBound) {
+                  kLeaseDeadlineBound,
+                  [service] { service->keep_lease_in_pass(); }) {
     service_->abandon_lease_if_expired();
   }
 
@@ -109,11 +110,7 @@ CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
       s3_(config_.s3),
       clickhouse_(std::make_shared<const ClickHouseClient>(config_.clickhouse)),
       writer_(clickhouse_, config_.writer),
-      indexer_(&s3_, &writer_, [this] {
-        IndexerConfig indexer = config_.indexer;
-        indexer.keep_lease = [this] { keep_lease_in_pass(); };
-        return indexer;
-      }()) {
+      indexer_(&s3_, &writer_, config_.indexer) {
   if (config_.spool_root.empty()) {
     throw std::invalid_argument("storage service: spool_root is required");
   }
@@ -704,12 +701,12 @@ void CaptureStorageService::keep_lease() {
   // Renewing from the cycle let the lease lapse during an outage and a rival
   // take the catalog. This thread renews on its own schedule instead, and
   // takes a fresh lease once a lost one can be replaced.
-  const auto tick =
-      std::chrono::nanoseconds(lease_tick_ns(config_.writer.lease_ttl_ns));
+  uint64_t wait_ns = lease_tick_ns(config_.writer.lease_ttl_ns);
   while (true) {
     {
       std::unique_lock<std::mutex> lock(wake_mutex_);
-      wake_.wait_for(lock, tick, [this] { return lease_stop_requested_; });
+      wake_.wait_for(lock, std::chrono::nanoseconds(wait_ns),
+                     [this] { return lease_stop_requested_; });
       if (lease_stop_requested_) return;
     }
     {
@@ -717,12 +714,28 @@ void CaptureStorageService::keep_lease() {
       if (failure_) return;
     }
     LeaseScope lease(this);  // publishes the lease state when done
+    // Wakes when the renewal falls due (a tick at most), not on a fixed
+    // tick: after a pass lets go of the lease lock, the renewal it leaves
+    // due has to start then, not up to a tick later.
+    const auto next_wake = [this] {
+      const uint64_t ttl = config_.writer.lease_ttl_ns;
+      const uint64_t tick = lease_tick_ns(ttl);
+      const uint64_t sent = writer_.lease_sent_ns();
+      if (sent == 0) return tick;
+      const uint64_t due = sent + ttl / 3;
+      const uint64_t now = steady_ns();
+      return std::clamp<uint64_t>(due > now ? due - now : 0, 1'000'000ull,
+                                  tick);
+    };
     if (writer_.held_lease() == nullptr) {
       ensure_publisher_lease();
+      wait_ns = next_wake();
       continue;
     }
+    wait_ns = lease_tick_ns(config_.writer.lease_ttl_ns);
     try {
       renew_lease_if_due();
+      wait_ns = next_wake();
     } catch (const CatalogError& exc) {
       if (is_lease_refusal(exc)) {
         // The coordinator dropped the lease: a live foreign head refused
@@ -742,17 +755,20 @@ void CaptureStorageService::keep_lease() {
 
 void CaptureStorageService::renew_lease_if_due() {
   // Due a third of the TTL after the claim that stamped the lease row was
-  // sent -- this thread's last renewal, or the one a publish made before
-  // its fenced statements -- as the writer records it, so nothing but a
-  // confirmed claim moves the schedule. The lease thread looks every sixth
-  // of the TTL, so with the lease lock free a renewal starts within half the
-  // TTL of that send, and has until the lease deadline to be answered: the
-  // renewal window the constructor checks (lease_coordinator.h). A stretch
-  // under the lease lock delays it, but every request in such a stretch is
-  // bounded by the same deadline, and a pass renews through the indexer's
-  // keep_lease hook before each catalog write. A failed renewal costs the
-  // lease at once: a refusal drops it in the coordinator, and any other
-  // error quarantines the writer (renew_for_publish).
+  // sent -- the last renewal, or the one a publish made before its fenced
+  // statements -- as the writer records it, so nothing but a confirmed
+  // claim moves the schedule. The lease thread wakes when it falls due, and
+  // at least every sixth of the TTL, so with the lease lock free a renewal
+  // starts within half the TTL of that send (in practice at a third), and
+  // has until the lease deadline to be answered: the renewal window the
+  // constructor checks (lease_coordinator.h). While a stretch holds the
+  // lease lock, this runs before every request it sends (LeaseScope's
+  // before_request hook), reads included, so the lease is never more than
+  // a third of the TTL plus one request old when a renewal starts -- not
+  // several requests' worth, which a slow but healthy catalog could not fit
+  // a renewal after. A failed renewal costs the lease at once: a refusal
+  // drops it in the coordinator, and any other error quarantines the writer
+  // (renew_for_publish).
   const uint64_t ttl = config_.writer.lease_ttl_ns;
   const uint64_t sent = writer_.lease_sent_ns();
   if (ttl == 0 || sent == 0 || steady_ns() - sent < ttl / 3) return;
@@ -764,6 +780,7 @@ void CaptureStorageService::renew_lease_if_due() {
 }
 
 void CaptureStorageService::keep_lease_in_pass() {
+  // What it throws fails the request it ran for, and so the stretch.
   try {
     renew_lease_if_due();
   } catch (const CatalogError&) {

@@ -33,12 +33,6 @@ struct IndexerConfig {
   // published head to move between an allocation and its publish, which
   // only something outside this call can do. Left empty, this is nothing.
   std::function<void(uint64_t)> after_allocate;
-  // Called before each catalog write commit() makes -- the version claim,
-  // each descriptor chunk, the inventory commit -- so that a long pass can
-  // renew its lease when that falls due, instead of running the lease down
-  // while its caller holds the lease lock. The publish renews on its own.
-  // What it throws propagates. Unset: nothing.
-  std::function<void()> keep_lease;
 };
 
 struct IndexFailureData {
@@ -96,7 +90,6 @@ class NativeIndexer {
 
  private:
   uint64_t allocate_version();
-  void keep_lease() const;
 
   dmi_store::S3Client* s3_;
   CatalogWriter* writer_;

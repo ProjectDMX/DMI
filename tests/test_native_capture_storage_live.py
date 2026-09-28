@@ -279,10 +279,11 @@ class _Switch:
     """A TCP forwarder in front of an HTTP server -- ClickHouse's HTTP port,
     or the fake S3 -- that can be cut (connections refused), stalled
     (connections accepted, never answered), made to hold lease INSERTs back
-    and deliver them late, to stall only the requests a predicate picks, or
-    to hold the first request a predicate picks back for a while. Every
-    native client opens one connection per request, so one request is one
-    connection here."""
+    and deliver them late, to stall only the requests a predicate picks, to
+    hold the first request a predicate picks back for a while, or to hold
+    every request back by a delay a function picks. Every native client
+    opens one connection per request, so one request is one connection
+    here."""
 
     def __init__(self, host: str, port: int):
         self._target = (host, port)
@@ -297,6 +298,9 @@ class _Switch:
         # (predicate, seconds): the first matching request reaches the server
         # only that much later; its answer is relayed if anyone still listens.
         self._slow_once = None
+        # A function of one whole request: the seconds it reaches the
+        # server late (0 for at once); its answer is relayed as usual.
+        self._delay_by = None
         # time.monotonic() of every request stall_requests() held.
         self.stalled: list[float] = []
         self._lock = threading.Lock()
@@ -326,7 +330,8 @@ class _Switch:
                 client.close()
                 continue
             if (self._late_by > 0 or self._stall_if is not None
-                    or self._slow_once is not None):
+                    or self._slow_once is not None
+                    or self._delay_by is not None):
                 threading.Thread(target=self._look_then_route,
                                  args=(client,), daemon=True).start()
                 continue
@@ -360,8 +365,8 @@ class _Switch:
         deliver_lease_inserts_late() reaches the server only after that delay
         -- long after the client gave up on it -- and nobody hears the
         answer; a request stall_requests() picks is never answered; the first
-        request slow_once() picks is forwarded late; anything else goes
-        straight through."""
+        request slow_once() picks is forwarded late, and each request by
+        what delay_requests() says; anything else goes straight through."""
         request = b""
         continued = False
         try:
@@ -402,6 +407,9 @@ class _Switch:
         if slow is not None and slow[0](request):
             self._slow_once = None
             time.sleep(slow[1])
+        delay_by = self._delay_by
+        if delay_by is not None and (delay := delay_by(request)) > 0:
+            time.sleep(delay)
         late_by = self._late_by
         late = (late_by > 0 and b"INSERT INTO" in request
                 and b"_publisher_lease" in request)
@@ -442,6 +450,10 @@ class _Switch:
         """Forward the first request `predicate` picks `seconds` late."""
         self._slow_once = (predicate, seconds)
 
+    def delay_requests(self, delay_by):
+        """Forward every request `delay_by(request_bytes)` seconds late."""
+        self._delay_by = delay_by
+
     def cut(self):
         self._up = False
         with self._lock:
@@ -465,6 +477,7 @@ class _Switch:
         self._late_by = 0.0
         self._stall_if = None
         self._slow_once = None
+        self._delay_by = None
 
     def close(self):
         self.cut()
@@ -1545,6 +1558,66 @@ def test_the_lease_renews_until_the_loops_last_cycle_is_done(
         assert not _held_but_dead(log), log
         assert snapshot["indexed_packs"] == 1, snapshot
         assert snapshot["lease_state"] == "released", snapshot
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert sorted(captures) == sorted(tensors)
+
+
+def _slow_catalog(insert_s: float, read_s: float):
+    """A delay_requests() function: a catalog slow but healthy, every INSERT
+    answered insert_s late and every SELECT read_s late."""
+    def _delay(request: bytes) -> float:
+        body = request.partition(b"\r\n\r\n")[2]
+        if body.startswith(b"INSERT"):
+            return insert_s
+        if body.startswith(b"SELECT"):
+            return read_s
+        return 0.0
+    return _delay
+
+
+def test_a_slow_but_healthy_catalog_keeps_its_lease_through_index_passes(
+        fake_s3, tmp_path):
+    """Every request made under the lease lock has to be answered by the
+    lease deadline, and a pass renewed only at the indexer's keep_lease hook,
+    before its catalog writes. Between two hooks ran several requests with
+    no chance to renew -- allocate_version's two max() reads, its claim
+    INSERT and read-back; the publish's watermark INSERT, read-backs and the
+    inventory commit -- so against a catalog slow but healthy the renewal
+    at the next hook started with too little time left, timed out, and
+    quarantined the lease, pass after pass: flush() never drained. main
+    drained it, bounding nothing. The renewal is now checked before every
+    request made under the lease lock, reads included. Scaled 1/5: 0.6 s
+    INSERTs and 0.2 s reads against a 3 s TTL are 3 s and 1 s at the 15 s
+    default."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (client, catalog):
+        knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
+                     publish_timeout_s=1, clickhouse_request_timeout_s=20.0)
+        warm = _service(_storage_config(fake_s3, catalog.table_prefix,
+                                        **knobs), tmp_path / "warm")
+        warm.start()
+        warm.stop()
+
+        switch.delay_requests(_slow_catalog(0.6, 0.2))
+        service = _service(_storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            **knobs), spool_root)
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(4))  # two packs
+            log = _sample_during(lambda: service.flush(60.0), service,
+                                 client, catalog.table_prefix, every=0.2)
+            snapshot = service.snapshot()
+            service.rethrow_if_failed()
+        finally:
+            switch.close()
+            service.stop()
+
+        assert {state for _, state, _ in log} == {"held"}, log
+        assert not _held_but_dead(log), log
+        assert snapshot["indexed_packs"] == 2, snapshot
+        assert snapshot["lease_timeouts"] == 0, snapshot
         captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
         assert sorted(captures) == sorted(tensors)
 

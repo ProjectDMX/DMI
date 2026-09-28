@@ -62,6 +62,14 @@ uint64_t steady_now_ns();
 // The publisher lease is what uses it (lease_coordinator.h): while a lease is
 // held, every request its holder makes has to be answered before the lease
 // row can expire, not only the lease's own statements.
+//
+// A scope may also carry a hook that execute() runs once before each request
+// it sends, before the deadline is read -- so the hook can move it: the
+// storage service renews its lease there when that falls due, whatever the
+// request. Only the innermost scope's hook runs, so a scope nested inside
+// one (the lease coordinator's, around a renewal the hook started) keeps the
+// hook from running for its own requests; and a hook never runs inside
+// itself.
 class RequestDeadline {
  public:
   // A fixed deadline, steady ns.
@@ -69,7 +77,8 @@ class RequestDeadline {
   // A deadline read afresh before every request attempt, so that its owner
   // can move it while the scope lives (a lease that renews mid-pass). 0
   // means no deadline is in force at the moment.
-  RequestDeadline(std::function<uint64_t()> deadline_ns, std::string bound);
+  RequestDeadline(std::function<uint64_t()> deadline_ns, std::string bound,
+                  std::function<void()> before_request = {});
   ~RequestDeadline();
   RequestDeadline(const RequestDeadline&) = delete;
   RequestDeadline& operator=(const RequestDeadline&) = delete;
@@ -77,11 +86,15 @@ class RequestDeadline {
   // The tightest deadline in force on this thread, 0 if none; `bound`, when
   // given, receives what set it.
   static uint64_t current(std::string* bound = nullptr);
+  // Runs the innermost scope's before_request hook, if it has one and it is
+  // not already running. What the hook throws propagates.
+  static void before_request();
 
  private:
   uint64_t fixed_ns_ = 0;
   std::function<uint64_t()> moving_ns_;
   std::string bound_;
+  std::function<void()> before_request_;
   RequestDeadline* outer_;
 };
 
@@ -199,7 +212,8 @@ class ClickHouseClient {
   // milliseconds left (rounded down, so never past it), no attempt starts
   // with less than a millisecond left, and no backoff sleeps past it -- the
   // last attempt's error is thrown instead, saying so. A timeout's message
-  // names the bound that ended it.
+  // names the bound that ended it. The innermost scope's before_request
+  // hook runs first, once per call.
   //
   // Reads also carry wait_end_of_query=1, so the server buffers the result
   // and an exception part-way through it arrives as an error status rather

@@ -44,10 +44,11 @@
 // Bounded by the lease. Every catalog request the service makes while it
 // holds the lease -- the renewal's own, and every one an index pass or a
 // reconcile sends under the lease lock -- has to be answered by the lease
-// deadline (lease_coordinator.h), since the lease cannot renew while that
-// lock is held: so a catalog that stops answering fails the stretch, and the
-// lease quarantines, while its row still keeps rivals out. A lease whose
-// deadline passes unrenewed is abandoned, never reported held (LeaseScope).
+// deadline (lease_coordinator.h), since while that lock is held the lease
+// renews only between those requests, before each one that finds it due:
+// so a catalog that stops answering fails the stretch, and the lease
+// quarantines, while its row still keeps rivals out. A lease whose deadline
+// passes unrenewed is abandoned, never reported held (LeaseScope).
 // An index pass reads its packs from the object store without the lock, so
 // a stalled read cannot hold the renewal off either. Claims made with no
 // lease are bounded by min(request timeout, lease_ttl / 3) per request; a
@@ -221,9 +222,11 @@ class CaptureStorageService {
   // Holds lease_mutex_ for a stretch of catalog work, and bounds every
   // request the thread makes meanwhile by the held lease's deadline -- read
   // afresh per request, so a renewal inside the stretch extends it at once.
-  // A lease whose deadline has passed is abandoned on the way in and on the
-  // way out, so it is neither used nor reported held; the lease state is
-  // published on the way out. Every use of writer_'s lease goes through one.
+  // Before each request it renews the lease if that has fallen due
+  // (keep_lease_in_pass). A lease whose deadline has passed is abandoned on
+  // the way in and on the way out, so it is neither used nor reported held;
+  // the lease state is published on the way out. Every use of writer_'s
+  // lease goes through one.
   class LeaseScope;
 
   void loop();
@@ -240,7 +243,8 @@ class CaptureStorageService {
   void reconcile();
   void keep_lease();          // the lease thread's body
   void renew_lease_if_due();  // requires lease_mutex_
-  // The indexer's keep_lease hook: renew_lease_if_due() inside a pass.
+  // LeaseScope's before_request hook: renew_lease_if_due() before each
+  // request a stretch under the lease lock sends.
   void keep_lease_in_pass();  // requires lease_mutex_
   // Gives up a held lease whose deadline has passed. Requires lease_mutex_.
   void abandon_lease_if_expired();

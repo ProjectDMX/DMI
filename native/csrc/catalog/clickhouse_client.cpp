@@ -124,6 +124,8 @@ std::string url_encode(const std::string& value) {
 // The innermost RequestDeadline on this thread; each links to the one it
 // nests in.
 thread_local RequestDeadline* innermost_deadline = nullptr;
+// Set while a before_request hook runs on this thread.
+thread_local bool in_before_request = false;
 
 // "60 s", "0.25 s": a timeout for a message.
 std::string seconds_text(double seconds) {
@@ -244,8 +246,10 @@ RequestDeadline::RequestDeadline(uint64_t deadline_ns, std::string bound)
 }
 
 RequestDeadline::RequestDeadline(std::function<uint64_t()> deadline_ns,
-                                 std::string bound)
+                                 std::string bound,
+                                 std::function<void()> before_request)
     : moving_ns_(std::move(deadline_ns)), bound_(std::move(bound)),
+      before_request_(std::move(before_request)),
       outer_(innermost_deadline) {
   innermost_deadline = this;
 }
@@ -264,6 +268,18 @@ uint64_t RequestDeadline::current(std::string* bound) {
     }
   }
   return tightest;
+}
+
+void RequestDeadline::before_request() {
+  const RequestDeadline* scope = innermost_deadline;
+  if (scope == nullptr || !scope->before_request_ || in_before_request) {
+    return;
+  }
+  struct Running {
+    Running() { in_before_request = true; }
+    ~Running() { in_before_request = false; }
+  } running;
+  scope->before_request_();
 }
 
 void validate(const ClickHouseConnection& c) {
@@ -447,6 +463,9 @@ ClickHouseClient::~ClickHouseClient() = default;
 std::vector<Row> ClickHouseClient::execute(
     const std::string& query, const Params& params,
     const std::map<std::string, std::string>& settings, int* attempts) const {
+  // First, so that what it does -- a lease renewal -- moves the deadline
+  // before this request reads it.
+  RequestDeadline::before_request();
   const std::string statement = substitute(query, params);
   const bool read = is_read_statement(statement);
 
