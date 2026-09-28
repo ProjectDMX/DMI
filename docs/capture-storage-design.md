@@ -1611,7 +1611,11 @@ so the groups and their resolution are unchanged: that is the same immutability
 rule, below, that makes the pre-aggregation filters safe. The Python reference
 reader keeps the single-phase shape, so the parity suite compares the two
 shapes directly. Each page still scans the rows past the cursor. Removing that
-needs index-usable cursor bounds.
+needs index-usable cursor bounds. Each query builds the join's members set, so
+a page builds it twice. On a 2.1M-row corpus that costs 19-28% on selective
+pages at 20k packs, is mixed at 100k packs, and is 2.7-3.7x faster than the
+`IN` set it replaced at 1M packs; see *Native search pages over the snapshot
+join* in `benchmarks.md`.
 
 The two queries must filter alike. If the inner query drops a filter that the
 outer one keeps, such as snapshot membership or a hook filter, its `LIMIT` fills

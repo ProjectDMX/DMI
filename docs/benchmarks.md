@@ -187,6 +187,63 @@ Core summaries run at roughly 80–140 M elements/s depending on dtype
 the insert sweep, these are loopback numbers: repeat them on representative
 hardware and duplicate ratios before treating any as a capacity claim.
 
+**Native search pages over the snapshot join (2026-09-28).** A pinned read
+ranks a capture's packs by `member_version`, the version at which each pack was
+first published (see *The ranking version* in `capture-storage-design.md`). To
+get that version, the native reader now joins `*_capture_raw` to a members
+subquery, which runs `min(index_version)` over the paired manifest rows, grouped
+on `(store_id, pack_id)`. Before, it filtered with `(store_id, pack_id) IN
+(<manifest>)`. Both queries of the two-phase page read the join, so every page
+builds the members set twice. What that costs depends on how many packs the
+manifest holds.
+
+The corpus was synthetic and built by SQL: 2,000,000 captures in `P` packs
+published over 200 versions. On top of that, 5% of the captures are
+re-described by a newer pack published five versions later. 1% of the packs
+were rewritten at a version that was never published, and another 1% were
+rewritten and published again. After `OPTIMIZE FINAL` the table holds
+2,100,000 `capture_raw` rows. Each build's `search` statement was captured from
+`system.query_log` and re-run nine times, interleaved, with its own settings
+plus `use_query_condition_cache=0`. The figures below are the median
+`query_duration_ms` for a page of `limit=100`. A first page has no cursor, and
+a mid page sets its cursor at capture 1,000,000. "hook" filters on the tenant
+and one of four hooks, and "layer" filters on the tenant and one of 32 layers.
+The host was the reference host above, running ClickHouse 25.12.2.
+
+| Packs | first | first, hook | first, layer | mid | mid, hook | mid, layer | members set, one build |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 20k | 113 → 109 | 56 → 70 | 46 → 59 | 103 → 105 | 58 → 69 | 52 → 66 | 2 → 11 |
+| 100k | 168 → 166 | 110 → 100 | 100 → 88 | 155 → 167 | 113 → 104 | 103 → 96 | 4 → 26 |
+| 1M | 952 → 346 | 870 → 266 | 881 → 241 | 938 → 332 | 877 → 250 | 874 → 244 | 6 → 53 |
+
+Each cell is main (`8b7991d`) → the join, in ms. The last column times the
+membership subquery on its own: main's `IN` set, then the join's grouped
+members.
+
+- **Rows read are identical** in every cell, for example 2,188,994 at 20k packs
+  and 6,128,594 at 1M. `EXPLAIN indexes = 1` shows the same granules on
+  `capture_raw` for both builds (1/258 on a first page, 2/258 on a selective
+  mid page). The only difference is that main's primary-key condition carries
+  the `(store_id, pack_id)` set, 40,000 elements at 20k packs and 2,000,000 at
+  1M, where the join reads the manifest on its own.
+- **At 20k packs, selective pages are 19-28% slower** (+11 to +14 ms), which is
+  about two builds of the members set. Unfiltered pages are unchanged.
+- **At 100k packs the result is mixed, from 0.88x to 1.08x.** The members build
+  costs more, but so does main's larger key set. An independent review on a
+  differently shaped corpus measured 1.06-1.34x at 100k packs, so treat
+  20k-100k packs as a latency cost of up to about a third on selective pages.
+  Nothing is refused: `max_rows_to_read` sees the same row counts.
+- **At 1M packs the join is 2.7-3.7x faster,** because main spends most of each
+  page on its 2M-element key set.
+- **Page contents differ from main only where main ranks wrongly,** which is the
+  case this change fixes. That is a capture re-described by a newer pack while
+  its older pack was replayed, which main resolved back to the older pack: 1-10
+  rows of a 101-row page at 20k and 100k packs.
+
+Building the members set once per statement and sharing it between the two
+queries (a CTE or a named set) might remove the second build. It has not been
+measured.
+
 Baselines:
 
 - **HuggingFace Ideal** — vanilla HF `generate`, no observation (used as 1.0)
