@@ -402,8 +402,8 @@ def test_a_pack_whose_footer_names_another_tenant_is_refused(tmp_path: Path):
     the descriptors are built, nothing has ever compared what the pack CLAIMS
     to be against where it was found. Indexed, it would be admitted under the
     victim's tenant, and since the reader resolves a capture with `argMax` over
-    `(index_version, store_id, pack_id)` it can become the pack that capture
-    resolves to at every fresh watermark.
+    `(member_version, store_id, pack_id, index_version)`, newest pack first,
+    it can become the pack that capture resolves to at every fresh watermark.
     """
     store, ref = _pack_at(
         tmp_path,

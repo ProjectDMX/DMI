@@ -150,6 +150,15 @@ class CatalogError : public std::runtime_error {
   Kind kind_;
 };
 
+// The publisher lease is gone: a claim or renewal met another holder
+// (kHeld), or this writer holds none or was fenced out (kLease). The storage
+// service rethrows these so that the pass they cut short is owed, so code
+// that wraps a failed request in another error has to keep these kinds.
+inline bool is_lease_refusal(const CatalogError& exc) {
+  return exc.kind() == CatalogError::Kind::kHeld ||
+         exc.kind() == CatalogError::Kind::kLease;
+}
+
 std::string new_uuid_v4();
 
 class LeaseCoordinator {

@@ -128,12 +128,52 @@ def inline_chunks(
         yield chunk
 
 
-def membership_predicate(manifest: str, watermark: str, *, bounded: bool) -> str:
+def _published_manifest_rows(manifest: str, watermark: str, *, bounded: bool) -> str:
+    """The manifest rows whose own publish reached the watermark log."""
     manifest_bound = "index_version <= %(watermark)s AND " if bounded else ""
     watermark_bound = " WHERE index_version <= %(watermark)s" if bounded else ""
     return (
-        "(store_id, pack_id) IN ("
-        f"SELECT store_id, pack_id FROM {manifest} "
+        f"FROM {manifest} "
         f"WHERE {manifest_bound}(index_version, publish_id) IN "
-        f"(SELECT index_version, publish_id FROM {watermark}{watermark_bound}))"
+        f"(SELECT index_version, publish_id FROM {watermark}{watermark_bound})"
+    )
+
+
+def membership_predicate(manifest: str, watermark: str, *, bounded: bool) -> str:
+    return (
+        "(store_id, pack_id) IN ("
+        "SELECT store_id, pack_id "
+        f"{_published_manifest_rows(manifest, watermark, bounded=bounded)})"
+    )
+
+
+# The column `member_versions` names a pack's membership version under.
+MEMBER_VERSION = "member_version"
+
+
+def member_versions(manifest: str, watermark: str) -> str:
+    """The packs inside the snapshot at ``%(watermark)s``, one row each, with
+    the FIRST version at which a publish that reached the watermark made the
+    pack a member.
+
+    The same manifest rows ``membership_predicate`` admits, bounded at the
+    watermark, so the two cannot disagree about what is inside a snapshot;
+    this one also says WHEN each pack got there, which is what the reader
+    ranks a capture's packs by.
+
+    The first publish, not the newest. A pass that replays an already-published
+    pack -- a crash before ``commit_packs``, an outcome-unknown publish that
+    landed, a rebuild -- publishes it again at a fresh version. Ranked on its
+    newest publish, a pack superseded in the meantime by a second pack
+    describing the same capture would win again at every head from the
+    replay on. A replay adds nothing to the catalog, so it must not move a
+    pack's rank; ``min`` fixes the rank once the pack is first published.
+    Either way a pin is stable: a later publish lands above it and the bound
+    excludes it. A genuine re-capture is a new pack and a mirror is another
+    store, so each still gets a fresh first publish.
+    """
+    return (
+        f"SELECT store_id, pack_id, min(index_version) AS {MEMBER_VERSION} "
+        f"{_published_manifest_rows(manifest, watermark, bounded=True)} "
+        "GROUP BY store_id, pack_id"
     )

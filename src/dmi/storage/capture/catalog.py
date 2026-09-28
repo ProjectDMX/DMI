@@ -526,18 +526,23 @@ class CatalogIndexer:
 
         A losing publish made nothing visible, so recovery is a fresh version
         and another attempt -- and the DESCRIPTORS are rewritten at that
-        version, not only the manifest rows. VISIBILITY does not need the
-        rewrite (membership decides it, and membership is rewritten at the
-        version that wins), but SUPERSESSION does: ``index_version`` leads
-        ``clickhouse_reader._RESOLUTION_ORDER``, the primary ordering between
-        two rows describing one capture in two DIFFERENT packs. Rows left at
-        the lost version would rank below another pack's rows written between
-        the lost and the winning version, so the reader would resolve a capture
-        to the OLDER publish's pack -- and to its locator, which is exactly
-        what may differ. The rewrite is byte-identical rows at the new version;
-        the superseded rows share their full sort key with them (pack identity
-        included), so the ReplacingMergeTree collapses each pair to the new
-        version and ``argMax`` resolves the same rows in the meantime.
+        version, not only the manifest rows. Neither visibility nor
+        supersession depends on that rewrite any more. Membership decides
+        visibility, and it is rewritten at the version that wins. Supersession
+        ranks a pack by the version its first publish reached the watermark at
+        (``member_version`` in ``clickhouse_reader._RESOLUTION_ORDER``), read
+        from the manifest, and not by the ``index_version`` its rows were
+        written at. It used to rank on the rows' version, and that is what
+        broke on a REPLAY: a pass re-indexing a pack that was already published
+        -- after a crash before ``commit_packs`` below, or an outcome-unknown
+        publish that landed -- writes its rows at a new, higher version before
+        publishing, so a pack that had already been superseded outranked the
+        newer pack inside snapshots it could no longer change, pinned ones
+        included. The rewrite still keeps a published pack's rows at the
+        version that published them. They are byte-identical rows that share
+        their full sort key (pack identity included) with the rows at the lost
+        version, so the ReplacingMergeTree collapses each pair to the new
+        version.
 
         A publish that CONFLICTED is the opposite of a loss: it is visible, by
         that error's own contract, so its packs enter the replay inventory

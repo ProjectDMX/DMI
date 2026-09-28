@@ -54,11 +54,6 @@ bool is_pack_id(const std::string& value) {
   return dmi_pack::ParseUuid(value, &bytes, &canonical) && canonical == value;
 }
 
-bool is_lease_refusal(const CatalogError& exc) {
-  return exc.kind() == CatalogError::Kind::kHeld ||
-         exc.kind() == CatalogError::Kind::kLease;
-}
-
 // The lease thread's tick: the longest it sleeps, and the retry interval for
 // a claim another holder refused or one that wrote nothing -- a sixth of the
 // TTL. A renewal falls due a third of the TTL after the claim that stamped

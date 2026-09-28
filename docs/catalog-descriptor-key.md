@@ -87,11 +87,22 @@ as everything else".
 > merge had put both rows in one part.
 >
 > The shipped projection is **one** `argMax` over a tuple of every resolved
-> column, ordered on the tuple `(index_version, store_id, pack_id)`. The tuple
-> key restores a total order (supersession is unchanged -- `index_version`
-> still leads); the single aggregate makes a mixed descriptor -- `store_id`
-> from one row and `object_key` from another -- structurally impossible rather
-> than merely unobserved. Twenty-seven aggregates ordered on the tuple are also
+> column, ordered on the tuple `(member_version, store_id, pack_id,
+> index_version)`. The tuple key restores a total order; the single aggregate
+> makes a mixed descriptor -- `store_id` from one row and `object_key` from
+> another -- structurally impossible rather than merely unobserved.
+>
+> Supersession no longer leads with a row's `index_version`. `e93a2c8`'s key
+> was `(index_version, store_id, pack_id)`, and a pass that replays an
+> already-published pack (a crash before `commit_packs`, an outcome-unknown
+> publish that landed, a rebuild) rewrites its rows at a fresh, higher version,
+> which let a superseded pack outrank the newer one inside snapshots already
+> pinned. `member_version` is instead the version at which the pack's FIRST
+> publish reached the watermark, at or below the pin -- `min(index_version)`
+> over the manifest rows paired with the watermark log. First rather than
+> newest, so that a replay which does publish cannot re-promote the superseded
+> pack at every later head. `index_version` stays last, so within one pack a
+> read resolves the row a merge keeps. Twenty-seven aggregates ordered on the tuple are also
 > correct and cost +291% at a 100-row page, because ClickHouse compares a tuple
 > ordering argument through a generic `Field` once per row per aggregate. See
 > `clickhouse_reader._projection`.
@@ -253,7 +264,11 @@ goes without a contract change:
   locator, which is exactly the field that may differ. The rewrite is
   byte-identical rows at the winning version; the superseded rows share their
   full sort key with them (pack identity included), so the engine collapses
-  each pair and `argMax` resolves the new version in the meantime.
+  each pair and `argMax` resolves the new version in the meantime. (That was
+  the resolution order when this shipped. The reader now ranks a pack by its
+  first paired publish, `member_version`, read from the manifest -- see the
+  note under the projection above -- so supersession no longer depends on the
+  rewrite either.)
 - **The publish verifies that it owns the version, not that the version is
   occupied.** Each attempt mints a `publish_id`, writes it on its manifest rows
   and on its watermark row, and reads that column back. The check it replaced --
