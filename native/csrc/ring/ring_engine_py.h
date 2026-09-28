@@ -280,9 +280,11 @@ public:
     // Per-hook reservation: claim `nbytes` of payload ring + 1 task entry
     // for an upcoming producer kernel launch.  Used by the safety net
     // when force_eager is on and the spec is dynamic-shape.  Advances
-    // cpu_payload_head/cpu_task_head atomically.  Throws std::logic_error,
-    // reserving nothing, when no task entry is free: the producer would
-    // overwrite an unconsumed READY word.  Callers flush_and_wait() first.
+    // cpu_payload_head/cpu_task_head atomically.  Reserves nothing and
+    // throws when no task entry is free, since the producer would
+    // overwrite an unconsumed READY word: the drain's failure when the
+    // drain has failed, std::logic_error otherwise.  Callers
+    // flush_and_wait() first.
     void reserve_one(uint64_t nbytes);
 
     // Synchronise the current CUDA stream + force drain to process all

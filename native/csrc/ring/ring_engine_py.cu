@@ -955,12 +955,21 @@ uint64_t RingEnginePy::available_task_slots() const {
 // drain.reserve takes mgmt_mu_ internally.
 void RingEnginePy::reserve_one(uint64_t nbytes) {
     refuse_on_record_ring(impl_->record_mode, "legacy per-hook reservation");
+    auto& drain = impl_->engine.drain_thread();
     if (available_task_slots() == 0) {
+        // A failed drain never frees an entry again, and on a legacy ring
+        // its flush_and_wait returns at once without raising (the failure
+        // went to stderr), so a caller that just flushed lands here.  Name
+        // that failure rather than asking for the flush it already made.
+        drain.rethrow_drain_failure();
         throw std::logic_error(
-            "reserve_one: no free task-ring entry; flush_and_wait first");
+            "reserve_one: every task-ring entry is reserved; call "
+            "flush_and_wait first. A flush frees only entries a producer "
+            "published, so right after one the entries belong to "
+            "reservations nothing publishes, such as a step that failed "
+            "after prepare_step");
     }
-    impl_->engine.drain_thread().reserve(
-        ring::align_up(nbytes, ring::PAYLOAD_ALIGN), 1);
+    drain.reserve(ring::align_up(nbytes, ring::PAYLOAD_ALIGN), 1);
 }
 
 // Synchronise the current CUDA stream so all queued producer kernels
