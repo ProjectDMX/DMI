@@ -6,7 +6,7 @@
 (*   native/csrc/catalog/version_allocator.cpp:49-89  (allocate_version)   *)
 (*   native/csrc/catalog/version_allocator.h:5-7      (the claim we check) *)
 (*   native/csrc/catalog/clickhouse_client.cpp:374    (deciding_read)      *)
-(*   native/csrc/catalog/catalog_writer.cpp:587-620   (watermark publish)  *)
+(*   native/csrc/catalog/catalog_writer.cpp:583-628   (watermark publish)  *)
 (*                                                                         *)
 (* The C++ loop, verbatim in structure:                                    *)
 (*                                                                         *)
@@ -233,8 +233,9 @@ Distinct ==
 (*     "exactly one claim row stands at a returned version".               *)
 (*     EXPECTED: FALSE, even under Linearizable.  A loser's INSERT can     *)
 (*     land after the winner's read-back.  This is the invariant           *)
-(*     tests/test_native_catalog_lease_live.py:598-607 says is false       *)
-(*     ("DURABLY CLAIMED, not solely claimed").                            *)
+(*     tests/test_native_catalog_lease_live.py:653-662 says is false       *)
+(*     ("DURABLY CLAIMED, not solely claimed"; the test's docstring at     *)
+(*     :605-609 makes the same point).                                     *)
 (***************************************************************************)
 SoleRow ==
     \A a \in Allocators :

@@ -105,7 +105,7 @@ vars     == <<envVars, headVars, locVars, resVars, rivVars>>
 
 \* storage_service.cpp:65-67  lease_tick_ns(ttl) = max(ttl/6, 10ms).  The
 \* 10 ms floor only bites for a TTL under 60 ms, which the writer's own
-\* config precondition (catalog_writer.cpp:148-158) already forbids.
+\* config precondition (catalog_writer.cpp:148-160) already forbids.
 Tick      == IF TTL \div 6 > 0 THEN TTL \div 6 ELSE 1
 DueAfter  == TTL \div 3        \* storage_service.cpp:638
 LatchWin  == 2 * TTL           \* storage_service.cpp:735
@@ -254,9 +254,12 @@ RenewIfDue(s) ==
                               IF LatchNow(s) THEN "failed" ELSE "run"]
            /\ UNCHANGED <<headVars, myLid, qUntil, lastRenew, reacq, dropped>>
         \/ \* :625-628 unknown outcome.  catalog_writer.cpp:285-292
-           \* renew_for_publish(): ONE std::exception -- the first to outlast
-           \* the client's read retries -- quarantines the writer and
-           \* discards the lease.  There is no second try.
+           \* renew_for_publish(): ONE std::exception -- the first the client
+           \* does not retry away (it repeats a read after a transient
+           \* failure, and a write only if it never connected; never a
+           \* timeout) -- quarantines the writer and discards the lease.
+           \* The claim INSERT is a write, so its first failure after
+           \* connecting quarantines at once.  There is no second try.
            /\ CanUnknown
            /\ \E landed \in {TRUE, FALSE} :
                 /\ landed => CanLand(myLid[s])

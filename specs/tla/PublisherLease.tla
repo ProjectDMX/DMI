@@ -337,7 +337,7 @@ ManRead(p) ==
   /\ UNCHANGED <<rows, settled, now, lease, ctm, clid, chunk, ver, att,
                  manifest, wm, inflight, maxLanded, wmOutOfOrder, used>>
 
-(* THE visibility write -- catalog_writer.cpp:583-602.  Barrier AND fence AND
+(* THE visibility write -- catalog_writer.cpp:583-606.  Barrier AND fence AND
    the INSERT are ONE server-side statement, so both predicates are evaluated
    HERE, at admission.  The row lands in WmLand, possibly later: doc :496
    "A's watermark statement must evaluate the fence before B's lease row
