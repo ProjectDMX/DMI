@@ -1470,6 +1470,87 @@ def test_a_pass_whose_lease_changed_while_it_read_rereads_the_replay_guard(
         assert len(captures) == 4
 
 
+@pytest.mark.parametrize("after_conflict", [None, "transport"])
+def test_a_conflicted_publish_reports_the_conflict(
+        fake_s3, tmp_path, after_conflict):
+    """A publish that finds a second writer's row at its own version is
+    visible and must not be retried, so the indexer records its packs in the
+    inventory and raises kPublishConflict: a supervisor matching on it learns
+    that something else is writing the prefix.
+
+    If that inventory INSERT then fails in transport, the conflict is still
+    what the pass reports, with the failure in its message (catalog.py's
+    `raise conflict from commit_failure`). Left to propagate, the transport
+    error replaced it.
+
+    The conflict is real: a foreign watermark row lands at the pass's version
+    after the pass's own and before its owners read-back
+    (`conflict_at_publish`, in conformance_catalog's `index` op).
+    """
+    from tests.test_native_catalog_lease_live import CatalogDriver, _open
+
+    spool_root = tmp_path / "spool"
+    _stage(spool_root, range(4))  # two packs
+    store = _Driver(STORE_DRIVER)
+    try:
+        uploaded = store.call(
+            op="upload_pending", endpoint=fake_s3, bucket=BUCKET,
+            region=REGION, access=ACCESS, secret=SECRET, token=None,
+            insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
+            store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
+        assert uploaded["ok"], uploaded
+    finally:
+        store.close()
+    refs = uploaded["refs"]
+    assert len(refs) == 2, refs
+
+    with _catalog() as (client, catalog):
+        driver = CatalogDriver()
+        try:
+            _open(driver, catalog.table_prefix)
+            assert driver.call(op="ensure_schema")["ok"]
+            assert driver.call(op="acquire", holder="indexer")["ok"]
+            seam = {"conflict_at_publish": True}
+            if after_conflict is not None:
+                seam["after_conflict"] = after_conflict
+            result = driver.call(
+                op="index", refs=refs, endpoint=fake_s3, bucket=BUCKET,
+                region=REGION, access=ACCESS, secret=SECRET, insecure=True,
+                **seam)
+        finally:
+            driver.close()
+
+        def table(name):
+            return f"`{DATABASE}`.`{catalog.table_prefix}_{name}`"
+
+        # The conflict: two publishes at one version, the pass's own among
+        # them with its whole manifest, so its packs are visible.
+        conflicted = client.execute(
+            f"SELECT index_version FROM {table('index_watermark')} "
+            "GROUP BY index_version HAVING uniqExact(publish_id) = 2")
+        assert len(conflicted) == 1, conflicted
+        assert client.execute(
+            f"SELECT count() FROM {table('snapshot_manifest')} "
+            "WHERE index_version = %(version)s",
+            {"version": conflicted[0][0]}) == [(2,)]
+        recorded = client.execute(
+            f"SELECT count() FROM {table('pack_inventory_raw')}")[0][0]
+
+        assert not result["ok"], result
+        message = result["message"]
+        if after_conflict is None:
+            assert result["error"] == "SnapshotPublishConflictError", result
+            assert recorded == 2, result
+        else:
+            assert result["error"] == "SnapshotPublishConflictError", result
+            assert "was published by this writer" in message, result
+            assert ("recording its packs in the inventory then failed too"
+                    in message), result
+            assert "simulated connection reset" in message, result
+            assert recorded == 0, result
+
+
 def _lease_head_read(request: bytes) -> bool:
     return b"SELECT term, toString(lease_id)" in request
 

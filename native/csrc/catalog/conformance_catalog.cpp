@@ -11,9 +11,11 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -1044,6 +1046,61 @@ std::string respond(const std::string& line, Session* session) {
               {{"version", version + 1}});
         };
       }
+      // A second writer publishing the SAME version: its watermark row lands
+      // after this pass's own and before the pass reads the version's owners
+      // back, so publish_snapshot finds two publishes there and reports
+      // kPublishConflict -- visible, and never retried. That window is one
+      // round trip wide, so the seam sits in the request hook the storage
+      // service's lease scope uses (RequestDeadline's before_request), which
+      // runs before every request this thread sends: once the pass's row
+      // stands at its version, the next request, the owners read, finds the
+      // foreign row beside it.
+      //
+      // after_conflict then decides what the conflict path's inventory
+      // INSERT, the request after that read, meets:
+      //   "transport"      its connection fails.
+      struct ConflictSeam {
+        uint64_t version = 0;
+        enum { kWaiting, kConflicted, kDone } phase = kWaiting;
+      };
+      const auto seam = std::make_shared<ConflictSeam>();
+      std::function<void()> before_request;
+      if (jc::FindBool(line, "conflict_at_publish")) {
+        const std::function<void(uint64_t)> earlier =
+            index_config.after_allocate;
+        index_config.after_allocate = [seam, earlier](uint64_t version) {
+          if (earlier) earlier(version);
+          seam->version = version;
+        };
+        const auto client = session->client;
+        const std::string qualified = "`" + session->database + "`.`" +
+                                      session->table_prefix;
+        const std::string after_conflict =
+            jc::FindString(line, "after_conflict");
+        before_request = [seam, client, qualified, after_conflict] {
+          if (seam->version == 0 || seam->phase == ConflictSeam::kDone) return;
+          if (seam->phase == ConflictSeam::kConflicted) {
+            seam->phase = ConflictSeam::kDone;
+            if (after_conflict == "transport") {
+              throw ClickHouseError(
+                  "simulated connection reset while recording the packs");
+            }
+            return;
+          }
+          const std::vector<dmi_catalog::Row> own = client->execute(
+              "SELECT count() FROM " + qualified +
+                  "_index_watermark` WHERE index_version = %(version)s",
+              {{"version", seam->version}});
+          if (own.empty() || own[0].empty() || own[0][0] != "1") return;
+          client->execute(
+              "INSERT INTO " + qualified +
+                  "_index_watermark` (index_version, publish_id, "
+                  "published_at_ns, indexed_rows, indexed_packs) VALUES "
+                  "(%(version)s, generateUUIDv4(), 1, 0, 0)",
+              {{"version", seam->version}});
+          seam->phase = ConflictSeam::kConflicted;
+        };
+      }
       dmi_catalog::NativeIndexer indexer(&s3, &writer, index_config);
       dmi_catalog::IndexPlan plan = indexer.plan(refs);
       indexer.read(&plan);
@@ -1064,7 +1121,14 @@ std::string respond(const std::string& line, Session* session) {
         }
         writer.acquire_lease(holder);
       }
+      std::optional<dmi_catalog::RequestDeadline> seam_scope;
+      if (before_request) {
+        seam_scope.emplace([] { return uint64_t{0}; },
+                           "the conformance driver's conflict seam",
+                           before_request);
+      }
       const dmi_catalog::IndexResultData result = indexer.commit(&plan);
+      seam_scope.reset();
       out = ",\"result\":{\"requested_packs\":" +
             std::to_string(result.requested_packs) +
             ",\"skipped_packs\":" + std::to_string(result.skipped_packs) +
