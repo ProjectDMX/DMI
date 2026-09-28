@@ -121,8 +121,9 @@ PublisherLease LeaseCoordinator::claim_with_rival(
   if (owners == std::set<std::string>{lease_id}) {
     // rows[0] is this claim's own row, unordered and ungrouped though the
     // read is: every row at this term carries our lease_id, and we wrote one
-    // (the client never re-sends an INSERT, and CatalogWriter quarantines
-    // after one of unknown outcome rather than retrying). The expiry rule is
+    // (the client repeats an INSERT only when its connection was never made,
+    // so nothing reached the server, and CatalogWriter quarantines after one
+    // of unknown outcome rather than retrying). The expiry rule is
     // the minimum expires_at_ns under (term, lease_id), which differs from
     // any one row only once a release's tombstone shares the key, and none
     // can here: a release writes at the holder's own term and a claim always

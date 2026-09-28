@@ -640,8 +640,9 @@ void CaptureStorageService::renew_lease_if_due() {
   // lease at once whatever the cause. A refusal drops it in the coordinator,
   // and any ClickHouse error (transport, timeout, or a server error) takes
   // renew_for_publish()'s catch, which quarantines the writer on the first
-  // error that survives the client's retries (reads only; a write that may
-  // have reached the server is never retried).
+  // error that survives the client's retries (a write is repeated only when
+  // its connection was never made; one that may have reached the server
+  // never is).
   const uint64_t ttl = config_.writer.lease_ttl_ns;
   if (ttl == 0 || steady_ns() - last_renew_ns_ < ttl / 3) return;
   writer_.renew_lease();
