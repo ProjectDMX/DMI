@@ -69,13 +69,19 @@ uint64_t lease_deadline_ns(uint64_t sent_ns, uint64_t lease_ttl_ns,
                            uint64_t clock_skew_ns);
 
 // How long a renewal has between when it starts, at the latest, and the
-// lease deadline it must finish by. The storage service renews a third of
-// the TTL after the claim that stamped the row was sent and looks every
-// sixth, so a renewal starts within lease_ttl_ns / 2 of that send:
+// lease deadline it must finish by. The storage service's renewal falls due
+// a third of the TTL after the claim that stamped the row was sent: its
+// lease thread wakes for it, and a stretch holding its lease lock renews
+// before the next request it sends. Allowing a sixth of the TTL more for
+// whatever holds the lock between requests, a renewal is taken to start
+// within lease_ttl_ns / 2 of that send:
 //
 //   window = lease_ttl_ns / 2 - clock_skew_ns - kLeaseDeadlineMarginNs
 //
-// 0 when the skew leaves no time at all.
+// 0 when the skew leaves no time at all. It is the floor the configuration
+// is checked against, not a promise: a renewal that starts later still has
+// to finish by the deadline, and fails, while the row is live, if it
+// cannot.
 uint64_t renewal_window_ns(uint64_t lease_ttl_ns, uint64_t clock_skew_ns);
 
 // The storage service refuses a skew whose renewal window is shorter than

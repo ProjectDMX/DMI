@@ -303,6 +303,8 @@ class _Switch:
         self._delay_by = None
         # time.monotonic() of every request stall_requests() held.
         self.stalled: list[float] = []
+        # time.monotonic() of every connection refused while cut.
+        self.refused: list[float] = []
         self._lock = threading.Lock()
         self._sockets: set[socket.socket] = set()
         threading.Thread(target=self._accept, daemon=True).start()
@@ -327,6 +329,7 @@ class _Switch:
                     self._sockets.add(client)  # held open, never read
                 continue
             if not self._up:
+                self.refused.append(time.monotonic())
                 client.close()
                 continue
             if (self._late_by > 0 or self._stall_if is not None
@@ -1114,6 +1117,14 @@ def _held_but_dead(log):
     return [sample for sample in log if sample[1] == "held" and not sample[2]]
 
 
+def _quarantined_at(snapshot, ttl_s: float) -> float:
+    """When the writer quarantined, on time.monotonic()'s clock: the
+    quarantine ends one TTL after it began, on the same steady clock. More
+    precise than the first sample that saw it."""
+    assert snapshot["lease_state"] == "quarantined", snapshot
+    return snapshot["quarantined_until"] - ttl_s
+
+
 def _lease_row_left_s(client, prefix) -> float:
     """Seconds the newest lease row has left on the server's clock; negative
     once it has expired."""
@@ -1216,9 +1227,13 @@ def test_a_stalled_renewal_gives_up_while_the_lease_row_is_still_live(
             log = _sample_lease(service, client, catalog.table_prefix, 4.0,
                                 origin=stalled_at)
             assert not _held_but_dead(log), log
-            quarantined = [t for t, state, _ in log if state == "quarantined"]
-            assert quarantined and quarantined[0] < 3.0, log
             snapshot = service.snapshot()
+            # At the lease deadline, 2.9 s after start()'s claim was sent,
+            # a moment before stalled_at: before the row can have expired.
+            # From the quarantine itself, not the first sample to see it,
+            # which could come a sampling interval later.
+            quarantined_at = _quarantined_at(snapshot, 3.0) - stalled_at
+            assert 2.0 < quarantined_at < 2.95, (quarantined_at, log)
             assert "lease renewal failed" in snapshot["last_error"], snapshot
             assert "Timeout" in snapshot["last_error"], snapshot
             assert snapshot["failed"] is False, snapshot
@@ -1238,16 +1253,79 @@ def _catalog_insert_but_the_lease(request: bytes) -> bool:
     return body.startswith(b"INSERT") and b"_publisher_lease` (term" not in body
 
 
-def test_a_stall_inside_the_index_pass_gives_up_while_the_lease_row_is_live(
+def test_a_claim_that_wrote_nothing_goes_again_a_tick_later(
         fake_s3, tmp_path):
+    """A claim that failed before its INSERT went out -- here every
+    connection is refused -- wrote nothing, so it does not quarantine the
+    writer; and so that flush()'s fast cycles do not hammer a catalog that
+    cannot answer, the next claim waits a lease tick (a sixth of the TTL),
+    not a cycle."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        ttl = 6.0  # a 1 s tick
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            reconcile_on_start=False, lease_ttl_s=ttl, publish_timeout_s=1)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            _stage(spool_root, range(2))
+            switch.cut()
+            # The renewal fails and quarantines; once that ends, every claim
+            # fails to connect, and writes nothing.
+            _wait_for(lambda: service.snapshot()["lease_state"]
+                      == "quarantined", timeout_s=ttl)
+            _wait_for(lambda: service.snapshot()["lease_state"]
+                      == "reacquiring", timeout_s=ttl + 2)
+
+            def _flush():
+                try:
+                    service.flush(4.0)
+                except Exception:  # noqa: BLE001 -- only the traffic counts
+                    pass
+
+            flusher = threading.Thread(target=_flush, daemon=True)
+            watched_from = time.monotonic()
+            flusher.start()
+            flusher.join(timeout=10)
+            watched = time.monotonic() - watched_from
+            refused = [t for t in switch.refused if t >= watched_from]
+            snapshot = service.snapshot()
+        finally:
+            switch.close()
+            service.stop()
+
+        # Not quarantined by claims that wrote nothing.
+        assert snapshot["lease_state"] == "reacquiring", snapshot
+        # One claim a tick, of up to three connection attempts each (the
+        # client retries a refused connection): about 12 in 4 s, where
+        # flush()'s cycles, 50 ms apart, would make several times that.
+        assert len(refused) <= 3 * (watched / 1.0 + 2), (len(refused), watched)
+
+
+def _replay_guard_read(request: bytes) -> bool:
+    body = request.partition(b"\r\n\r\n")[2]
+    return (body.startswith(b"SELECT store_id, toString(pack_id) FROM")
+            and b"_pack_inventory" in body)
+
+
+@pytest.mark.parametrize("stalled", [_catalog_insert_but_the_lease,
+                                     _replay_guard_read],
+                         ids=["insert", "read"])
+def test_a_stall_inside_the_index_pass_gives_up_while_the_lease_row_is_live(
+        fake_s3, tmp_path, stalled):
     """The index pass holds the lease lock across its catalog requests -- the
     version claim, the descriptor INSERTs, the publish and its read-backs --
     and those were bounded only by the client's request timeout. One that
     stalled kept the lease thread from renewing: the row expired while the
     snapshot still said "held", until the 20 s request timeout. The lease
     deadline now bounds every request sent under the lease, not only the
-    lease's own, so the stalled INSERT fails, and the lease quarantines,
-    while the row is still live."""
+    lease's own, so the stalled request fails, and the lease quarantines,
+    while the row is still live. A stalled INSERT has an unknown outcome and
+    quarantines the writer itself; a stalled read (the replay guard) does
+    not, and it is the lease lock's scope that abandons the lease its
+    deadline passed on, rather than go on calling it held."""
     spool_root = tmp_path / "spool"
     switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
     with _catalog() as (client, catalog):
@@ -1258,17 +1336,26 @@ def test_a_stall_inside_the_index_pass_gives_up_while_the_lease_row_is_live(
         service = _service(config, spool_root)
         service.start()
         try:
-            # Every catalog INSERT but the lease's own stalls, so the lease
-            # thread alone could keep the row alive -- if it got the lock.
-            switch.stall_requests(_catalog_insert_but_the_lease)
+            # Every such request stalls, while the lease's own go through,
+            # so the lease thread alone could keep the row alive -- if it
+            # got the lock.
+            switch.stall_requests(stalled)
             tensors = _stage(spool_root, range(2))
             _wait_for(lambda: switch.stalled, timeout_s=10.0)
-            log = _sample_lease(service, client, catalog.table_prefix, 8.0,
+            log = _sample_lease(service, client, catalog.table_prefix, 2.5,
                                 origin=switch.stalled[0])
+            _wait_for(lambda: service.snapshot()["lease_state"]
+                      == "quarantined", timeout_s=2.0)
+            snapshot = service.snapshot()
+            log += _sample_lease(service, client, catalog.table_prefix, 3.0,
+                                 origin=switch.stalled[0])
             assert not _held_but_dead(log), log
-            quarantined = [t for t, state, _ in log if state == "quarantined"]
-            assert quarantined and quarantined[0] < 3.0, log
-            assert service.snapshot()["failed"] is False
+            # By the lease deadline, at most 2.9 s after the stalled
+            # request went out (the lease renews before each request that
+            # finds it due).
+            quarantined_at = _quarantined_at(snapshot, 3.0) - switch.stalled[0]
+            assert quarantined_at < 2.95, (quarantined_at, log)
+            assert snapshot["failed"] is False
 
             switch.restore()
             service.flush(30.0)

@@ -59,12 +59,14 @@ bool is_lease_refusal(const CatalogError& exc) {
          exc.kind() == CatalogError::Kind::kLease;
 }
 
-// The lease thread's tick, which is also the retry interval for a claim
-// another holder refused: a sixth of the TTL, so a renewal due at ttl/3 is
-// never more than a tick late. renewal_window_ns (lease_coordinator.h) takes
-// the least time a renewal has from this schedule -- it starts within ttl/2
-// of the claim that stamped the row -- so change one and the other must
-// follow.
+// The lease thread's tick: the longest it sleeps, and the retry interval for
+// a claim another holder refused or one that wrote nothing -- a sixth of the
+// TTL. A renewal falls due a third of the TTL after the claim that stamped
+// the row was sent; the thread wakes for it then, not on the next tick, and
+// a stretch holding the lease lock renews before its next request once it
+// is due. renewal_window_ns (lease_coordinator.h) allows a tick more than
+// that -- a renewal is taken to start within ttl/2 of the send -- so change
+// one and the other must follow.
 uint64_t lease_tick_ns(uint64_t ttl_ns) {
   return std::max<uint64_t>(ttl_ns / 6, 10'000'000ull);
 }
