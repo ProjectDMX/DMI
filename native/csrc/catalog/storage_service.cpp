@@ -632,10 +632,17 @@ void CaptureStorageService::keep_lease() {
 }
 
 void CaptureStorageService::renew_lease_if_due() {
-  // Renew once a third of the TTL has passed without a publish. The lease
-  // thread wakes every ttl/6, so the renewal fires about a tick after it
-  // falls due (later if an index() call holds lease_mutex_), leaving roughly
-  // half the TTL for it to land before the row expires. That slack covers a
+  // Renew once a third of the TTL has passed since last_renew_ns_. The lease
+  // thread wakes every ttl/6, so with no index() in the way the renewal
+  // fires within about a tick of falling due, leaving at least roughly half
+  // the TTL for it to land before the row expires. An index() can leave far
+  // less, or none. It holds lease_mutex_ throughout, so this thread cannot
+  // renew until it returns, and index_bounded() then stamps last_renew_ns_
+  // whenever it indexed or skipped a pack, as though the row had just been
+  // renewed. After a publish that stamp trails the publish's own last
+  // renewal by the watermark INSERT, its read-backs and commit_packs; and
+  // it is taken even when every pack was already committed, so index()
+  // published nothing and renewed nothing. Whatever slack is left covers a
   // renewal that runs late, not one that fails. A failed renewal costs the
   // lease at once whatever the cause. A refusal drops it in the coordinator,
   // and any ClickHouse error (transport, timeout, or a server error) takes

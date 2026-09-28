@@ -111,11 +111,15 @@ struct StorageServiceConfig {
   // take the lease and sweep while the first is still writing; one on
   // another (database, table_prefix) never meets the lease at all. Its
   // Recover() also lists the first's sealed packs, which the first may
-  // upload too: a quarantined holder uploads nothing without the lease, but
-  // a stalled one still holds it locally and uploads until a renewal or
-  // publish is refused, and two on different (database, table_prefix)
-  // pairs each hold a lease and upload freely. The spool itself is not
-  // locked; one process per spool is the caller's job.
+  // upload too. A cycle checks the lease once, before its upload batch, and
+  // UploadPending does not stop when the lease is lost: a holder that is
+  // quarantined, or refused a renewal or publish, while a batch is in
+  // flight finishes that batch (which can outlast the TTL), and only its
+  // later cycles upload nothing while it holds no lease. A stalled one
+  // still holds the lease locally and starts new batches until a renewal
+  // or publish is refused. Two on different (database, table_prefix) pairs
+  // each hold a lease and upload freely. The spool itself is not locked;
+  // one process per spool is the caller's job.
   bool sweep_spool_on_start = true;
   bool reconcile_on_start = true;
 };
