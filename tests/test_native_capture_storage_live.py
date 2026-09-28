@@ -953,6 +953,89 @@ def test_a_quarantined_service_leaves_new_packs_in_the_spool(
         assert sorted(captures) == sorted(tensors)
 
 
+def _lease_row_live(client, prefix) -> bool:
+    """Whether the newest lease row on the catalog still keeps rivals out."""
+    table = f"`{DATABASE}`.`{prefix}_publisher_lease`"
+    return client.execute(
+        f"SELECT max(expires_at_ns) > toUnixTimestamp64Nano(now64(9)) "
+        f"FROM {table} WHERE term = (SELECT max(term) FROM {table})")[0][0] == 1
+
+
+def _held_but_dead(log):
+    return [sample for sample in log if sample[1] == "held" and not sample[2]]
+
+
+def _lease_row_left_s(client, prefix) -> float:
+    """Seconds the newest lease row has left on the server's clock; negative
+    once it has expired."""
+    table = f"`{DATABASE}`.`{prefix}_publisher_lease`"
+    return client.execute(
+        f"SELECT (toInt64(max(expires_at_ns)) - "
+        f"toInt64(toUnixTimestamp64Nano(now64(9)))) / 1e9 "
+        f"FROM {table} WHERE term = (SELECT max(term) FROM {table})")[0][0]
+
+
+def test_passes_over_committed_packs_do_not_hold_off_the_renewal(
+        fake_s3, tmp_path):
+    """The lease thread renews a third of the TTL after the last renewal,
+    and the service counted an index pass as one whenever it indexed or
+    SKIPPED a pack. A pass over packs the catalog had already committed
+    publishes nothing, so nothing renewed the row -- yet each such pass
+    restarted the renewal clock. Packs that keep arriving already committed
+    (re-staged after a crash between upload and spool removal, or reconciled
+    first at start) held the renewal off indefinitely, and the row expired
+    under a service still reporting the lease held. The schedule now runs
+    from when the claim that stamped the row was sent, whatever the passes
+    do."""
+    import os
+
+    spool_root = tmp_path / "spool"
+    _stage(spool_root, range(2))
+    (ready,) = _ready(spool_root)
+    kept = tmp_path / ready.name
+    os.link(ready, kept)  # the spool's copy goes once it is uploaded
+    with _catalog() as (client, catalog):
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, reconcile_on_start=False,
+            lease_ttl_s=3.0, publish_timeout_s=1)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            service.flush(30.0)
+            before = service.snapshot()
+            assert before["indexed_packs"] == 1, before
+
+            # Two TTLs of cycles that each upload the committed pack again
+            # (the uploader finds it in the store and verifies it) and index
+            # it: every pass skips it.
+            log, left = [], []
+            origin = time.monotonic()
+            while time.monotonic() < origin + 6.0:
+                try:
+                    os.link(kept, ready)
+                except FileExistsError:
+                    pass
+                state = service.snapshot()["lease_state"]
+                log.append((round(time.monotonic() - origin, 2), state,
+                            _lease_row_live(client, catalog.table_prefix)))
+                left.append(_lease_row_left_s(client, catalog.table_prefix))
+                time.sleep(0.1)
+            after = service.snapshot()
+            service.rethrow_if_failed()
+        finally:
+            service.stop()
+
+        assert after["indexed_packs"] == 1, after
+        assert after["uploaded_packs"] - before["uploaded_packs"] >= 10, after
+        assert not _held_but_dead(log), log
+        # A renewal falls due a third of the TTL after the last and the lease
+        # thread looks every sixth, so the row never has less than about half
+        # the TTL left; a third leaves room for a slow request.
+        assert min(left) > 1.0, left
+        # One every 1 to 1.5 s over the 6 s.
+        assert after["lease_renewals"] - before["lease_renewals"] >= 3, after
+
+
 def _latch_lines(err: str) -> list[str]:
     return [line for line in err.splitlines() if "indexing stopped" in line]
 

@@ -229,7 +229,6 @@ class CaptureStorageService {
   // Serialises every use of writer_'s lease: the lease thread renews it
   // while cycles publish. Taken inside cycle_mutex_, never the other way.
   std::mutex lease_mutex_;
-  uint64_t last_renew_ns_ = 0;  // guarded by lease_mutex_
   // When a claim or renewal was first refused by another holder since the
   // lease was last held; 0 while none has been. Guarded by lease_mutex_.
   uint64_t held_elsewhere_since_ns_ = 0;

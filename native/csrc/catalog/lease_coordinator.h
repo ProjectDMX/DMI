@@ -41,6 +41,10 @@ struct PublisherLease {
   std::string holder;
   uint64_t acquired_at_ns = 0;
   uint64_t expires_at_ns = 0;
+  // steady_clock ns: when the claim INSERT that stamped this row was sent.
+  // The server stamps the row no earlier, so it lives at least lease_ttl_ns
+  // past this on the claimant's own clock.
+  uint64_t sent_ns = 0;
 };
 
 struct LeaseHead {

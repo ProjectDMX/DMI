@@ -1,6 +1,7 @@
 #include "lease_coordinator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <random>
 #include <set>
@@ -8,6 +9,13 @@
 namespace dmi_catalog {
 
 namespace {
+
+uint64_t steady_ns() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
 
 }  // namespace
 
@@ -105,6 +113,9 @@ PublisherLease LeaseCoordinator::claim_with_rival(
   const LeaseHead current = head();
   reject_live(current, lease_id);
   const uint64_t term = current.term + 1;
+  // Taken before the INSERT goes out, so never after the server stamps the
+  // row: the renewal schedule counts from here.
+  const uint64_t sent_ns = steady_ns();
   insert(term, lease_id, holder);
   if (rival_lease_id.has_value()) {
     // The contested-claim scenario: a rival row lands between the
@@ -132,7 +143,8 @@ PublisherLease LeaseCoordinator::claim_with_rival(
     lease_ = PublisherLease{
         term, lease_id, holder,
         parse_u64_field(rows[0][1], "lease acquisition"),
-        parse_u64_field(rows[0][2], "lease expiry")};
+        parse_u64_field(rows[0][2], "lease expiry"),
+        sent_ns};
     return *lease_;
   }
   lease_.reset();

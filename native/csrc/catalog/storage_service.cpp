@@ -434,11 +434,12 @@ void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
     work.pop_back();
     IndexResultData result;
     try {
+      // Nothing here stamps a renewal: the schedule follows the lease itself
+      // (renew_lease_if_due), which only a claim that confirmed moves -- a
+      // pass that published nothing, over packs already committed, renewed
+      // nothing.
       std::lock_guard<std::mutex> lease(lease_mutex_);
       result = indexer_.index(batch);
-      if (result.indexed_packs > 0 || result.skipped_packs > 0) {
-        last_renew_ns_ = steady_ns();  // a publish renews the lease
-      }
     } catch (const CatalogError& exc) {
       if (exc.kind() == CatalogError::Kind::kBatchTooLarge && batch.size() > 1) {
         const size_t middle = batch.size() / 2;
@@ -632,28 +633,16 @@ void CaptureStorageService::keep_lease() {
 }
 
 void CaptureStorageService::renew_lease_if_due() {
-  // Renew once a third of the TTL has passed since last_renew_ns_. The lease
-  // thread wakes every ttl/6, so with no index() in the way the renewal
-  // fires within about a tick of falling due, leaving at least roughly half
-  // the TTL for it to land before the row expires. An index() can leave far
-  // less, or none. It holds lease_mutex_ throughout, so this thread cannot
-  // renew until it returns, and index_bounded() then stamps last_renew_ns_
-  // whenever it indexed or skipped a pack, as though the row had just been
-  // renewed. After a publish that stamp trails the publish's own last
-  // renewal by the watermark INSERT, its read-backs and commit_packs; and
-  // it is taken even when every pack was already committed, so index()
-  // published nothing and renewed nothing. Whatever slack is left covers a
-  // renewal that runs late, not one that fails. A failed renewal costs the
-  // lease at once whatever the cause. A refusal drops it in the coordinator,
-  // and any ClickHouse error (transport, timeout, or a server error) takes
-  // renew_for_publish()'s catch, which quarantines the writer on the first
-  // error that survives the client's retries (a write is repeated only when
-  // its connection was never made; one that may have reached the server
-  // never is).
+  // Due a third of the TTL after the claim that stamped the lease row was
+  // sent -- this thread's last renewal, or the one a publish made before
+  // its fenced statements -- as the writer records it, so nothing but a
+  // confirmed claim moves the schedule. The lease thread looks every sixth
+  // of the TTL, so with the lease lock free a renewal starts within half the
+  // TTL of that send, and the row has the other half left.
   const uint64_t ttl = config_.writer.lease_ttl_ns;
-  if (ttl == 0 || steady_ns() - last_renew_ns_ < ttl / 3) return;
+  const uint64_t sent = writer_.lease_sent_ns();
+  if (ttl == 0 || sent == 0 || steady_ns() - sent < ttl / 3) return;
   writer_.renew_lease();
-  last_renew_ns_ = steady_ns();
   held_elsewhere_since_ns_ = 0;
   std::lock_guard<std::mutex> lock(state_mutex_);
   ++state_.lease_renewals;
@@ -670,7 +659,6 @@ void CaptureStorageService::acquire_lease_at_start() {
   while (true) {
     try {
       writer_.acquire_lease(config_.holder);
-      last_renew_ns_ = steady_ns();
       return;
     } catch (const CatalogError& exc) {
       if (!is_lease_refusal(exc) || config_.start_lease_wait_ns == 0) throw;
@@ -724,7 +712,6 @@ bool CaptureStorageService::ensure_publisher_lease() {
     publish_lease_state();
     return false;
   }
-  last_renew_ns_ = steady_ns();
   held_elsewhere_since_ns_ = 0;
   next_claim_ns_ = 0;
   {

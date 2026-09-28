@@ -89,6 +89,13 @@ class CatalogWriter {
   PublisherLease renew_lease();
   void release_lease();
   const PublisherLease* held_lease() const { return leases_->lease(); }
+  // steady_clock ns: when the claim INSERT that stamped the held lease's row
+  // was sent -- the lease thread's last renewal, or a publish's -- or 0
+  // while none is held.
+  uint64_t lease_sent_ns() const {
+    const PublisherLease* held = leases_->lease();
+    return held != nullptr ? held->sent_ns : 0;
+  }
   uint64_t allocate_version();
   uint64_t max_version(const std::string& table,
                        const std::string& column) const;
