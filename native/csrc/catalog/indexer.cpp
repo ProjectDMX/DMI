@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iterator>
 #include <map>
 #include <set>
+#include <stdexcept>
+#include <utility>
 
 namespace dmi_catalog {
 
@@ -19,10 +22,10 @@ uint64_t NowWallClockNs() {
 }
 
 std::vector<PackIdentity> PackIdentitiesFrom(
-    const std::vector<const PackRefData*>& refs) {
+    const std::vector<PackRefData>& refs) {
   std::vector<PackIdentity> out;
-  for (const PackRefData* ref : refs) {
-    out.emplace_back(ref->store_id, ref->pack_id);
+  for (const PackRefData& ref : refs) {
+    out.emplace_back(ref.store_id, ref.pack_id);
   }
   return out;
 }
@@ -85,15 +88,14 @@ std::string ConflictMessage(const PackIdentity& identity) {
 
 // The six version-independent pack columns; commit_packs appends the
 // batch's index_version itself, the same convention as write_descriptors.
-std::vector<std::string> RenderPackRows(
-    const std::vector<const PackRefData*>& refs) {
+std::vector<std::string> RenderPackRows(const std::vector<PackRefData>& refs) {
   std::vector<std::string> rows;
-  for (const PackRefData* ref : refs) {
-    rows.push_back(sql_uuid(ref->pack_id) + "," + sql_quote(ref->store_id) +
-                   "," + sql_quote(ref->object_key) + "," +
-                   std::to_string(ref->object_bytes) + "," +
-                   sql_quote(ref->checksum) + "," +
-                   std::to_string(ref->record_count));
+  for (const PackRefData& ref : refs) {
+    rows.push_back(sql_uuid(ref.pack_id) + "," + sql_quote(ref.store_id) +
+                   "," + sql_quote(ref.object_key) + "," +
+                   std::to_string(ref.object_bytes) + "," +
+                   sql_quote(ref.checksum) + "," +
+                   std::to_string(ref.record_count));
   }
   return rows;
 }
@@ -126,7 +128,14 @@ uint64_t NativeIndexer::allocate_version() {
 }
 
 IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
-  IndexResultData result;
+  IndexPlan planned = plan(refs);
+  read(&planned);
+  return commit(&planned);
+}
+
+IndexPlan NativeIndexer::plan(const std::vector<PackRefData>& refs) {
+  IndexPlan planned;
+  IndexResultData& result = planned.result;
   if (static_cast<int>(refs.size()) > config_.max_packs) {
     throw CatalogError(
         CatalogError::Kind::kValue,
@@ -197,6 +206,8 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
   result.requested_packs = unique.size() + result.failures.size();
 
   // The replay guard, and nothing else: visibility comes from publish.
+  const PublisherLease* held = writer_->held_lease();
+  planned.planned_under = held != nullptr ? held->lease_id : "";
   std::set<PackIdentity> committed;
   if (!unique.empty()) {
     std::vector<PackIdentity> identities;
@@ -206,31 +217,32 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
     committed = writer_->committed_pack_ids(identities);
   }
 
-  std::vector<const PackRefData*> pending;
-  uint64_t estimated_bytes = 0;
   for (const PackRefData* ref : unique) {
     if (committed.count({ref->store_id, ref->pack_id})) continue;
-    pending.push_back(ref);
+    planned.pending.push_back(*ref);
   }
-  result.skipped_packs = unique.size() - pending.size();
+  result.skipped_packs = unique.size() - planned.pending.size();
+  return planned;
+}
 
-  std::vector<std::string> all_rows;
+void NativeIndexer::read(IndexPlan* planned) {
+  planned->read = true;
+  IndexResultData& result = planned->result;
   // Successes are COLLECTED, never removed from the sequence being
   // walked: erasing from `pending` mid-walk shifts every later pack one
   // slot left while the walk carries on past the hole, so the pack behind
   // a failure is never read yet still published and committed as indexed
   // (committed and invisible, which no later pass can repair) and the last
   // pack is read twice. `valid_refs` in catalog.py, for the same reason.
-  std::vector<const PackRefData*> indexed;
-  for (const PackRefData* ref : pending) {
+  for (const PackRefData& ref : planned->pending) {
     std::vector<std::string> rows;
     try {
-      rows = read_pack_descriptor_rows(s3_, *ref);
+      rows = read_pack_descriptor_rows(s3_, ref);
     } catch (const CatalogError& e) {
       std::string message = e.what();
       if (message.size() > 512) message.resize(512);
       result.failures.push_back(
-          {ref->pack_id, ref->object_key, "CatalogError", message});
+          {ref.pack_id, ref.object_key, "CatalogError", message});
       continue;
     }
     uint64_t pack_bytes = 0;
@@ -243,6 +255,7 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
     // inside, the handler for unreadable packs caught it and blamed the
     // pack that happened to cross the budget — then every pack behind it —
     // and returned a partial index reporting success.
+    const uint64_t estimated_bytes = planned->estimated_bytes;
     if (estimated_bytes + pack_bytes > config_.max_estimated_bytes) {
       throw CatalogError(
           CatalogError::Kind::kBatchTooLarge,
@@ -250,15 +263,23 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
               std::to_string(estimated_bytes + pack_bytes) + " > " +
               std::to_string(config_.max_estimated_bytes));
     }
-    estimated_bytes += pack_bytes;
-    all_rows.insert(all_rows.end(), rows.begin(), rows.end());
-    indexed.push_back(ref);
+    planned->estimated_bytes += pack_bytes;
+    planned->indexed.push_back(ref);
+    planned->rows.push_back(std::move(rows));
   }
+}
 
-  if (!all_rows.empty() || !indexed.empty()) {
+IndexResultData NativeIndexer::commit(IndexPlan* planned) {
+  if (!planned->read) {
+    throw std::logic_error("NativeIndexer::commit before read");
+  }
+  IndexResultData& result = planned->result;
+  std::vector<PackRefData>& indexed = planned->indexed;
+  if (!indexed.empty()) {
     // Fail before the batch is written, not after it is wasted: a writer
     // without publishing authority discovers it last otherwise.
-    if (writer_->held_lease() == nullptr) {
+    const PublisherLease* held = writer_->held_lease();
+    if (held == nullptr) {
       throw CatalogError(
           CatalogError::Kind::kLease,
           "the catalog writer holds no publisher lease, and only the "
@@ -266,6 +287,35 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
           "indexing. Refused before allocating a version and writing "
           "descriptors, neither of which this pass could have published.");
     }
+    if (held->lease_id != planned->planned_under) {
+      // The lease was lost and a fresh one taken while the packs were read,
+      // so the replay guard was read under another lease, and a publisher
+      // that held the catalog in between may have committed these packs.
+      // Read it again, under the lease that is to publish them.
+      const std::set<PackIdentity> committed =
+          writer_->committed_pack_ids(PackIdentitiesFrom(indexed));
+      std::vector<PackRefData> still;
+      std::vector<std::vector<std::string>> still_rows;
+      for (size_t i = 0; i < indexed.size(); ++i) {
+        if (committed.count({indexed[i].store_id, indexed[i].pack_id})) {
+          ++result.skipped_packs;
+          continue;
+        }
+        still.push_back(std::move(indexed[i]));
+        still_rows.push_back(std::move(planned->rows[i]));
+      }
+      indexed.swap(still);
+      planned->rows.swap(still_rows);
+    }
+  }
+  std::vector<std::string> all_rows;
+  for (std::vector<std::string>& rows : planned->rows) {
+    all_rows.insert(all_rows.end(), std::make_move_iterator(rows.begin()),
+                    std::make_move_iterator(rows.end()));
+  }
+  planned->rows.clear();
+
+  if (!all_rows.empty() || !indexed.empty()) {
     uint64_t version = allocate_version();
     uint64_t descriptor_inserts = 0;
     const auto write_batches = [&](uint64_t at_version) {
@@ -343,7 +393,7 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
   result.indexed_packs = indexed.size();
   result.indexed_rows = all_rows.size();
   result.failed_packs = result.failures.size();
-  result.estimated_bytes = estimated_bytes;
+  result.estimated_bytes = planned->estimated_bytes;
   return result;
 }
 

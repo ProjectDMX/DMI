@@ -85,6 +85,16 @@ def _ns(seconds: float) -> int:
 # once the publish statement cap and the skew bound are spent.
 _FENCE_MARGIN_NS = 100_000_000
 
+# The native kLeaseDeadlineMarginNs and kMinimumRenewalWindowNs
+# (native/csrc/catalog/lease_coordinator.h), see _validate_lease.
+_LEASE_DEADLINE_MARGIN_NS = 100_000_000
+_MINIMUM_RENEWAL_WINDOW_NS = 200_000_000
+
+
+def _renewal_window_ns(ttl_ns: int, skew_ns: int) -> int:
+    """renewal_window_ns from native/csrc/catalog/lease_coordinator.h."""
+    return max(ttl_ns // 2 - skew_ns - _LEASE_DEADLINE_MARGIN_NS, 0)
+
 
 # The sink's admission policies (native/csrc/sink/pack_sink.h Overload).
 SINK_OVERLOAD_POLICIES = ("block", "drop_newest")
@@ -231,7 +241,13 @@ class NativeCaptureStorageConfig:
     clickhouse_reader_user: str = ""
     clickhouse_reader_password: str = field(default="", repr=False)
     # Every catalog request is bounded, so a server that stops answering
-    # cannot hold a flush, a publish or the lease renewal indefinitely.
+    # cannot hold a flush, a publish or the lease renewal indefinitely. While
+    # the service holds the publisher lease, its requests are bounded tighter
+    # still, by the lease deadline -- lease_ttl_s less clock_skew_s and 0.1 s
+    # after the claim that stamped the lease row was sent -- so a renewal or
+    # an index pass that cannot finish fails while the row still keeps
+    # rivals out; each request of a claim made without a lease has
+    # min(clickhouse_request_timeout_s, lease_ttl_s / 3).
     clickhouse_connect_timeout_s: float = 10.0
     clickhouse_request_timeout_s: float = 60.0
     database: str = "default"
@@ -265,7 +281,9 @@ class NativeCaptureStorageConfig:
     lease_ttl_s: float = 15.0
     # The server-side cap on each fenced publish statement, whole seconds.
     publish_timeout_s: float = 5.0
-    # The bound on host clock disagreement across a replicated catalog.
+    # The bound on host clock disagreement across a replicated catalog. At
+    # most lease_ttl_s / 2 - 0.3 s: a renewal must have time to fail while a
+    # rival whose clock runs ahead still sees the row live.
     clock_skew_s: float = 0.0
     # How long start() waits for a predecessor's lease to expire before
     # failing with it held. None waits lease_ttl_s + publish_timeout_s +
@@ -370,6 +388,23 @@ class NativeCaptureStorageConfig:
                 "lease_ttl_s must exceed publish_timeout_s + clock_skew_s by "
                 "at least 0.1 s, or a publish statement can still be running "
                 "when its lease becomes takeable")
+        # The native service's rule (storage_service.cpp): a renewal starts
+        # up to lease_ttl_s / 2 after the claim that stamped the lease row
+        # was sent, and has to be answered by the lease deadline, lease_ttl_s
+        # less clock_skew_s and 0.1 s after that send, so that a renewal
+        # that fails does so while its row is still live.
+        window = _renewal_window_ns(_ns(self.lease_ttl_s),
+                                    _ns(self.clock_skew_s))
+        if window < _MINIMUM_RENEWAL_WINDOW_NS:
+            raise ValueError(
+                "clock_skew_s leaves a lease renewal no time to finish while "
+                "its row is live: a renewal starts up to lease_ttl_s / 2 "
+                "after the claim that stamped the row was sent, and has to be "
+                "answered by lease_ttl_s - clock_skew_s - 0.1 s after it, "
+                f"which leaves {window / 1e6:.1f} ms, under the "
+                f"{_MINIMUM_RENEWAL_WINDOW_NS // 1_000_000} ms minimum. Keep "
+                "clock_skew_s at most lease_ttl_s / 2 - 0.3 s, or raise "
+                "lease_ttl_s")
 
     def _lease_native(self) -> dict[str, int]:
         wait = self.start_lease_wait_s
@@ -553,7 +588,11 @@ class NativeCaptureStorage:
         """Ensure the catalog schema, take the lease, sweep the spool.
 
         Waits up to ``start_lease_wait_s`` for another holder's lease to
-        expire, then raises naming the holder.
+        expire, then raises naming the holder. A claim that times out is
+        retried within the same wait; one whose INSERT may have landed sets
+        the lease aside for ``lease_ttl_s``, and that is waited out even
+        past the wait, once, so start() can take up to about
+        ``start_lease_wait_s + 2 * lease_ttl_s`` against a catalog that slow.
         """
         self._service.start()
 

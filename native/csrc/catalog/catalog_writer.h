@@ -89,6 +89,28 @@ class CatalogWriter {
   PublisherLease renew_lease();
   void release_lease();
   const PublisherLease* held_lease() const { return leases_->lease(); }
+  // The held lease's timing, on the steady clock, 0 while none is held: when
+  // the claim INSERT that stamped its row was sent -- the lease thread's
+  // last renewal, or a publish's -- and the deadline every request made
+  // under it has to be answered by (lease_coordinator.h). Lock-free like
+  // held_lease(): the storage service reads the deadline before each request
+  // it sends while holding its lease lock.
+  uint64_t lease_sent_ns() const {
+    const PublisherLease* held = leases_->lease();
+    return held != nullptr ? held->sent_ns : 0;
+  }
+  uint64_t lease_deadline_ns() const {
+    const PublisherLease* held = leases_->lease();
+    return held != nullptr ? held->deadline_ns : 0;
+  }
+  // Gives up a lease whose deadline has passed unrenewed. Its row may still
+  // be live, and a statement of the pass that ran out of time may still be
+  // running, so it goes as an unknown outcome does: no tombstone, and
+  // quarantined for a TTL.
+  void abandon_lease();
+  // Whether the last lease refusal came only from this writer's own earlier
+  // claim rows (LeaseCoordinator::refused_by_own_claims).
+  bool refused_by_own_claims() const;
   uint64_t allocate_version();
   uint64_t max_version(const std::string& table,
                        const std::string& column) const;

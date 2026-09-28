@@ -9,7 +9,46 @@ namespace dmi_catalog {
 
 namespace {
 
+// How many recent claim lease_ids to remember (see claimed_ids_).
+constexpr size_t kClaimHistory = 16;
+
+// A Seconds setting from whole milliseconds, to the millisecond ("1.999",
+// "0.25", "4"): fractional seconds, which the server parses for
+// max_execution_time and lock_acquire_timeout alike (checked on 25.12).
+// Rounding down to whole seconds cut up to a second off an INSERT the
+// client was still waiting for, so the server aborted healthy claims.
+// Never "0": ClickHouse reads a zero max_execution_time as no limit at all.
+std::string seconds_setting(uint64_t ms) {
+  ms = std::max<uint64_t>(ms, 1);
+  std::string text = std::to_string(ms / 1000);
+  if (ms % 1000 != 0) {
+    char fraction[8];
+    std::snprintf(fraction, sizeof(fraction), ".%03u",
+                  static_cast<unsigned>(ms % 1000));
+    text += fraction;
+    while (text.back() == '0') text.pop_back();
+  }
+  return text;
+}
+
 }  // namespace
+
+const char* const kLeaseDeadlineBound =
+    "the lease deadline (lease_ttl_s, less clock_skew_s and a 0.1 s margin, "
+    "after the claim that stamped the lease row was sent; "
+    "clickhouse_request_timeout_s caps each request as well)";
+
+uint64_t lease_deadline_ns(uint64_t sent_ns, uint64_t lease_ttl_ns,
+                           uint64_t clock_skew_ns) {
+  const uint64_t spent = clock_skew_ns + kLeaseDeadlineMarginNs;
+  return lease_ttl_ns > spent ? sent_ns + (lease_ttl_ns - spent) : sent_ns;
+}
+
+uint64_t renewal_window_ns(uint64_t lease_ttl_ns, uint64_t clock_skew_ns) {
+  const uint64_t spent = clock_skew_ns + kLeaseDeadlineMarginNs;
+  const uint64_t half = lease_ttl_ns / 2;
+  return half > spent ? half - spent : 0;
+}
 
 std::string new_uuid_v4() {
   static std::mt19937_64 rng(std::random_device{}());
@@ -32,14 +71,75 @@ LeaseCoordinator::LeaseCoordinator(
     : client_(std::move(client)), config_(std::move(config)) {
   table_ = "`" + config_.database + "`.`" + config_.table_prefix +
            "_publisher_lease`";
+  const double request_ns = client_->request_timeout_s() * 1e9;
+  claim_bound_ns_ = std::max<uint64_t>(
+      request_ns < static_cast<double>(config_.lease_ttl_ns / 3)
+          ? static_cast<uint64_t>(request_ns)
+          : config_.lease_ttl_ns / 3,
+      1'000'000);
+  claim_bound_text_ =
+      "the bound on each request of a claim made without a live lease, "
+      "min(clickhouse_request_timeout_s, lease_ttl_s / 3) = " +
+      std::to_string(claim_bound_ns_ / 1'000'000) + " ms";
 }
 
-std::map<std::string, std::string> LeaseCoordinator::quorum_write() const {
-  if (!config_.insert_quorum.has_value()) return {};
-  return {{"insert_quorum", std::to_string(*config_.insert_quorum)},
-          {"insert_quorum_parallel", "0"},
-          {"insert_quorum_timeout",
-           std::to_string(config_.publish_timeout_ns / 1'000'000)}};
+std::vector<Row> LeaseCoordinator::run(
+    const std::string& query, const Params& params,
+    std::map<std::string, std::string> settings, bool write) const {
+  // Held, and its deadline still ahead: that deadline, shared by every
+  // request until the lease renews. Otherwise each request gets the claim
+  // bound from when it starts -- with no lease, and with one whose deadline
+  // has passed, whose row can no longer be counted on to keep rivals out.
+  // A request made under such a lease is a claim like any other, decided by
+  // the protocol's own reads: a renewal that meets a successor is refused,
+  // and a publish is fenced out. Refusing to send it at all would turn those
+  // known outcomes into unknown ones. What must not happen is a holder going
+  // on as though it still held the lease, and the storage service abandons
+  // one before it makes another request (storage_service.h).
+  const uint64_t now = steady_now_ns();
+  const bool live = lease_.has_value() && lease_->deadline_ns > now;
+  const RequestDeadline deadline(
+      live ? lease_->deadline_ns : now + claim_bound_ns_,
+      live ? std::string(kLeaseDeadlineBound) : claim_bound_text_);
+  if (!write) return client_->execute(query, params, settings);
+  return client_->execute(
+      query, params, settings, nullptr,
+      [this](uint64_t attempt_ms, std::map<std::string, std::string>* caps) {
+        add_write_caps(attempt_ms, caps);
+      });
+}
+
+void LeaseCoordinator::add_write_caps(
+    uint64_t attempt_ms, std::map<std::string, std::string>* settings) const {
+  // A lease INSERT the client gave up on (a timeout, so an unknown outcome)
+  // must not land afterwards: a claim row stamped then outlives the
+  // quarantine meant to cover it. So the server gets the time the client
+  // gives the attempt -- its request timeout cut to the tightest deadline in
+  // force, computed afresh for every attempt, so a retry after a refused
+  // connection carries the time left then -- and abandons the statement
+  // then: max_execution_time for running it, lock_acquire_timeout for
+  // waiting on the table lock before it starts, and throw, not break, since
+  // break would insert what had been read so far. The quorum wait is bounded
+  // by insert_quorum_timeout alone, so that is capped too, as well as by
+  // publish_timeout as before: past the deadline nobody is listening.
+  //
+  // What the caps do not cover: ClickHouse checks max_execution_time only at
+  // designated points while the pipeline runs, so the part commit can
+  // overrun it, and its clock starts when the server starts the query, not
+  // when the client sent it -- a request held up in transit can still land
+  // up to that delay after the client gave up. The storage service
+  // therefore does not count a refusal by its own claim rows towards its
+  // 2 x TTL latch (refused_by_own_claims()).
+  if (config_.insert_quorum.has_value()) {
+    (*settings)["insert_quorum"] = std::to_string(*config_.insert_quorum);
+    (*settings)["insert_quorum_parallel"] = "0";
+    (*settings)["insert_quorum_timeout"] = std::to_string(std::max<uint64_t>(
+        std::min<uint64_t>(config_.publish_timeout_ns / 1'000'000, attempt_ms),
+        1));
+  }
+  (*settings)["max_execution_time"] = seconds_setting(attempt_ms);
+  (*settings)["lock_acquire_timeout"] = seconds_setting(attempt_ms);
+  (*settings)["timeout_overflow_mode"] = "throw";
 }
 
 PublisherLease LeaseCoordinator::acquire(const std::string& holder) {
@@ -70,13 +170,13 @@ PublisherLease LeaseCoordinator::renew() {
 void LeaseCoordinator::release() {
   const PublisherLease* held = lease();
   if (held == nullptr) return;
-  client_->execute(release_statement(),
-                   {{"term", held->term},
-                    {"lease_id", held->lease_id},
-                    {"holder", held->holder}},
-                   // A deciding WRITE like the claim: the successor's head
-                   // read is what this row is written for.
-                   quorum_write());
+  // A deciding WRITE like the claim: the successor's head read is what this
+  // row is written for.
+  run(release_statement(),
+      {{"term", held->term},
+       {"lease_id", held->lease_id},
+       {"holder", held->holder}},
+      {}, true);
   lease_.reset();
 }
 
@@ -102,20 +202,53 @@ PublisherLease LeaseCoordinator::claim_contested(
 PublisherLease LeaseCoordinator::claim_with_rival(
     const std::string& holder, const std::string& lease_id,
     std::optional<std::string> rival_lease_id) {
+  refused_by_own_claims_ = false;
+  claim_insert_sent_ = false;
   const LeaseHead current = head();
   reject_live(current, lease_id);
   const uint64_t term = current.term + 1;
-  insert(term, lease_id, holder);
+  // Remembered before it is sent: a claim that times out may still land.
+  // Each id once, moved to the back when it is claimed again (a renewal).
+  const auto seen =
+      std::find(claimed_ids_.begin(), claimed_ids_.end(), lease_id);
+  if (seen != claimed_ids_.end()) claimed_ids_.erase(seen);
+  claimed_ids_.push_back(lease_id);
+  if (claimed_ids_.size() > kClaimHistory) claimed_ids_.pop_front();
+  // Taken before the INSERT goes out, so never after the server stamps the
+  // row: the new lease's deadline counts from here.
+  const uint64_t sent_ns = steady_now_ns();
+  const uint64_t deadline_ns =
+      lease_deadline_ns(sent_ns, config_.lease_ttl_ns, config_.clock_skew_ns);
+  // The lease this claim takes is good only until deadline_ns, so the claim
+  // has to be confirmed by then: from its INSERT on, every request of it is
+  // bounded by that deadline as well as by its own (run()). A claim made
+  // without a lease otherwise gave its read-back a fresh claim bound, and
+  // with a clock skew over TTL / 3 - 0.1 s an INSERT and read-back each
+  // inside the bound could confirm a lease already past its deadline -- a
+  // success its holder had to abandon at once, with no timeout to say why.
+  // On a renewal the old lease's deadline, earlier still, is what binds.
+  const RequestDeadline confirmed_by(deadline_ns, kLeaseDeadlineBound);
+  claim_insert_sent_ = true;
+  try {
+    insert(term, lease_id, holder);
+  } catch (const ClickHouseError& exc) {
+    // Nothing reached the server when no attempt connected, or when the
+    // deadline had passed before the INSERT could go out.
+    claim_insert_sent_ = exc.sent();
+    throw;
+  }
   if (rival_lease_id.has_value()) {
     // The contested-claim scenario: a rival row lands between the
     // claimant's INSERT and its read-back, the way the Python live suite
     // injects it through a client wrapper. Same term, long TTL.
     insert(term, *rival_lease_id, "rival", 600'000'000'000ull);
   }
-  const std::vector<Row> rows = client_->execute(
+  // Under the old lease's deadline on a renewal: its row is what keeps
+  // rivals out until this one is confirmed.
+  const std::vector<Row> rows = run(
       "SELECT toString(lease_id), acquired_at_ns, expires_at_ns "
       "FROM " + table_ + " WHERE term = %(term)s",
-      {{"term", term}}, deciding_read());
+      {{"term", term}}, deciding_read(), false);
   std::set<std::string> owners;
   for (const Row& row : rows) owners.insert(row[0]);
   if (owners == std::set<std::string>{lease_id}) {
@@ -132,7 +265,9 @@ PublisherLease LeaseCoordinator::claim_with_rival(
     lease_ = PublisherLease{
         term, lease_id, holder,
         parse_u64_field(rows[0][1], "lease acquisition"),
-        parse_u64_field(rows[0][2], "lease expiry")};
+        parse_u64_field(rows[0][2], "lease expiry"),
+        sent_ns,
+        deadline_ns};
     return *lease_;
   }
   lease_.reset();
@@ -143,12 +278,12 @@ PublisherLease LeaseCoordinator::claim_with_rival(
 
 LeaseHead LeaseCoordinator::head() const {
   const std::string table = table_;
-  const std::vector<Row> rows = client_->execute(
+  const std::vector<Row> rows = run(
       "SELECT term, toString(lease_id), any(holder), min(expires_at_ns), "
       "toUnixTimestamp64Nano(now64(9)) FROM " + table + " "
       "WHERE term = (SELECT max(term) FROM " + table + ") "
       "GROUP BY term, lease_id ORDER BY lease_id DESC",
-      {}, deciding_read());
+      {}, deciding_read(), false);
   if (rows.empty()) return LeaseHead{};
   LeaseHead out;
   out.term = parse_u64_field(rows[0][0], "lease term");
@@ -160,6 +295,7 @@ LeaseHead LeaseCoordinator::head() const {
   for (const Row& row : rows) {
     out.live_until_ns = std::max(
         out.live_until_ns, parse_u64_field(row[3], "lease expiry"));
+    out.lease_ids.push_back(row[1]);
   }
   return out;
 }
@@ -185,12 +321,12 @@ bool LeaseCoordinator::fence_eval(const std::string& lease_id,
   // A deciding read: the answer decides whether the fence admits, and the
   // fence's head subquery read from a replica behind on the lease table
   // would admit or deny on stale state.
-  const std::vector<Row> rows = client_->execute(
+  const std::vector<Row> rows = run(
       "SELECT " + fence(),
       {{"lease_id", lease_id},
        {"publish_timeout_ns", publish_timeout_ns},
        {"clock_skew_ns", clock_skew_ns}},
-      deciding_read());
+      deciding_read(), false);
   return !rows.empty() && rows[0][0] == "1";
 }
 
@@ -214,8 +350,7 @@ void LeaseCoordinator::reject_if_gone() const {
 void LeaseCoordinator::insert(uint64_t term, const std::string& lease_id,
                               const std::string& holder,
                               std::optional<uint64_t> ttl_ns) const {
-  client_->execute(
-      "INSERT INTO " + table_ + " "
+  run("INSERT INTO " + table_ + " "
       "(term, lease_id, holder, acquired_at_ns, expires_at_ns) "
       "SELECT toUInt64(%(term)s), toUUID(%(lease_id)s), %(holder)s, "
       "now_ns, now_ns + toUInt64(%(ttl_ns)s) "
@@ -224,7 +359,7 @@ void LeaseCoordinator::insert(uint64_t term, const std::string& lease_id,
        {"lease_id", lease_id},
        {"holder", holder},
        {"ttl_ns", ttl_ns.value_or(config_.lease_ttl_ns)}},
-      quorum_write());
+      {}, true);
 }
 
 void LeaseCoordinator::reject_live(const LeaseHead& head,
@@ -234,6 +369,13 @@ void LeaseCoordinator::reject_live(const LeaseHead& head,
     return;
   }
   lease_.reset();
+  refused_by_own_claims_ =
+      !head.lease_ids.empty() &&
+      std::all_of(head.lease_ids.begin(), head.lease_ids.end(),
+                  [this](const std::string& id) {
+                    return std::find(claimed_ids_.begin(), claimed_ids_.end(),
+                                     id) != claimed_ids_.end();
+                  });
   if (head.claimants > 1) {
     throw CatalogError(
         CatalogError::Kind::kHeld,

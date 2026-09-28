@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import socket
 import subprocess
 import threading
@@ -275,8 +276,14 @@ def test_the_reference_reader_sees_the_same_captures(fake_s3, tmp_path):
 
 
 class _Switch:
-    """A TCP forwarder in front of ClickHouse's HTTP port that can be cut
-    (connections refused) or stalled (connections accepted, never answered)."""
+    """A TCP forwarder in front of an HTTP server -- ClickHouse's HTTP port,
+    or the fake S3 -- that can be cut (connections refused), stalled
+    (connections accepted, never answered), made to hold lease INSERTs back
+    and deliver them late, to stall only the requests a predicate picks, to
+    hold the first request a predicate picks back for a while, or to hold
+    every request back by a delay a function picks. Every native client
+    opens one connection per request, so one request is one connection
+    here."""
 
     def __init__(self, host: str, port: int):
         self._target = (host, port)
@@ -284,9 +291,32 @@ class _Switch:
         self.port = self._listener.getsockname()[1]
         self._up = True
         self._stalled = False
+        self._late_by = 0.0  # seconds a lease INSERT is held back; 0 = never
+        # A predicate over one whole request (head and body): matching
+        # requests are held open and never answered.
+        self._stall_if = None
+        # (predicate, seconds): the first matching request reaches the server
+        # only that much later; its answer is relayed if anyone still listens.
+        self._slow_once = None
+        # A function of one whole request: the seconds it reaches the
+        # server late (0 for at once); its answer is relayed as usual.
+        self._delay_by = None
+        # time.monotonic() of every request stall_requests() held.
+        self.stalled: list[float] = []
+        # time.monotonic() of every connection refused while cut.
+        self.refused: list[float] = []
         self._lock = threading.Lock()
         self._sockets: set[socket.socket] = set()
         threading.Thread(target=self._accept, daemon=True).start()
+
+    @classmethod
+    def to_url(cls, url: str) -> "_Switch":
+        host, port = url.split("://", 1)[1].rstrip("/").rsplit(":", 1)
+        return cls(host, int(port))
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
 
     def _accept(self):
         while True:
@@ -299,7 +329,14 @@ class _Switch:
                     self._sockets.add(client)  # held open, never read
                 continue
             if not self._up:
+                self.refused.append(time.monotonic())
                 client.close()
+                continue
+            if (self._late_by > 0 or self._stall_if is not None
+                    or self._slow_once is not None
+                    or self._delay_by is not None):
+                threading.Thread(target=self._look_then_route,
+                                 args=(client,), daemon=True).start()
                 continue
             try:
                 upstream = socket.create_connection(self._target)
@@ -326,6 +363,100 @@ class _Switch:
                 except OSError:
                     pass
 
+    def _look_then_route(self, client):
+        """Read one HTTP request and route it: a lease INSERT held back by
+        deliver_lease_inserts_late() reaches the server only after that delay
+        -- long after the client gave up on it -- and nobody hears the
+        answer; a request stall_requests() picks is never answered; the first
+        request slow_once() picks is forwarded late, and each request by
+        what delay_requests() says; anything else goes straight through."""
+        request = b""
+        continued = False
+        try:
+            client.settimeout(2.0)
+            while True:
+                head, found, body = request.partition(b"\r\n\r\n")
+                if found:
+                    length = re.search(rb"(?i)content-length:\s*(\d+)", head)
+                    if length is None or len(body) >= int(length.group(1)):
+                        break
+                    # libcurl holds a body over 1 KiB back until the server
+                    # says 100 Continue, or for a second; answer for it, so
+                    # routing a large statement does not add that second.
+                    if not continued and re.search(
+                            rb"(?i)\r\nexpect:\s*100-continue", head):
+                        client.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+                        continued = True
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                request += chunk
+            client.settimeout(None)
+        except OSError:
+            client.close()
+            return
+        if continued:
+            # The server must not answer 100 Continue a second time.
+            head, _, body = request.partition(b"\r\n\r\n")
+            request = (re.sub(rb"(?i)\r\nexpect:[^\r\n]*", b"", head)
+                       + b"\r\n\r\n" + body)
+        stall_if = self._stall_if
+        if stall_if is not None and stall_if(request):
+            with self._lock:
+                self.stalled.append(time.monotonic())
+                self._sockets.add(client)  # held open, never answered
+            return
+        slow = self._slow_once
+        if slow is not None and slow[0](request):
+            self._slow_once = None
+            time.sleep(slow[1])
+        delay_by = self._delay_by
+        if delay_by is not None and (delay := delay_by(request)) > 0:
+            time.sleep(delay)
+        late_by = self._late_by
+        late = (late_by > 0 and b"INSERT INTO" in request
+                and b"_publisher_lease" in request)
+        if late:
+            time.sleep(late_by)
+        try:
+            upstream = socket.create_connection(self._target)
+            upstream.sendall(request)
+        except OSError:
+            client.close()
+            return
+        if late:
+            # Nobody is listening any more; the server runs it regardless.
+            client.close()
+            upstream.settimeout(10.0)
+            try:
+                while upstream.recv(65536):
+                    pass
+            except OSError:
+                pass
+            upstream.close()
+            return
+        with self._lock:
+            self._sockets |= {client, upstream}
+        for source, sink in ((client, upstream), (upstream, client)):
+            threading.Thread(target=self._pump, args=(source, sink),
+                             daemon=True).start()
+
+    def deliver_lease_inserts_late(self, late_by: float):
+        self._late_by = late_by
+
+    def stall_requests(self, predicate):
+        """Hold every new request `predicate(request_bytes)` picks open and
+        never answer it; the rest go through."""
+        self._stall_if = predicate
+
+    def slow_once(self, predicate, seconds: float):
+        """Forward the first request `predicate` picks `seconds` late."""
+        self._slow_once = (predicate, seconds)
+
+    def delay_requests(self, delay_by):
+        """Forward every request `delay_by(request_bytes)` seconds late."""
+        self._delay_by = delay_by
+
     def cut(self):
         self._up = False
         with self._lock:
@@ -346,6 +477,10 @@ class _Switch:
     def restore(self):
         self._up = True
         self._stalled = False
+        self._late_by = 0.0
+        self._stall_if = None
+        self._slow_once = None
+        self._delay_by = None
 
     def close(self):
         self.cut()
@@ -622,7 +757,7 @@ def test_a_batch_over_the_budget_splits_until_every_pack_indexes(
         service = _load_native_store_extension().StorageService(native)
         service.start()
         try:
-            assert service.flush(30.0)
+            service.flush(30.0)
             snapshot = service.snapshot()
         finally:
             service.stop()
@@ -953,6 +1088,919 @@ def test_a_quarantined_service_leaves_new_packs_in_the_spool(
         assert sorted(captures) == sorted(tensors)
 
 
+def _lease_row_live(client, prefix) -> bool:
+    """Whether the newest lease row on the catalog still keeps rivals out."""
+    table = f"`{DATABASE}`.`{prefix}_publisher_lease`"
+    return client.execute(
+        f"SELECT max(expires_at_ns) > toUnixTimestamp64Nano(now64(9)) "
+        f"FROM {table} WHERE term = (SELECT max(term) FROM {table})")[0][0] == 1
+
+
+def _sample_lease(service, client, prefix, seconds, *, origin=None,
+                  every=0.1):
+    """(t, lease_state, row live) every `every` s for `seconds`, t measured
+    from `origin` (time.monotonic(); the first sample by default). The state
+    is read before the row, so a sample that says "held" over a dead row
+    means the service called the lease held after the row had expired."""
+    log = []
+    origin = time.monotonic() if origin is None else origin
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        state = service.snapshot()["lease_state"]
+        log.append((round(time.monotonic() - origin, 2), state,
+                    _lease_row_live(client, prefix)))
+        time.sleep(every)
+    return log
+
+
+def _held_but_dead(log):
+    return [sample for sample in log if sample[1] == "held" and not sample[2]]
+
+
+def _quarantined_at(snapshot, ttl_s: float) -> float:
+    """When the writer quarantined, on time.monotonic()'s clock: the
+    quarantine ends one TTL after it began, on the same steady clock. More
+    precise than the first sample that saw it."""
+    assert snapshot["lease_state"] == "quarantined", snapshot
+    return snapshot["quarantined_until"] - ttl_s
+
+
+def _lease_row_left_s(client, prefix) -> float:
+    """Seconds the newest lease row has left on the server's clock; negative
+    once it has expired."""
+    table = f"`{DATABASE}`.`{prefix}_publisher_lease`"
+    return client.execute(
+        f"SELECT (toInt64(max(expires_at_ns)) - "
+        f"toInt64(toUnixTimestamp64Nano(now64(9)))) / 1e9 "
+        f"FROM {table} WHERE term = (SELECT max(term) FROM {table})")[0][0]
+
+
+def test_passes_over_committed_packs_do_not_hold_off_the_renewal(
+        fake_s3, tmp_path):
+    """The lease thread renews a third of the TTL after the last renewal,
+    and the service counted an index pass as one whenever it indexed or
+    SKIPPED a pack. A pass over packs the catalog had already committed
+    publishes nothing, so nothing renewed the row -- yet each such pass
+    restarted the renewal clock. Packs that keep arriving already committed
+    (re-staged after a crash between upload and spool removal, or reconciled
+    first at start) held the renewal off indefinitely, and the row expired
+    under a service still reporting the lease held. The schedule now runs
+    from when the claim that stamped the row was sent, whatever the passes
+    do."""
+    import os
+
+    spool_root = tmp_path / "spool"
+    _stage(spool_root, range(2))
+    (ready,) = _ready(spool_root)
+    kept = tmp_path / ready.name
+    os.link(ready, kept)  # the spool's copy goes once it is uploaded
+    with _catalog() as (client, catalog):
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, reconcile_on_start=False,
+            lease_ttl_s=3.0, publish_timeout_s=1)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            service.flush(30.0)
+            before = service.snapshot()
+            assert before["indexed_packs"] == 1, before
+
+            # Two TTLs of cycles that each upload the committed pack again
+            # (the uploader finds it in the store and verifies it) and index
+            # it: every pass skips it.
+            log, left = [], []
+            origin = time.monotonic()
+            while time.monotonic() < origin + 6.0:
+                try:
+                    os.link(kept, ready)
+                except FileExistsError:
+                    pass
+                state = service.snapshot()["lease_state"]
+                log.append((round(time.monotonic() - origin, 2), state,
+                            _lease_row_live(client, catalog.table_prefix)))
+                left.append(_lease_row_left_s(client, catalog.table_prefix))
+                time.sleep(0.1)
+            after = service.snapshot()
+            service.rethrow_if_failed()
+        finally:
+            service.stop()
+
+        assert after["indexed_packs"] == 1, after
+        assert after["uploaded_packs"] - before["uploaded_packs"] >= 10, after
+        assert not _held_but_dead(log), log
+        # A renewal falls due a third of the TTL after the last and the lease
+        # thread looks every sixth, so the row never has less than about half
+        # the TTL left; a third leaves room for a slow request.
+        assert min(left) > 1.0, left
+        # One every 1 to 1.5 s over the 6 s.
+        assert after["lease_renewals"] - before["lease_renewals"] >= 3, after
+
+
+def test_a_stalled_renewal_gives_up_while_the_lease_row_is_still_live(
+        fake_s3, tmp_path):
+    """One renewal is three ClickHouse requests, and each was bounded only by
+    the client's request timeout -- 60 s by default, against a 15 s TTL --
+    while the lease thread held the lease lock. A ClickHouse that accepted
+    the renewal's connection and never answered let the row expire with the
+    service still reporting the lease held, so a rival could take the
+    catalog before any error surfaced. Every request made under the lease is
+    now bounded by the lease deadline -- when the claim that stamped the row
+    was sent, plus the TTL, less the skew and a margin -- so the stalled
+    renewal fails, and the writer quarantines, while its row still keeps
+    rivals out."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (client, catalog):
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            reconcile_on_start=False, lease_ttl_s=3.0, publish_timeout_s=1,
+            # Longer than the TTL, so only the lease deadline can end the
+            # stalled request in time.
+            clickhouse_request_timeout_s=20.0)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            assert service.snapshot()["lease_state"] == "held"
+            stalled_at = time.monotonic()
+            switch.stall()
+            # Past the row's whole TTL, so the row has expired by the end.
+            log = _sample_lease(service, client, catalog.table_prefix, 4.0,
+                                origin=stalled_at)
+            assert not _held_but_dead(log), log
+            snapshot = service.snapshot()
+            # At the lease deadline, 2.9 s after start()'s claim was sent,
+            # a moment before stalled_at: before the row can have expired.
+            # From the quarantine itself, not the first sample to see it,
+            # which could come a sampling interval later.
+            quarantined_at = _quarantined_at(snapshot, 3.0) - stalled_at
+            assert 2.0 < quarantined_at < 2.95, (quarantined_at, log)
+            assert "lease renewal failed" in snapshot["last_error"], snapshot
+            assert "Timeout" in snapshot["last_error"], snapshot
+            assert snapshot["failed"] is False, snapshot
+
+            # The quarantine is the recoverable kind: the lease comes back.
+            switch.restore()
+            _wait_for(lambda: service.snapshot()["lease_state"] == "held",
+                      timeout_s=10.0)
+            service.rethrow_if_failed()
+        finally:
+            switch.close()  # releases the stalled connections
+            service.stop()
+
+
+def _catalog_insert_but_the_lease(request: bytes) -> bool:
+    body = request.partition(b"\r\n\r\n")[2]
+    return body.startswith(b"INSERT") and b"_publisher_lease` (term" not in body
+
+
+def test_a_claim_that_wrote_nothing_goes_again_a_tick_later(
+        fake_s3, tmp_path):
+    """A claim that failed before its INSERT went out -- here every
+    connection is refused -- wrote nothing, so it does not quarantine the
+    writer; and so that flush()'s fast cycles do not hammer a catalog that
+    cannot answer, the next claim waits a lease tick (a sixth of the TTL),
+    not a cycle."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        ttl = 6.0  # a 1 s tick
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            reconcile_on_start=False, lease_ttl_s=ttl, publish_timeout_s=1)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            _stage(spool_root, range(2))
+            switch.cut()
+            # The renewal fails and quarantines; once that ends, every claim
+            # fails to connect, and writes nothing.
+            _wait_for(lambda: service.snapshot()["lease_state"]
+                      == "quarantined", timeout_s=ttl)
+            _wait_for(lambda: service.snapshot()["lease_state"]
+                      == "reacquiring", timeout_s=ttl + 2)
+
+            def _flush():
+                try:
+                    service.flush(4.0)
+                except Exception:  # noqa: BLE001 -- only the traffic counts
+                    pass
+
+            flusher = threading.Thread(target=_flush, daemon=True)
+            watched_from = time.monotonic()
+            flusher.start()
+            flusher.join(timeout=10)
+            watched = time.monotonic() - watched_from
+            refused = [t for t in switch.refused if t >= watched_from]
+            snapshot = service.snapshot()
+        finally:
+            switch.close()
+            service.stop()
+
+        # Not quarantined by claims that wrote nothing.
+        assert snapshot["lease_state"] == "reacquiring", snapshot
+        # One claim a tick, of up to three connection attempts each (the
+        # client retries a refused connection): about 12 in 4 s, where
+        # flush()'s cycles, 50 ms apart, would make several times that.
+        assert len(refused) <= 3 * (watched / 1.0 + 2), (len(refused), watched)
+
+
+def _replay_guard_read(request: bytes) -> bool:
+    body = request.partition(b"\r\n\r\n")[2]
+    return (body.startswith(b"SELECT store_id, toString(pack_id) FROM")
+            and b"_pack_inventory" in body)
+
+
+@pytest.mark.parametrize("stalled", [_catalog_insert_but_the_lease,
+                                     _replay_guard_read],
+                         ids=["insert", "read"])
+def test_a_stall_inside_the_index_pass_gives_up_while_the_lease_row_is_live(
+        fake_s3, tmp_path, stalled):
+    """The index pass holds the lease lock across its catalog requests -- the
+    version claim, the descriptor INSERTs, the publish and its read-backs --
+    and those were bounded only by the client's request timeout. One that
+    stalled kept the lease thread from renewing: the row expired while the
+    snapshot still said "held", until the 20 s request timeout. The lease
+    deadline now bounds every request sent under the lease, not only the
+    lease's own, so the stalled request fails, and the lease quarantines,
+    while the row is still live. A stalled INSERT has an unknown outcome and
+    quarantines the writer itself; a stalled read (the replay guard) does
+    not, and it is the lease lock's scope that abandons the lease its
+    deadline passed on, rather than go on calling it held."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (client, catalog):
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            reconcile_on_start=False, lease_ttl_s=3.0, publish_timeout_s=1,
+            clickhouse_request_timeout_s=20.0)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            # Every such request stalls, while the lease's own go through,
+            # so the lease thread alone could keep the row alive -- if it
+            # got the lock.
+            switch.stall_requests(stalled)
+            tensors = _stage(spool_root, range(2))
+            _wait_for(lambda: switch.stalled, timeout_s=10.0)
+            log = _sample_lease(service, client, catalog.table_prefix, 2.5,
+                                origin=switch.stalled[0])
+            _wait_for(lambda: service.snapshot()["lease_state"]
+                      == "quarantined", timeout_s=2.0)
+            snapshot = service.snapshot()
+            log += _sample_lease(service, client, catalog.table_prefix, 3.0,
+                                 origin=switch.stalled[0])
+            assert not _held_but_dead(log), log
+            # By the lease deadline, at most 2.9 s after the stalled
+            # request went out (the lease renews before each request that
+            # finds it due).
+            quarantined_at = _quarantined_at(snapshot, 3.0) - switch.stalled[0]
+            assert quarantined_at < 2.95, (quarantined_at, log)
+            assert snapshot["failed"] is False
+
+            switch.restore()
+            service.flush(30.0)
+            service.rethrow_if_failed()
+        finally:
+            switch.close()
+            service.stop()
+
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert sorted(captures) == sorted(tensors)
+
+
+def _ranged_get(request: bytes) -> bool:
+    head = request.partition(b"\r\n\r\n")[0].lower()
+    return head.startswith(b"get ") and b"\r\nrange:" in head
+
+
+def test_a_stalled_object_store_read_does_not_hold_up_the_lease(
+        fake_s3, tmp_path):
+    """The index pass read each pack's footer from the object store with the
+    lease lock held, so a GET that stalled -- bounded only by the S3 read
+    timeout, 120 s by default -- kept the lease thread from renewing, and the
+    row expired while the snapshot said "held". The pass now takes the lock
+    only for its catalog requests and reads packs without it, so the lease
+    keeps renewing through a stalled read."""
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (client, catalog):
+        config = _storage_config(
+            s3.url, catalog.table_prefix, reconcile_on_start=False,
+            lease_ttl_s=3.0, publish_timeout_s=1)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            # The uploader PUTs and HEADs a new pack; only the indexer's
+            # footer reads are ranged GETs.
+            s3.stall_requests(_ranged_get)
+            tensors = _stage(spool_root, range(2))
+            _wait_for(lambda: s3.stalled, timeout_s=10.0)
+            renewals = service.snapshot()["lease_renewals"]
+            # Two TTLs: without renewals the row would be long dead.
+            log = _sample_lease(service, client, catalog.table_prefix, 6.0,
+                                origin=s3.stalled[0])
+            assert all(state == "held" and live
+                       for _, state, live in log), log
+            assert service.snapshot()["lease_renewals"] >= renewals + 3
+
+            # Fail the stalled read: the pack stays owed and indexes after.
+            s3.cut()
+            s3.restore()
+            service.flush(30.0)
+            service.rethrow_if_failed()
+        finally:
+            s3.close()
+            service.stop()
+
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert sorted(captures) == sorted(tensors)
+
+
+def test_a_pass_whose_lease_changed_while_it_read_rereads_the_replay_guard(
+        fake_s3, tmp_path):
+    """Reading packs without the lease lock opens a window the whole-pass
+    lock did not have: the lease can be lost and taken afresh while the pass
+    reads, and another publisher can hold the catalog meanwhile and index
+    the same packs (its reconcile finds them uploaded and uncommitted). The
+    replay guard the pass read first no longer holds then, and a commit that
+    trusted it would publish the packs a second time, at a higher version.
+    The commit reads the guard again when the lease is not the one it was
+    read under."""
+    from tests.test_native_catalog_lease_live import CatalogDriver, _open
+
+    spool_root = tmp_path / "spool"
+    _stage(spool_root, range(4))  # two packs
+    store = _Driver(STORE_DRIVER)
+    try:
+        uploaded = store.call(
+            op="upload_pending", endpoint=fake_s3, bucket=BUCKET,
+            region=REGION, access=ACCESS, secret=SECRET, token=None,
+            insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
+            store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
+        assert uploaded["ok"], uploaded
+    finally:
+        store.close()
+    refs = uploaded["refs"]
+    assert len(refs) == 2, refs
+
+    with _catalog() as (client, catalog):
+        driver = CatalogDriver()
+        try:
+            _open(driver, catalog.table_prefix)
+            assert driver.call(op="ensure_schema")["ok"]
+            assert driver.call(op="acquire", holder="indexer")["ok"]
+            result = driver.call(
+                op="index", refs=refs, endpoint=fake_s3, bucket=BUCKET,
+                region=REGION, access=ACCESS, secret=SECRET, insecure=True,
+                rival_indexes_before_commit=True)
+            assert result["ok"], result
+            assert result["result"]["indexed_packs"] == 0, result
+            assert result["result"]["skipped_packs"] == 2, result
+            assert driver.call(op="release")["ok"]
+        finally:
+            driver.close()
+
+        table = f"`{DATABASE}`.`{catalog.table_prefix}_capture_raw`"
+        # The rival's one publish, not a second copy of every descriptor.
+        assert client.execute(
+            f"SELECT count(), uniqExact(index_version) FROM {table}") == [
+                (4, 1)]
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert len(captures) == 4
+
+
+def _lease_head_read(request: bytes) -> bool:
+    return b"SELECT term, toString(lease_id)" in request
+
+
+@pytest.mark.parametrize("schema", ["installed", "fresh"])
+def test_start_survives_a_first_lease_read_slower_than_its_bound(
+        fake_s3, tmp_path, schema):
+    """A claim made without a lease has min(clickhouse_request_timeout_s,
+    lease_ttl_s / 3) per request, and a cold server's first read can take
+    longer. start() failed outright when its claim timed out; it now retries
+    one that did, as it retries one another holder refused, until
+    start_lease_wait_s runs out. A head read that timed out wrote nothing,
+    so it does not quarantine the writer and the retry need not wait. On a
+    fresh catalog the first lease read is the schema install's claim, and
+    that is the first start against a new catalog -- when the server is
+    likeliest to be cold -- so it is retried the same way, within the
+    install lease's own wait."""
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
+                     publish_timeout_s=1)
+        if schema == "installed":
+            # The schema first, directly: then the service's own claim is
+            # the first lease read through the switch.
+            warm = _service(_storage_config(fake_s3, catalog.table_prefix,
+                                            **knobs), tmp_path / "warm")
+            warm.start()
+            warm.stop()
+
+        switch.slow_once(_lease_head_read, 1.5)  # past the 1 s claim bound
+        service = _service(_storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            **knobs), tmp_path / "spool")
+        started = time.monotonic()
+        service.start()
+        try:
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "held", snapshot
+            # Retried at once (the install claim after its 0.5 s retry
+            # sleep), without waiting out a 3 s quarantine.
+            assert 1.0 <= elapsed < 3.0, elapsed
+            if schema == "installed":
+                # The schema install records no error of its own.
+                assert "Timeout" in snapshot["last_error"], snapshot
+        finally:
+            service.stop()
+            switch.close()
+
+
+def _first(predicate):
+    """A predicate that picks only the first request `predicate` does."""
+    picked = []
+
+    def _pick(request: bytes) -> bool:
+        if picked or not predicate(request):
+            return False
+        picked.append(time.monotonic())
+        return True
+
+    return _pick
+
+
+@pytest.mark.parametrize("delivered", [False, True],
+                         ids=["never-delivered", "delivered-late"])
+def test_start_waits_out_the_quarantine_its_own_claim_left(
+        fake_s3, tmp_path, delivered):
+    """A claim INSERT that timed out at start() may still land, so it
+    quarantines the writer for a TTL -- and start() failed at once whenever
+    that quarantine ended past start_lease_wait_s, which at the default wait
+    (lease_ttl_s + publish_timeout_s + clock_skew_s) it always did once the
+    INSERT had used its claim bound: a slow INSERT at start, a cold
+    replicated catalog's quorum INSERT say, still failed start(). The
+    quarantine is now waited out even past the wait, once, like the live
+    row of a crashed predecessor it may be, and the claim made again after
+    it -- refused by the late row, if it landed, until that expires."""
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
+                     publish_timeout_s=1)
+        warm = _service(_storage_config(fake_s3, catalog.table_prefix,
+                                        **knobs), tmp_path / "warm")
+        warm.start()
+        warm.stop()
+
+        if delivered:
+            # Reaches the server after the 1 s claim bound: the row lands,
+            # and is this service's own, live for a TTL.
+            switch.slow_once(_lease_insert, 1.5)
+        else:
+            switch.stall_requests(_first(_lease_insert))
+        service = _service(_storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            **knobs), tmp_path / "spool")
+        started = time.monotonic()
+        service.start()
+        try:
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "held", snapshot
+            # The claim timed out at 1 s and quarantined until 4 s; the
+            # default wait, 3 + 1 = 4 s, ended before a claim could follow.
+            assert 3.9 < elapsed < 7.0, elapsed
+        finally:
+            service.stop()
+            switch.close()
+
+
+def _listing(request: bytes) -> bool:
+    line = request.partition(b"\r\n")[0]
+    return line.startswith(b"GET ") and b"list-type=2" in line
+
+
+def _upload_behind_the_service(spool_root: Path, endpoint: str) -> list:
+    """Upload what the spool holds without indexing it -- the crash window
+    between an upload and its index -- and return the refs."""
+    store = _Driver(STORE_DRIVER)
+    try:
+        uploaded = store.call(
+            op="upload_pending", endpoint=endpoint, bucket=BUCKET,
+            region=REGION, access=ACCESS, secret=SECRET, token=None,
+            insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
+            store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
+        assert uploaded["ok"], uploaded
+    finally:
+        store.close()
+    assert _ready(spool_root) == []
+    return uploaded["refs"]
+
+
+def _sample_during(call, service, client, prefix, *, every=0.1):
+    """Run call() while sampling (t, lease_state, row live) from another
+    thread, as _sample_lease does; the row is read only while the service
+    says "held", since the lease table may not exist before that."""
+    log = []
+    done = threading.Event()
+    origin = time.monotonic()
+
+    def _sample():
+        while not done.is_set():
+            state = service.snapshot()["lease_state"]
+            live = (_lease_row_live(client, prefix) if state == "held"
+                    else None)
+            log.append((round(time.monotonic() - origin, 2), state, live))
+            time.sleep(every)
+
+    sampler = threading.Thread(target=_sample, daemon=True)
+    sampler.start()
+    try:
+        call()
+    finally:
+        done.set()
+        sampler.join(timeout=10)
+    return log
+
+
+@pytest.mark.parametrize("crash_window_pack", [True, False])
+def test_the_lease_renews_while_start_reconciles(
+        fake_s3, tmp_path, crash_window_pack):
+    """start() takes the lease, then sweeps the spool and reconciles the
+    bucket, and only then started the lease thread: nothing renewed the
+    lease while a large bucket was listed. Once its deadline passed, the
+    first lease-locked step abandoned it, so a crash-window pack found after
+    that could not be indexed and start() failed, where main re-claimed its
+    own lapsed row and indexed it; with nothing to index, start() returned
+    with the lease quarantined, and the snapshot said "held" over a dead row
+    all through the listing. The lease thread now runs from the moment the
+    lease is taken. One slow listing page (6 s, two TTLs) stands in for a
+    bucket of many pages."""
+    spool_root = tmp_path / "spool"
+    tensors = {}
+    if crash_window_pack:
+        tensors = _stage(spool_root, range(2))
+        _upload_behind_the_service(spool_root, fake_s3)
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (client, catalog):
+        config = _storage_config(s3.url, catalog.table_prefix,
+                                 lease_ttl_s=3.0, publish_timeout_s=1)
+        service = _service(config, spool_root)
+        s3.slow_once(_listing, 6.0)
+        try:
+            log = _sample_during(service.start, service, client,
+                                 catalog.table_prefix)
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "held", snapshot
+            assert snapshot["reconcile_passes"] == 1, snapshot
+            assert snapshot["reconciled_packs"] == int(crash_window_pack), \
+                snapshot
+            assert snapshot["indexed_packs"] == int(crash_window_pack), \
+                snapshot
+            assert snapshot["lease_renewals"] >= 3, snapshot
+            assert not _held_but_dead(log), log
+            service.flush(30.0)
+            service.rethrow_if_failed()
+        finally:
+            service.stop()
+            s3.close()
+
+        if crash_window_pack:
+            captures = _read_all(_storage_config(fake_s3,
+                                                 catalog.table_prefix))
+            assert sorted(captures) == sorted(tensors)
+
+
+def test_the_lease_renews_until_the_loops_last_cycle_is_done(
+        fake_s3, tmp_path):
+    """stop() woke the loop and the lease thread together, and the lease
+    thread left at once while the loop's last cycle still ran: a pass
+    reading a pack then found its lease abandoned at the commit, and the
+    snapshot said "held" over a dead row until then. The lease thread now
+    stops only after the loop has."""
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (client, catalog):
+        config = _storage_config(s3.url, catalog.table_prefix,
+                                 reconcile_on_start=False, lease_ttl_s=3.0,
+                                 publish_timeout_s=1)
+        service = _service(config, spool_root)
+        service.start()
+        reads = []
+
+        def _first_read(request: bytes) -> bool:
+            if _ranged_get(request):
+                reads.append(time.monotonic())
+                return True
+            return False
+
+        try:
+            s3.slow_once(_first_read, 4.0)  # past the lease deadline
+            tensors = _stage(spool_root, range(2))
+            _wait_for(lambda: reads, timeout_s=10.0)
+            log = _sample_during(service.stop, service, client,
+                                 catalog.table_prefix)
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+            s3.close()
+
+        assert not _held_but_dead(log), log
+        assert snapshot["indexed_packs"] == 1, snapshot
+        assert snapshot["lease_state"] == "released", snapshot
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert sorted(captures) == sorted(tensors)
+
+
+def _slow_catalog(insert_s: float, read_s: float):
+    """A delay_requests() function: a catalog slow but healthy, every INSERT
+    answered insert_s late and every SELECT read_s late."""
+    def _delay(request: bytes) -> float:
+        body = request.partition(b"\r\n\r\n")[2]
+        if body.startswith(b"INSERT"):
+            return insert_s
+        if body.startswith(b"SELECT"):
+            return read_s
+        return 0.0
+    return _delay
+
+
+def test_a_slow_but_healthy_catalog_keeps_its_lease_through_index_passes(
+        fake_s3, tmp_path):
+    """Every request made under the lease lock has to be answered by the
+    lease deadline, and a pass renewed only at the indexer's keep_lease hook,
+    before its catalog writes. Between two hooks ran several requests with
+    no chance to renew -- allocate_version's two max() reads, its claim
+    INSERT and read-back; the publish's watermark INSERT, read-backs and the
+    inventory commit -- so against a catalog slow but healthy the renewal
+    at the next hook started with too little time left, timed out, and
+    quarantined the lease, pass after pass: flush() never drained. main
+    drained it, bounding nothing. The renewal is now checked before every
+    request made under the lease lock, reads included. Scaled 1/5: 0.6 s
+    INSERTs and 0.2 s reads against a 3 s TTL are 3 s and 1 s at the 15 s
+    default."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (client, catalog):
+        knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
+                     publish_timeout_s=1, clickhouse_request_timeout_s=20.0)
+        warm = _service(_storage_config(fake_s3, catalog.table_prefix,
+                                        **knobs), tmp_path / "warm")
+        warm.start()
+        warm.stop()
+
+        switch.delay_requests(_slow_catalog(0.6, 0.2))
+        service = _service(_storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            **knobs), spool_root)
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(4))  # two packs
+            log = _sample_during(lambda: service.flush(60.0), service,
+                                 client, catalog.table_prefix, every=0.2)
+            snapshot = service.snapshot()
+            service.rethrow_if_failed()
+        finally:
+            switch.close()
+            service.stop()
+
+        assert {state for _, state, _ in log} == {"held"}, log
+        assert not _held_but_dead(log), log
+        assert snapshot["indexed_packs"] == 2, snapshot
+        assert snapshot["lease_timeouts"] == 0, snapshot
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert sorted(captures) == sorted(tensors)
+
+
+def test_a_catalog_too_slow_to_keep_its_lease_says_so(fake_s3, tmp_path):
+    """The lease-timeout streak reset on every successful claim, and counted
+    only claims and renewals that timed out. Against a catalog too slow to
+    keep a lease -- each claim goes through, then a renewal or a request of
+    the pass runs out of lease, the writer quarantines, and the next claim
+    goes through again -- the count went 1, 0, 1, 0 and the knobs were
+    never named. Every timeout that costs the lease now counts, and the
+    count clears only once a lease has been held for 2 x TTL. Scaled 1/5:
+    0.9 s INSERTs and 0.4 s reads against a 3 s TTL."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
+                     publish_timeout_s=1, clickhouse_request_timeout_s=20.0)
+        warm = _service(_storage_config(fake_s3, catalog.table_prefix,
+                                        **knobs), tmp_path / "warm")
+        warm.start()
+        warm.stop()
+
+        switch.delay_requests(_slow_catalog(0.9, 0.4))
+        service = _service(_storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            **knobs), spool_root)
+        service.start()
+        states = []
+        stop = threading.Event()
+
+        def _sample():
+            while not stop.is_set():
+                states.append(service.snapshot()["lease_state"])
+                time.sleep(0.1)
+
+        sampler = threading.Thread(target=_sample, daemon=True)
+        sampler.start()
+        try:
+            _stage(spool_root, range(4))
+
+            def _flush():
+                try:
+                    service.flush(40.0)  # never drains; stop() ends it
+                except Exception:  # noqa: BLE001 -- "not started" once stopped
+                    pass
+
+            flusher = threading.Thread(target=_flush, daemon=True)
+            flusher.start()
+            _wait_for(lambda: service.snapshot()["lease_timeout_error"],
+                      timeout_s=30.0)
+            snapshot = service.snapshot()
+        finally:
+            stop.set()
+            switch.close()
+            service.stop()
+            sampler.join(timeout=5)
+
+        # The claims went through: this is the lease lost after each.
+        assert "held" in states and "quarantined" in states, states
+        assert snapshot["lease_timeouts"] >= 3, snapshot
+        assert snapshot["failed"] is False, snapshot
+        for knob in ("lease_ttl_s", "clock_skew_s",
+                     "clickhouse_request_timeout_s", "lease_ttl_s / 3"):
+            assert knob in snapshot["lease_timeout_error"], snapshot
+        # last_error is whatever failed last -- the knobs when the count
+        # reached three, the pass the lost lease failed a moment later.
+        assert "lease" in snapshot["last_error"], snapshot
+
+
+def _lease_insert(request: bytes) -> bool:
+    body = request.partition(b"\r\n\r\n")[2]
+    return body.startswith(b"INSERT") and b"_publisher_lease` (term" in body
+
+
+def test_a_lease_lost_while_start_reconciles_is_retaken_and_the_pass_rerun(
+        fake_s3, tmp_path):
+    """A lease lost while start() reconciled failed start(): the pass's
+    commit found no lease and start() rethrew, although a quarantine is the
+    recoverable kind everywhere else. Here the lease thread's renewal stalls
+    while the listing is slow, so the lease quarantines before the
+    crash-window pack is found. start() now returns, and the loop takes a
+    fresh lease once the quarantine ends and runs the reconcile it owes."""
+    spool_root = tmp_path / "spool"
+    tensors = _stage(spool_root, range(2))
+    _upload_behind_the_service(spool_root, fake_s3)
+    s3 = _Switch.to_url(fake_s3)
+    catalog_switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        knobs = dict(lease_ttl_s=3.0, publish_timeout_s=1,
+                     clickhouse_request_timeout_s=20.0)
+        # The schema first, directly, so that the service's claim is the
+        # first lease INSERT through the switch.
+        warm = _service(_storage_config(fake_s3, catalog.table_prefix,
+                                        reconcile_on_start=False, **knobs),
+                        tmp_path / "warm")
+        warm.start()
+        warm.stop()
+
+        seen = []
+
+        def _renewal(request: bytes) -> bool:
+            if not _lease_insert(request):
+                return False
+            seen.append(request)
+            return len(seen) > 1  # the claim goes through, renewals stall
+
+        catalog_switch.stall_requests(_renewal)
+        s3.slow_once(_listing, 2.5)  # past the first renewal, due at 1 s
+        service = _service(_storage_config(
+            s3.url, catalog.table_prefix,
+            clickhouse_port=catalog_switch.port, **knobs), spool_root)
+        service.start()
+        try:
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "quarantined", snapshot
+            assert snapshot["indexed_packs"] == 0, snapshot
+            assert "reconcile at start lost the publisher lease" in \
+                snapshot["last_error"], snapshot
+
+            catalog_switch.restore()
+            _wait_for(lambda: service.snapshot()["reconciled_packs"] == 1,
+                      timeout_s=15.0)
+            service.flush(30.0)
+            snapshot = service.snapshot()
+            assert snapshot["indexed_packs"] == 1, snapshot
+            assert snapshot["lease_state"] == "held", snapshot
+            service.rethrow_if_failed()
+        finally:
+            service.stop()
+            catalog_switch.close()
+            s3.close()
+
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert sorted(captures) == sorted(tensors)
+
+
+def test_lease_requests_that_keep_timing_out_name_the_knobs_that_bound_them(
+        fake_s3, tmp_path):
+    """On a catalog too slow for its lease the service went round -- a claim
+    timed out, quarantined, was refused by its own late row, started over --
+    and all the snapshot ever said was "curl: Timeout was reached". Once
+    three lease requests in a row time out, the snapshot names the bound
+    and the knobs that set it, until a lease has been held for 2 x TTL
+    again."""
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            reconcile_on_start=False, lease_ttl_s=3.0, publish_timeout_s=1,
+            clickhouse_request_timeout_s=20.0)
+        service = _service(config, tmp_path / "spool")
+        service.start()
+        try:
+            snapshot = service.snapshot()
+            assert snapshot["lease_timeouts"] == 0, snapshot
+            assert snapshot["lease_timeout_error"] == "", snapshot
+
+            # The renewal times out at the lease deadline, then every claim
+            # at its own bound.
+            switch.stall()
+            _wait_for(lambda: service.snapshot()["lease_timeout_error"],
+                      timeout_s=15.0)
+            snapshot = service.snapshot()
+            assert snapshot["lease_timeouts"] >= 3, snapshot
+            assert snapshot["failed"] is False, snapshot
+            for text in (snapshot["lease_timeout_error"],
+                         snapshot["last_error"]):
+                for knob in ("lease_ttl_s", "clickhouse_request_timeout_s",
+                             "lease_ttl_s / 3"):
+                    assert knob in text, snapshot
+
+            switch.restore()
+            _wait_for(lambda: service.snapshot()["lease_timeout_error"] == "",
+                      timeout_s=15.0)
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "held", snapshot
+            assert snapshot["lease_timeouts"] == 0, snapshot
+            service.rethrow_if_failed()
+        finally:
+            switch.close()
+            service.stop()
+
+
+def test_the_lease_statements_carry_a_server_side_cap(fake_s3, tmp_path):
+    """The claim INSERT went out with no max_execution_time, unlike every
+    fenced publish statement. A request the client gave up on could still
+    land its claim row later -- after the quarantine that was meant to
+    outlive it had ended. The cap makes the server abandon the INSERT no
+    later than the client does: the time left before the request's
+    deadline, to the millisecond, and lock_acquire_timeout the same."""
+    with _catalog() as (client, catalog):
+        # The production knobs: a 15 s TTL.
+        config = _storage_config(fake_s3, catalog.table_prefix,
+                                 reconcile_on_start=False, holder="cap-test")
+        service = _service(config, tmp_path / "spool")
+        service.start()
+        service.stop()  # the release tombstone is a lease INSERT too
+
+        rows = []
+        for _ in range(25):
+            client.execute("SYSTEM FLUSH LOGS")
+            rows = client.execute(
+                "SELECT query, Settings['max_execution_time'], "
+                "Settings['timeout_overflow_mode'], "
+                "Settings['lock_acquire_timeout'] FROM system.query_log "
+                "WHERE type = 'QueryFinish' AND query LIKE 'INSERT%' "
+                f"AND query LIKE '%{catalog.table_prefix}_publisher_lease%'")
+            ours = [query for query, *_ in rows if "'cap-test'" in query]
+            if len(ours) >= 2:
+                break
+            time.sleep(0.2)
+        # The service's claim and its tombstone, beside the schema check's.
+        assert len(ours) == 2, rows
+        for query, cap, overflow, lock in rows:
+            if "now_ns + toUInt64" in query:
+                # A claim with no lease held: min(clickhouse_request_timeout_s,
+                # lease_ttl_s / 3) = 5 s, less the microseconds since.
+                assert 4.9 < float(cap) <= 5.0, (query, cap)
+            else:
+                # A tombstone, under the lease: what is left of 15 s less
+                # the 0.1 s margin since the claim was sent.
+                assert 12.0 < float(cap) < 14.9, (query, cap)
+            assert lock == cap, (query, lock)
+            # The log lists only settings that differ from the default, and
+            # throw is the default; break would insert what had been read.
+            assert overflow in ("", "throw"), (query, overflow)
+
+
 def _latch_lines(err: str) -> list[str]:
     return [line for line in err.splitlines() if "indexing stopped" in line]
 
@@ -1043,6 +2091,64 @@ def test_a_rival_that_stops_within_two_ttls_does_not_latch(
         assert snapshot["lease_reacquisitions"] >= 1, snapshot
         assert sorted(_read_all(_storage_config(
             fake_s3, catalog.table_prefix))) == sorted(tensors)
+    assert _latch_lines(capfd.readouterr().err) == []
+
+
+def test_a_late_landing_claim_of_its_own_does_not_latch_the_service(
+        fake_s3, tmp_path, capfd):
+    """The lease INSERT's server-side cap cannot cover a request held up in
+    transit: the server starts the clock only when the statement reaches
+    it. Such a claim lands after the client gave up and quarantined, and its
+    row then refuses the service's own next claim. Refusals by a rival that
+    had since left and by that row of our own added up to 2 x TTL, and the
+    service latched "held by another publisher" against itself. A refusal
+    by the service's own claim row now restarts the refusal clock."""
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
+                     publish_timeout_s=1)
+        first = _service(_storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            holder="first-publisher", **knobs), tmp_path / "first")
+        rival = _service(_storage_config(
+            fake_s3, catalog.table_prefix, holder="rival-publisher",
+            start_lease_wait_s=10.0, **knobs), tmp_path / "rival")
+        first.start()
+        try:
+            # A cut quarantines the first service; the rival takes over.
+            switch.cut()
+            rival.start()
+            switch.restore()
+            # The first service's quarantine ends and the rival refuses it:
+            # the refusal clock starts.
+            _wait_for(lambda: first.snapshot()["lease_state"] == "reacquiring",
+                      timeout_s=10.0)
+            refused_at = time.monotonic()
+            # Well inside 2 x TTL of refusals the rival leaves (a handover),
+            # and the first service's next claim is delivered 1.5 s late:
+            # the 1 s bound on a claim made without a lease (lease_ttl_s / 3)
+            # gives up first, and it quarantines.
+            time.sleep(max(0.0, refused_at + 4.0 - time.monotonic()))
+            switch.deliver_lease_inserts_late(1.5)
+            rival.stop()
+            _wait_for(lambda: first.snapshot()["lease_state"] == "quarantined",
+                      timeout_s=3.0)
+            switch.restore()
+            # The late claim lands inside the quarantine and outlives it by
+            # about a second, refusing the first service's next claim more
+            # than 2 x TTL after the rival's first refusal.
+            _wait_for(lambda: first.snapshot()["lease_state"] == "held"
+                      or first.snapshot()["failed"], timeout_s=10.0)
+            snapshot = first.snapshot()
+            assert time.monotonic() - refused_at > 2 * 3.0, snapshot
+            assert snapshot["failed"] is False, snapshot
+            assert snapshot["lease_state"] == "held", snapshot
+            first.rethrow_if_failed()
+        finally:
+            first.stop()
+            rival.stop()
+            switch.close()
+
     assert _latch_lines(capfd.readouterr().err) == []
 
 

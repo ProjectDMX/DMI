@@ -38,6 +38,24 @@
 // (clickhouse_catalog.py, publish_snapshot). Only a foreign lease that stays
 // live for 2 x TTL is fatal: the service stops (snapshot().failed), writes
 // one line to stderr, and flush() rethrows the refusal naming the holder.
+// A refusal by one of the service's own claim rows -- a claim that landed
+// after its request gave up -- is no rival and restarts that clock.
+//
+// Bounded by the lease. Every catalog request the service makes while it
+// holds the lease -- the renewal's own, and every one an index pass or a
+// reconcile sends under the lease lock -- has to be answered by the lease
+// deadline (lease_coordinator.h), since while that lock is held the lease
+// renews only between those requests, before each one that finds it due:
+// so a catalog that stops answering fails the stretch, and the lease
+// quarantines, while its row still keeps rivals out. A lease whose deadline
+// passes unrenewed is abandoned, never reported held (LeaseScope).
+// An index pass reads its packs from the object store without the lock, so
+// a stalled read cannot hold the renewal off either. Claims made with no
+// lease are bounded by min(request timeout, lease_ttl / 3) per request; a
+// claim that times out at start() is retried until start_lease_wait_ns ends
+// (or, once, until the quarantine it left is over), and lease requests that
+// keep timing out say which knobs bound them (snapshot().lease_timeout_error). The constructor refuses a clock skew
+// that leaves a renewal too little time to finish.
 #pragma once
 
 #include <atomic>
@@ -98,7 +116,9 @@ struct StorageServiceConfig {
 
   // How long start() waits for another holder's lease to expire before it
   // fails with the lease held. A crashed predecessor's lease stays live for
-  // up to its TTL; 0 fails at once.
+  // up to its TTL; 0 fails at once. A claim of start()'s own that timed out
+  // is retried within it, and a quarantine that claim left is waited out
+  // even past it, once (acquire_lease_at_start).
   uint64_t start_lease_wait_ns = 0;
 
   // Sweep a crashed sink's stale .open files before anything writes to the
@@ -115,11 +135,16 @@ struct StorageServiceConfig {
   // UploadPending does not stop when the lease is lost: a holder that is
   // quarantined, or refused a renewal or publish, while a batch is in
   // flight finishes that batch (which can outlast the TTL), and only its
-  // later cycles upload nothing while it holds no lease. A stalled one
-  // still holds the lease locally and starts new batches until a renewal
-  // or publish is refused. Two on different (database, table_prefix) pairs
-  // each hold a lease and upload freely. The spool itself is not locked;
-  // one process per spool is the caller's job.
+  // later cycles upload nothing while it holds no lease. One whose catalog
+  // requests stall gives the lease up at its deadline, before its row
+  // lapses: requests made under the lease are cut off there, and a cycle's
+  // check abandons a lease past it (LeaseScope), so no batch starts after
+  // that. Only a holder whose whole process stalls keeps the lease locally
+  // past its row: until it resumes and next checks, or -- after a system
+  // suspend, which the steady clock the deadline runs on does not count --
+  // until a renewal or publish is refused. Two on different (database,
+  // table_prefix) pairs each hold a lease and upload freely. The spool
+  // itself is not locked; one process per spool is the caller's job.
   bool sweep_spool_on_start = true;
   bool reconcile_on_start = true;
 };
@@ -151,6 +176,15 @@ struct StorageServiceSnapshot {
   // steady_clock ns at which the quarantine ends; 0 when not quarantined.
   uint64_t quarantined_until_ns = 0;
   uint64_t lease_reacquisitions = 0;  // fresh leases taken after a loss
+  // Timeouts that cost the publisher lease -- a claim or renewal that timed
+  // out (the server's own time limit included), a request made under the
+  // lease that its deadline cut off, a lease abandoned at its deadline --
+  // since a lease was last held for 2 x TTL. From the third on,
+  // lease_timeout_error says so and names the knobs that bound them (it is
+  // last_error too, when it happens); both clear once a lease has been held
+  // for 2 x TTL again.
+  uint64_t lease_timeouts = 0;
+  std::string lease_timeout_error;
   std::string last_error;
 };
 
@@ -162,9 +196,14 @@ class CaptureStorageService {
   CaptureStorageService& operator=(const CaptureStorageService&) = delete;
 
   // Ensure the catalog schema, take the publisher lease (waiting up to
-  // start_lease_wait_ns for another holder's to expire), sweep the spool,
-  // reconcile once, then start the background cycle. Throws if the lease is
-  // still held by another publisher when the wait ends.
+  // start_lease_wait_ns for another holder's to expire, or for a claim that
+  // timed out to go through -- past it, once, to wait out the quarantine
+  // such a claim left), sweep the spool, reconcile once, then start the
+  // background cycle. The lease renews from the moment it is taken.
+  // Throws if the lease is still held by another publisher when the wait
+  // ends, or its claim still times out. A lease lost while the reconcile
+  // runs does not fail start(): the loop takes a fresh one, as it would
+  // later, and reconciles then.
   void start();
 
   // Run cycles until one finds the spool empty with every uploaded pack
@@ -191,7 +230,28 @@ class CaptureStorageService {
     bool failed = true;    // an upload or index failed, or the cycle threw
   };
 
+  // Holds lease_mutex_ for a stretch of catalog work, and bounds every
+  // request the thread makes meanwhile by the held lease's deadline -- read
+  // afresh per request, so a renewal inside the stretch extends it at once.
+  // Before each request it renews the lease if that has fallen due
+  // (keep_lease_in_pass). A lease whose deadline has passed is abandoned on
+  // the way in and on the way out, so it is neither used nor reported held;
+  // the lease state is published on the way out. Every use of writer_'s
+  // lease goes through one but the schema install's at start(), before
+  // anything else can use the coordinator: CatalogSchema::ensure() claims,
+  // renews and releases its install lease there directly, its DDL bounded
+  // by the client's timeouts rather than by that lease's deadline, and an
+  // install claim that timed out is retried, not quarantined -- a row of it
+  // that lands late refuses start()'s own claim until it expires, which
+  // start() waits out like any holder's.
+  class LeaseScope;
+
   void loop();
+  // start()'s spool sweep and reconcile, with the lease held and the lease
+  // thread renewing it. Requires cycle_mutex_.
+  void sweep_and_reconcile_at_start();
+  // Stops the lease thread and waits for it.
+  void stop_lease_thread();
   CycleOutcome run_cycle();  // requires cycle_mutex_
   // Indexes refs in bounded batches, appending every ref that did not index
   // to *unindexed. Only a lost lease propagates; other failures are recorded.
@@ -200,13 +260,30 @@ class CaptureStorageService {
   void reconcile();
   void keep_lease();          // the lease thread's body
   void renew_lease_if_due();  // requires lease_mutex_
-  // Takes the lease at start(), waiting for an expiring predecessor.
+  // LeaseScope's before_request hook: renew_lease_if_due() before each
+  // request a stretch under the lease lock sends.
+  void keep_lease_in_pass();  // requires lease_mutex_
+  // Gives up a held lease whose deadline has passed, counting it towards
+  // lease_timeouts. Requires lease_mutex_.
+  void abandon_lease_if_expired();
+  // A lease claim or renewal failed (call from its catch block): one that
+  // timed out counts towards lease_timeouts. Requires lease_mutex_.
+  void note_lease_failure(const std::exception& failure);
+  // Counts one timeout that cost the lease; `latest` says what it was.
+  // Requires lease_mutex_.
+  void count_lease_timeout(const std::string& latest);
+  // Clears the timeout count once the lease now held has been held for
+  // 2 x TTL (publish_lease_state runs it). Requires lease_mutex_.
+  void track_stable_lease();
+  // Takes the lease at start(), waiting for an expiring predecessor or
+  // retrying a claim that timed out.
   void acquire_lease_at_start();  // requires lease_mutex_
   // Whether the writer holds a lease, taking a fresh one when it has none
   // and is no longer quarantined. Never throws. Requires lease_mutex_.
   bool ensure_publisher_lease();
   // Another holder refused a claim or renewal; latches once that has lasted
-  // 2 x TTL. Call from the catch block. Requires lease_mutex_.
+  // 2 x TTL. A refusal by the service's own claim rows restarts the clock
+  // instead. Call from the catch block. Requires lease_mutex_.
   void lease_held_elsewhere(const CatalogError& refusal);
   void publish_lease_state();  // requires lease_mutex_
   // Sets a pack aside for good; flush() reports it. Requires cycle_mutex_.
@@ -226,10 +303,20 @@ class CaptureStorageService {
   // is not thread-safe. Timed, so flush() can give up at its deadline while
   // a cycle is still in flight.
   std::timed_mutex cycle_mutex_;
-  // Serialises every use of writer_'s lease: the lease thread renews it
-  // while cycles publish. Taken inside cycle_mutex_, never the other way.
+  // Serialises every use of writer_'s lease (but the schema install's at
+  // start(), see LeaseScope): the lease thread renews it while cycles
+  // publish. Taken inside cycle_mutex_, never the other way, and only
+  // through a LeaseScope.
   std::mutex lease_mutex_;
-  uint64_t last_renew_ns_ = 0;  // guarded by lease_mutex_
+  // Timeouts that cost the lease since one was last held for 2 x TTL, and
+  // every one ever counted (which LeaseScope compares, so that a loss is
+  // counted once). Guarded by lease_mutex_.
+  uint64_t lease_timeouts_ = 0;
+  uint64_t lease_timeouts_counted_ = 0;
+  // The lease_id held when publish_lease_state() last looked, and since
+  // when (track_stable_lease). Guarded by lease_mutex_.
+  std::string stable_lease_id_;
+  uint64_t stable_since_ns_ = 0;
   // When a claim or renewal was first refused by another holder since the
   // lease was last held; 0 while none has been. Guarded by lease_mutex_.
   uint64_t held_elsewhere_since_ns_ = 0;
@@ -237,6 +324,9 @@ class CaptureStorageService {
   // hammer the lease table. Guarded by lease_mutex_.
   uint64_t next_claim_ns_ = 0;
   uint64_t last_reconcile_ns_ = 0;
+  // The reconcile at start() lost the lease before it finished; the loop
+  // runs one once it holds a lease again. Guarded by cycle_mutex_.
+  bool reconcile_owed_ = false;
   int failure_streak_ = 0;  // consecutive failed cycles, for the backoff
   // Uploaded, so gone from the spool, but not yet in the catalog.
   std::vector<PackRefData> pending_index_;
@@ -245,11 +335,13 @@ class CaptureStorageService {
 
   std::thread thread_;
   // Renews on its own schedule, so neither the cycle backoff nor a slow
-  // upload can let the lease lapse while the service still runs.
+  // upload can let the lease lapse while the service still runs. It runs
+  // from the moment start() takes the lease until the loop has stopped.
   std::thread lease_thread_;
   std::mutex wake_mutex_;
   std::condition_variable wake_;
-  bool stop_requested_ = false;
+  bool stop_requested_ = false;        // the loop's; guarded by wake_mutex_
+  bool lease_stop_requested_ = false;  // the lease thread's; likewise
   // Set when a lease is re-acquired, so a loop in a long backoff indexes
   // what is owed now rather than after its wait. Guarded by wake_mutex_.
   bool kick_ = false;

@@ -210,6 +210,12 @@ not use a `readonly=1` profile: the reader sends its query limits
 `publish_timeout_s` (10 s at the default 5 s publish timeout). A refused connection is retried for any
 statement; a reset, or a 5xx that is not a permanent ClickHouse error (such
 as a row limit or a denied grant), for reads only; and a timeout never.
+While the storage service holds the publisher lease, every request it makes,
+retries included, must also be answered by the lease deadline: `lease_ttl_s`
+less `clock_skew_s` and 0.1 s after the claim that stamped the lease row was
+sent. Each request of a claim made without a lease has
+min(`clickhouse_request_timeout_s`, `lease_ttl_s` / 3). `clock_skew_s` must
+therefore be at most `lease_ttl_s` / 2 - 0.3 s.
 The schedule's default factory creates a distinct `CaptureSchedule` for each
 config instance.
 `MonitoringEngine` stores the config, while concrete adaptors decide whether

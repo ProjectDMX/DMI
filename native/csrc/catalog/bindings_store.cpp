@@ -134,6 +134,8 @@ py::dict snapshot_dict(const dc::StorageServiceSnapshot& s) {
   // CLOCK_MONOTONIC on Linux); 0.0 when not quarantined.
   out["quarantined_until"] = static_cast<double>(s.quarantined_until_ns) / 1e9;
   out["lease_reacquisitions"] = s.lease_reacquisitions;
+  out["lease_timeouts"] = s.lease_timeouts;
+  out["lease_timeout_error"] = s.lease_timeout_error;
   out["last_error"] = s.last_error;
   return out;
 }
