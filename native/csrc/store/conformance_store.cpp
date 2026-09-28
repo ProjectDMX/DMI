@@ -15,6 +15,9 @@
 //   {"op":"list",...,"prefix":"...","delimiter":"...","max_keys":N,
 //    "continuation":"..."} -> {"ok":true,"truncated":bool,"next_token":"...",
 //    "objects":[{"key":"...","size":N,"etag":"..."}...],"attempts":N}
+//   {"op":"upload_one"|"upload_pending",...,"root":"...",
+//    "owner_lock":"take"|"held_by_caller" (optional, take by default)}
+//     open the spool at root, owner lock included, for the one op.
 // Errors: {"ok":false,"what":"..."}.
 
 #include "s3_client.h"
@@ -294,7 +297,12 @@ int main() {
       if (spool_config.max_bytes == 0) spool_config.max_bytes = 1ull << 40;
       dmi_store::Spool spool;
       std::string spool_error;
-      if (dmi_store::Spool::Open(spool_config, &spool, &spool_error) !=
+      const std::string owner_lock = jc::FindString(line, "owner_lock");
+      if (!owner_lock.empty() &&
+          !dmi_store::ParseOwnerLock(owner_lock, &spool_config.owner_lock)) {
+        out += "false,\"what\":";
+        jc::EscapeJson("spool open: unknown owner_lock: " + owner_lock, &out);
+      } else if (dmi_store::Spool::Open(spool_config, &spool, &spool_error) !=
           dmi_store::SpoolStatus::kOk) {
         out += "false,\"what\":";
         jc::EscapeJson("spool open: " + spool_error, &out);
@@ -337,7 +345,12 @@ int main() {
       if (spool_config.max_bytes == 0) spool_config.max_bytes = 1ull << 40;
       dmi_store::Spool spool;
       std::string spool_error;
-      if (dmi_store::Spool::Open(spool_config, &spool, &spool_error) !=
+      const std::string owner_lock = jc::FindString(line, "owner_lock");
+      if (!owner_lock.empty() &&
+          !dmi_store::ParseOwnerLock(owner_lock, &spool_config.owner_lock)) {
+        out += "false,\"what\":";
+        jc::EscapeJson("spool open: unknown owner_lock: " + owner_lock, &out);
+      } else if (dmi_store::Spool::Open(spool_config, &spool, &spool_error) !=
           dmi_store::SpoolStatus::kOk) {
         out += "false,\"what\":";
         jc::EscapeJson("spool open: " + spool_error, &out);

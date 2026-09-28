@@ -68,6 +68,11 @@ struct SinkConfig {
   double admission_timeout_s = -1.0;
   std::string spool_root;
   uint64_t spool_max_bytes = 1ull << 40;
+  // The spool directory's owner lock (spool.h). kTake owns the directory
+  // for the sink's life; a process that also runs a storage service on it
+  // holds one SpoolOwnerLock and opens both with kHeldByCaller.
+  dmi_store::OwnerLock spool_owner_lock = dmi_store::OwnerLock::kTake;
+  bool spool_allow_shared_filesystem = false;
   // Pack assembler workers. Records route by scope hash
   // (tenant, session, producer_rank), so one scope always lands on one
   // worker: per-scope ordering and single-scope packs are preserved at any

@@ -96,6 +96,8 @@ std::string PackSink::Start(std::string* spool_error) {
   dmi_store::SpoolConfig spool_config;
   spool_config.root = config_.spool_root;
   spool_config.max_bytes = config_.spool_max_bytes;
+  spool_config.owner_lock = config_.spool_owner_lock;
+  spool_config.allow_shared_filesystem = config_.spool_allow_shared_filesystem;
   std::string error;
   const dmi_store::SpoolStatus st =
       dmi_store::Spool::Open(spool_config, &spool_, &error);

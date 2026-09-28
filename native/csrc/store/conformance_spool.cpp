@@ -11,6 +11,9 @@
 //     -> {"ok":true}
 //   {"op":"snapshot","root":"...","max_bytes":N}
 //     -> {"ok":true,"snapshot":{"entries":N,"bytes":N,"peak_bytes":N,"max_bytes":N}}
+// Every op re-opens the spool, and takes "owner_lock":"take" (the default)
+// or "held_by_caller"; an open another owner refuses answers
+// {"ok":false,"status":"open","what":"...owned by pid N on host H..."}.
 // Errors: {"ok":false,"status":"...","what":"..."}.
 
 #include "spool.h"
@@ -103,8 +106,18 @@ int main() {
       continue;
     }
     if (config.max_bytes == 0) config.max_bytes = 1ull << 40;
+    // Optional: "take" (the default) or "held_by_caller".
+    const std::string owner_lock = jc::FindString(line, "owner_lock");
     dmi_store::Spool spool;
     std::string error;
+    if (!owner_lock.empty() &&
+        !dmi_store::ParseOwnerLock(owner_lock, &config.owner_lock)) {
+      std::string out = "{\"ok\":false,\"status\":\"open\",\"what\":";
+      jc::EscapeJson("unknown owner_lock: " + owner_lock, &out);
+      out += "}\n";
+      std::cout << out;
+      continue;
+    }
     if (dmi_store::Spool::Open(config, &spool, &error) !=
         dmi_store::SpoolStatus::kOk) {
       std::string out = "{\"ok\":false,\"status\":\"open\",\"what\":";
