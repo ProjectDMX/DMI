@@ -1470,8 +1470,8 @@ def test_a_pass_whose_lease_changed_while_it_read_rereads_the_replay_guard(
         assert len(captures) == 4
 
 
-@pytest.mark.parametrize("after_conflict", [None, "transport"])
-def test_a_conflicted_publish_reports_the_conflict(
+@pytest.mark.parametrize("after_conflict", [None, "transport", "lease_refused"])
+def test_a_conflicted_publish_reports_the_conflict_unless_the_lease_was_lost(
         fake_s3, tmp_path, after_conflict):
     """A publish that finds a second writer's row at its own version is
     visible and must not be retried, so the indexer records its packs in the
@@ -1482,6 +1482,15 @@ def test_a_conflicted_publish_reports_the_conflict(
     what the pass reports, with the failure in its message (catalog.py's
     `raise conflict from commit_failure`). Left to propagate, the transport
     error replaced it.
+
+    A lease refusal on that request is not a transport error, though. Under
+    the storage service every request runs behind the lease scope's hook,
+    which renews first once a renewal is due, and a rival claiming the lease
+    -- which is when a second writer turns up -- refuses it. index_bounded
+    tells a lost lease by its error kind and rethrows it, so that the pass it
+    cut short is owed (storage_service.cpp); relabelled a conflict, the loss
+    was handled as an ordinary failed batch. The refusal keeps its kind and
+    carries the conflict in its message.
 
     The conflict is real: a foreign watermark row lands at the pass's version
     after the pass's own and before its owners read-back
@@ -1542,12 +1551,17 @@ def test_a_conflicted_publish_reports_the_conflict(
         if after_conflict is None:
             assert result["error"] == "SnapshotPublishConflictError", result
             assert recorded == 2, result
-        else:
+        elif after_conflict == "transport":
             assert result["error"] == "SnapshotPublishConflictError", result
             assert "was published by this writer" in message, result
             assert ("recording its packs in the inventory then failed too"
                     in message), result
             assert "simulated connection reset" in message, result
+            assert recorded == 0, result
+        else:
+            assert result["error"] == "PublisherLeaseHeldError", result
+            assert "is contested" in message, result
+            assert "was published by this writer" in message, result
             assert recorded == 0, result
 
 

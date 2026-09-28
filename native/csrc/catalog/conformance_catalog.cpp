@@ -1058,7 +1058,10 @@ std::string respond(const std::string& line, Session* session) {
       //
       // after_conflict then decides what the conflict path's inventory
       // INSERT, the request after that read, meets:
-      //   "transport"      its connection fails.
+      //   "transport"      its connection fails;
+      //   "lease_refused"  a rival has claimed the lease's term, and the
+      //                    renewal the storage service runs before a request
+      //                    once one is due (keep_lease_in_pass) is refused.
       struct ConflictSeam {
         uint64_t version = 0;
         enum { kWaiting, kConflicted, kDone } phase = kWaiting;
@@ -1077,13 +1080,27 @@ std::string respond(const std::string& line, Session* session) {
                                       session->table_prefix;
         const std::string after_conflict =
             jc::FindString(line, "after_conflict");
-        before_request = [seam, client, qualified, after_conflict] {
+        CatalogWriter* publisher = &writer;
+        before_request = [seam, client, qualified, after_conflict,
+                          publisher] {
           if (seam->version == 0 || seam->phase == ConflictSeam::kDone) return;
           if (seam->phase == ConflictSeam::kConflicted) {
             seam->phase = ConflictSeam::kDone;
             if (after_conflict == "transport") {
               throw ClickHouseError(
                   "simulated connection reset while recording the packs");
+            }
+            if (after_conflict == "lease_refused") {
+              const PublisherLease* held = publisher->held_lease();
+              if (held == nullptr) return;
+              client->execute(
+                  "INSERT INTO " + qualified + "_publisher_lease` "
+                  "(term, lease_id, holder, acquired_at_ns, expires_at_ns) "
+                  "SELECT toUInt64(%(term)s), generateUUIDv4(), 'rival', "
+                  "now_ns, now_ns + 60000000000 FROM (SELECT "
+                  "toUnixTimestamp64Nano(now64(9)) AS now_ns)",
+                  {{"term", held->term}});
+              publisher->renew_lease();
             }
             return;
           }

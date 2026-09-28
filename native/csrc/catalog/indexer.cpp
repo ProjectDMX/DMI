@@ -352,27 +352,48 @@ IndexResultData NativeIndexer::commit(IndexPlan* planned) {
           if (e.kind() == CatalogError::Kind::kPublishConflict &&
               !indexed.empty()) {
             // Visible, so skippable: record the packs before propagating.
+            //
+            // If that fails, the conflict is still the finding (catalog.py's
+            // `raise conflict from commit_failure`). Left to propagate, the
+            // commit's transport error replaced kPublishConflict, so a
+            // supervisor matching on it never saw the second writer, and the
+            // visible packs stayed out of the inventory for the next pass to
+            // re-publish.
+            const auto conflict_then = [&e](const char* failure) {
+              return CatalogError(
+                  CatalogError::Kind::kPublishConflict,
+                  std::string(e.what()) +
+                      " (recording its packs in the inventory then failed "
+                      "too" +
+                      (failure != nullptr ? std::string(": ") + failure
+                                          : std::string()) +
+                      ")");
+            };
             try {
               writer_->commit_packs(RenderPackRows(indexed), version);
+            } catch (const CatalogError& commit_failure) {
+              // Except a lease refusal, which keeps its kind. Under the
+              // storage service this INSERT runs behind the lease scope's
+              // hook, which renews first once a renewal is due, and a rival
+              // holding the lease -- as one may when a second writer is
+              // publishing -- refuses it. index_bounded rethrows a lost
+              // lease, by its kind, so that the pass it cut short is owed;
+              // relabelled a conflict, it was handled as an ordinary failed
+              // batch. The Python oracle's commit_packs never renews, so it
+              // has no such case.
+              if (is_lease_refusal(commit_failure)) {
+                throw CatalogError(
+                    commit_failure.kind(),
+                    std::string(commit_failure.what()) +
+                        " (while recording the packs of a publish that "
+                        "conflicted: " +
+                        e.what() + ")");
+              }
+              throw conflict_then(commit_failure.what());
             } catch (const std::exception& commit_failure) {
-              // The conflict is the finding (catalog.py's `raise conflict
-              // from commit_failure`). Left to propagate, the commit's
-              // transport error replaced kPublishConflict, so a supervisor
-              // matching on it never saw the second writer, and the visible
-              // packs stayed out of the inventory for the next pass to
-              // re-publish.
-              throw CatalogError(
-                  CatalogError::Kind::kPublishConflict,
-                  std::string(e.what()) +
-                      " (recording its packs in the inventory then failed "
-                      "too: " +
-                      commit_failure.what() + ")");
+              throw conflict_then(commit_failure.what());
             } catch (...) {
-              throw CatalogError(
-                  CatalogError::Kind::kPublishConflict,
-                  std::string(e.what()) +
-                      " (recording its packs in the inventory then failed "
-                      "too)");
+              throw conflict_then(nullptr);
             }
           }
           throw;
