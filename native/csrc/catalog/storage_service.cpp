@@ -840,9 +840,12 @@ void CaptureStorageService::acquire_lease_at_start() {
   // out here turns a restart inside that window into a short delay instead
   // of a failed start; a live publisher keeps renewing, so the wait ends in
   // the same refusal as before, naming the holder.
-  const uint64_t deadline = steady_ns() + config_.start_lease_wait_ns;
+  uint64_t deadline = steady_ns() + config_.start_lease_wait_ns;
   const uint64_t poll = std::clamp<uint64_t>(
       config_.writer.lease_ttl_ns / 10, 50'000'000ull, 500'000'000ull);
+  // Whether the wait has already been stretched for a quarantine this
+  // start()'s own claim left (below): once only.
+  bool stretched = false;
   while (true) {
     try {
       writer_.acquire_lease(config_.holder);
@@ -863,18 +866,33 @@ void CaptureStorageService::acquire_lease_at_start() {
           std::chrono::nanoseconds(std::min(poll, deadline - now)));
     } catch (const ClickHouseError& exc) {
       // A claim that timed out -- a cold catalog's first reads can outlast
-      // the claim bound -- is retried within the same wait. One that wrote
-      // nothing (its head read timed out) goes again at once; one whose
-      // INSERT may have landed quarantined the writer for a TTL, which is
-      // waited out when it ends inside the wait. Any other error fails
-      // start() as before.
+      // the claim bound, and so can a slow INSERT -- is retried within the
+      // same wait. One that wrote nothing (its head read timed out) goes
+      // again at once. One whose INSERT may have landed quarantined the
+      // writer for a TTL: its row, if it landed, is live that long, as a
+      // crashed predecessor's is. The wait is sized for one of those, and a
+      // claim that used its bound has spent enough of it that the
+      // quarantine always ended past it at the defaults; so the quarantine
+      // is waited out even then, once, with time for a claim after it (one
+      // the late row refuses until it expires, if it landed). Any other
+      // error fails start() as before.
       record_error(std::string("publisher lease claim at start failed: ") +
                    exc.what());
       note_lease_failure(exc);
       if (!exc.timed_out() || config_.start_lease_wait_ns == 0) throw;
       uint64_t resume = steady_ns();
       uint64_t until = 0;
-      if (writer_.quarantined(&until)) resume = std::max(resume, until);
+      if (writer_.quarantined(&until)) {
+        resume = std::max(resume, until);
+        // A claim's three requests, each within the claim bound, and a poll
+        // for the late row to expire.
+        const uint64_t claim_ns =
+            3 * writer_.leases().claim_bound_ns() + poll;
+        if (!stretched && until + claim_ns > deadline) {
+          stretched = true;
+          deadline = until + claim_ns;
+        }
+      }
       if (resume >= deadline) {
         throw ClickHouseError(
             "storage service: the publisher lease claim timed out, and "

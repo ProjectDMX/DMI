@@ -71,6 +71,9 @@ class _FakeClickHouse:
         # (statement prefix, seconds): answer every such statement that late,
         # with a 503 -- a failure the client retries for a read.
         self.unavailable: tuple[str, float] | None = None
+        # (statement prefix, HTTP status, ClickHouse error code): answer
+        # every such statement with that error, as the server does.
+        self.fail: tuple[str, int, int] | None = None
         # Called before the head read is answered, from the thread serving
         # it.
         self.before_head_answer = None
@@ -98,6 +101,17 @@ class _FakeClickHouse:
                 for prefix, seconds in list(fake.delays.items()):
                     if body.startswith(prefix):
                         time.sleep(seconds)
+                failing = fake.fail
+                if failing is not None and body.startswith(failing[0]):
+                    payload = (f"Code: {failing[2]}. DB::Exception: scripted "
+                               "failure. (SCRIPTED)\n").encode()
+                    self.send_response(failing[1])
+                    self.send_header("X-ClickHouse-Exception-Code",
+                                     str(failing[2]))
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 unavailable = fake.unavailable
                 if unavailable is not None and body.startswith(unavailable[0]):
                     time.sleep(unavailable[1])
@@ -368,6 +382,35 @@ def test_a_claim_is_confirmed_by_the_deadline_of_the_lease_it_takes(
     assert 1.55 < time.monotonic() - arrived < 1.9
     if op == "acquire":
         assert driver.call(op="quarantined")["quarantined"] is True
+
+
+@pytest.mark.parametrize("status, code, timed_out", [
+    (408, 159, True),   # TIMEOUT_EXCEEDED: max_execution_time ran out
+    (500, 473, True),   # DEADLOCK_AVOIDED: lock_acquire_timeout ran out
+    (500, 319, True),   # UNKNOWN_STATUS_OF_INSERT: the quorum wait ran out
+    (500, 241, False),  # MEMORY_LIMIT_EXCEEDED: not a time limit
+])
+def test_a_lease_insert_the_server_gave_up_on_in_time_is_a_timeout(
+        fake, driver, status, code, timed_out):
+    """The lease INSERTs carry the time the client gives them as the
+    server's own limits, so a slow claim is often cut by the server first.
+    That came back as an ordinary error: start() did not retry it as it
+    retries a claim that timed out, and the service's lease-timeout count
+    never saw it, so the knobs to turn were never named. A time limit the
+    server enforced is now a timeout like the client's own; its outcome is
+    as unknown, so the claim still quarantines."""
+    assert driver.open(lease_ttl_ns=3_000_000_000,
+                       publish_timeout_ns=1_000_000_000)["ok"]
+    fake.fail = ("INSERT", status, code)
+    response = driver.call(op="acquire", holder="h")
+    assert not response["ok"], response
+    assert response["error"] == "ClickHouseError", response
+    assert response["timed_out"] is timed_out, response
+    assert response["sent"] is True, response
+    assert f"Code: {code}" in response["message"], response
+    if timed_out:
+        assert "lease_ttl_s / 3" in response["message"], response
+    assert driver.call(op="quarantined")["quarantined"] is True
 
 
 def test_a_slow_but_healthy_head_read_does_not_fail_the_claim(fake, driver):

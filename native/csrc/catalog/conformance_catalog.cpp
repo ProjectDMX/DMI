@@ -1119,7 +1119,8 @@ std::string respond(const std::string& line, Session* session) {
     std::string message;
     escape_into(e.what(), &message);
     return prefix + "false,\"error\":\"ClickHouseError\",\"message\":" +
-           message + "}";
+           message + ",\"timed_out\":" + (e.timed_out() ? "true" : "false") +
+           ",\"sent\":" + (e.sent() ? "true" : "false") + "}";
   } catch (const std::exception& e) {
     std::string message;
     escape_into(e.what(), &message);

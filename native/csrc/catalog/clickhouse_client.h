@@ -34,7 +34,9 @@ class ClickHouseError : public std::runtime_error {
 
   // The request ran out of time: the client's request (or connect) timeout,
   // or the RequestDeadline in force, ended it, or that deadline had already
-  // passed before it could be sent. The message names the bound.
+  // passed before it could be sent, or the server gave up on it for a time
+  // limit the request set (max_execution_time, lock_acquire_timeout,
+  // insert_quorum_timeout). The message names the bound.
   bool timed_out() const { return timed_out_; }
   // Whether the statement may have reached the server. False only when it
   // cannot have: every attempt was refused its connection (or the name did
@@ -207,8 +209,9 @@ class ClickHouseClient {
   //     so a 5xx that names a ClickHouse error (X-ClickHouse-Exception-Code,
   //     or a "Code: N." body) is retried only for the few transient codes
   //     listed in the .cpp; a 5xx naming none (a proxy's 502/503/504) is.
-  // A timeout is never retried, so each attempt's bound is the whole
-  // call's: at most max_attempts request timeouts plus the backoff, and a
+  // A timeout is never retried -- the client's own, or a time limit the
+  // server enforced (see ClickHouseError::timed_out) -- so each attempt's
+  // bound is the whole call's: at most max_attempts request timeouts plus the backoff, and a
   // single request timeout for anything that timed out. TLS failures (an
   // untrusted or misnamed certificate) and 4xx answers are not retried.
   // Timeouts go to libcurl in whole milliseconds, rounded up, so a positive

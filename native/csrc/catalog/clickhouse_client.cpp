@@ -98,6 +98,19 @@ bool transient_clickhouse_error(int code) {
   }
 }
 
+// The ClickHouse errors that say the server gave up on a statement for a
+// time limit the request set: TIMEOUT_EXCEEDED (159, max_execution_time;
+// answered with a 408), DEADLOCK_AVOIDED (473, lock_acquire_timeout) and
+// UNKNOWN_STATUS_OF_INSERT (319, insert_quorum_timeout -- which the server
+// also answers when it lost its Keeper session mid-insert, an unknown
+// outcome either way). The lease INSERTs set all three from the time the
+// client gives them (lease_coordinator.cpp), so the server often gives up
+// first: that is the request running out of time as surely as the client's
+// own timeout, and execute() says so (ClickHouseError::timed_out).
+bool server_time_limit(int code) {
+  return code == 159 || code == 473 || code == 319;
+}
+
 // libcurl takes whole milliseconds, and 0 means "its default" -- no bound at
 // all for the whole request. A positive timeout therefore rounds UP, so one
 // below a millisecond still bounds the request (at 1 ms); validate() has
@@ -594,20 +607,24 @@ std::vector<Row> ClickHouseClient::execute(
     if (attempt.code == CURLE_OK || !never_connected(attempt.code)) {
       sent = true;
     }
+    // Named in a timeout's message, so whoever reads it knows which knob to
+    // turn: the deadline that cut the attempt short, or the client's own
+    // timeouts.
+    const auto bounded_by = [&] {
+      return by_deadline
+                 ? " -- bounded by " + bound
+                 : " -- bounded by the client's timeouts "
+                   "(clickhouse_request_timeout_s = " +
+                       seconds_text(connection_.timeouts.request_s) +
+                       ", clickhouse_connect_timeout_s = " +
+                       seconds_text(connection_.timeouts.connect_s) + ")";
+    };
     if (attempt.code == CURLE_OPERATION_TIMEDOUT) {
-      // Never retried (above). Named, so whoever reads it knows which knob
-      // to turn: the deadline that cut the attempt short, or the client's
-      // own timeouts.
+      // Never retried (above).
       std::string error = std::string("curl: ") +
                           curl_easy_strerror(attempt.code);
       if (!attempt.detail.empty()) error += ": " + attempt.detail;
-      error += by_deadline
-                   ? " -- bounded by " + bound
-                   : " -- bounded by the client's timeouts "
-                     "(clickhouse_request_timeout_s = " +
-                         seconds_text(connection_.timeouts.request_s) +
-                         ", clickhouse_connect_timeout_s = " +
-                         seconds_text(connection_.timeouts.connect_s) + ")";
+      error += bounded_by();
       if (number > 1) {
         error += " (attempt " + std::to_string(number) + ")";
       }
@@ -629,6 +646,16 @@ std::vector<Row> ClickHouseClient::execute(
       // say, and is retried as before. Reads only, either way.
       int code = attempt.exception_code;
       if (code < 0) code = body_exception_code(attempt.body);
+      if (server_time_limit(code)) {
+        // A timeout too, and like one never retried.
+        error += " -- the server's own time limit (max_execution_time, "
+                 "lock_acquire_timeout or insert_quorum_timeout) ran out" +
+                 bounded_by();
+        if (number > 1) {
+          error += " (attempt " + std::to_string(number) + ")";
+        }
+        throw ClickHouseError(error, true, sent);
+      }
       retry = read && attempt.status >= 500 && attempt.status < 600 &&
               (code < 0 || transient_clickhouse_error(code));
     }

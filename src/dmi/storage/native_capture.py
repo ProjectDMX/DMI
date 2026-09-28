@@ -589,7 +589,10 @@ class NativeCaptureStorage:
 
         Waits up to ``start_lease_wait_s`` for another holder's lease to
         expire, then raises naming the holder. A claim that times out is
-        retried within the same wait.
+        retried within the same wait; one whose INSERT may have landed sets
+        the lease aside for ``lease_ttl_s``, and that is waited out even
+        past the wait, once, so start() can take up to about
+        ``start_lease_wait_s + 2 * lease_ttl_s`` against a catalog that slow.
         """
         self._service.start()
 

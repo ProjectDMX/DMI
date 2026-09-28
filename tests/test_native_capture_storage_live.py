@@ -1424,6 +1424,64 @@ def test_start_survives_a_first_lease_read_slower_than_its_bound(
             switch.close()
 
 
+def _first(predicate):
+    """A predicate that picks only the first request `predicate` does."""
+    picked = []
+
+    def _pick(request: bytes) -> bool:
+        if picked or not predicate(request):
+            return False
+        picked.append(time.monotonic())
+        return True
+
+    return _pick
+
+
+@pytest.mark.parametrize("delivered", [False, True],
+                         ids=["never-delivered", "delivered-late"])
+def test_start_waits_out_the_quarantine_its_own_claim_left(
+        fake_s3, tmp_path, delivered):
+    """A claim INSERT that timed out at start() may still land, so it
+    quarantines the writer for a TTL -- and start() failed at once whenever
+    that quarantine ended past start_lease_wait_s, which at the default wait
+    (lease_ttl_s + publish_timeout_s + clock_skew_s) it always did once the
+    INSERT had used its claim bound: a slow INSERT at start, a cold
+    replicated catalog's quorum INSERT say, still failed start(). The
+    quarantine is now waited out even past the wait, once, like the live
+    row of a crashed predecessor it may be, and the claim made again after
+    it -- refused by the late row, if it landed, until that expires."""
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
+                     publish_timeout_s=1)
+        warm = _service(_storage_config(fake_s3, catalog.table_prefix,
+                                        **knobs), tmp_path / "warm")
+        warm.start()
+        warm.stop()
+
+        if delivered:
+            # Reaches the server after the 1 s claim bound: the row lands,
+            # and is this service's own, live for a TTL.
+            switch.slow_once(_lease_insert, 1.5)
+        else:
+            switch.stall_requests(_first(_lease_insert))
+        service = _service(_storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            **knobs), tmp_path / "spool")
+        started = time.monotonic()
+        service.start()
+        try:
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "held", snapshot
+            # The claim timed out at 1 s and quarantined until 4 s; the
+            # default wait, 3 + 1 = 4 s, ended before a claim could follow.
+            assert 3.9 < elapsed < 7.0, elapsed
+        finally:
+            service.stop()
+            switch.close()
+
+
 def _listing(request: bytes) -> bool:
     line = request.partition(b"\r\n")[0]
     return line.startswith(b"GET ") and b"list-type=2" in line

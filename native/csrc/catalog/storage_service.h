@@ -52,9 +52,9 @@
 // An index pass reads its packs from the object store without the lock, so
 // a stalled read cannot hold the renewal off either. Claims made with no
 // lease are bounded by min(request timeout, lease_ttl / 3) per request; a
-// claim that times out at start() is retried until start_lease_wait_ns ends,
-// and lease requests that keep timing out say which knobs bound them
-// (snapshot().lease_timeout_error). The constructor refuses a clock skew
+// claim that times out at start() is retried until start_lease_wait_ns ends
+// (or, once, until the quarantine it left is over), and lease requests that
+// keep timing out say which knobs bound them (snapshot().lease_timeout_error). The constructor refuses a clock skew
 // that leaves a renewal too little time to finish.
 #pragma once
 
@@ -116,7 +116,9 @@ struct StorageServiceConfig {
 
   // How long start() waits for another holder's lease to expire before it
   // fails with the lease held. A crashed predecessor's lease stays live for
-  // up to its TTL; 0 fails at once.
+  // up to its TTL; 0 fails at once. A claim of start()'s own that timed out
+  // is retried within it, and a quarantine that claim left is waited out
+  // even past it, once (acquire_lease_at_start).
   uint64_t start_lease_wait_ns = 0;
 
   // Sweep a crashed sink's stale .open files before anything writes to the
@@ -187,8 +189,9 @@ class CaptureStorageService {
 
   // Ensure the catalog schema, take the publisher lease (waiting up to
   // start_lease_wait_ns for another holder's to expire, or for a claim that
-  // timed out to go through), sweep the spool, reconcile once, then start
-  // the background cycle. The lease renews from the moment it is taken.
+  // timed out to go through -- past it, once, to wait out the quarantine
+  // such a claim left), sweep the spool, reconcile once, then start the
+  // background cycle. The lease renews from the moment it is taken.
   // Throws if the lease is still held by another publisher when the wait
   // ends, or its claim still times out. A lease lost while the reconcile
   // runs does not fail start(): the loop takes a fresh one, as it would
