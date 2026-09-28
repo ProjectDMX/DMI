@@ -46,7 +46,8 @@
 // lock is held: so a catalog that stops answering fails the stretch, and the
 // lease quarantines, while its row still keeps rivals out. A lease whose
 // deadline passes unrenewed is abandoned, never reported held (LeaseScope).
-// Claims made with no
+// An index pass reads its packs from the object store without the lock, so
+// a stalled read cannot hold the renewal off either. Claims made with no
 // lease are bounded by min(request timeout, lease_ttl / 3) per request; a
 // claim that times out at start() is retried until start_lease_wait_ns ends,
 // and lease requests that keep timing out say which knobs bound them
@@ -229,6 +230,8 @@ class CaptureStorageService {
   void reconcile();
   void keep_lease();          // the lease thread's body
   void renew_lease_if_due();  // requires lease_mutex_
+  // The indexer's keep_lease hook: renew_lease_if_due() inside a pass.
+  void keep_lease_in_pass();  // requires lease_mutex_
   // Gives up a held lease whose deadline has passed. Requires lease_mutex_.
   void abandon_lease_if_expired();
   // A lease claim or renewal failed (call from its catch block): one that

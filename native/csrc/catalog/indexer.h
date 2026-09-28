@@ -33,6 +33,12 @@ struct IndexerConfig {
   // published head to move between an allocation and its publish, which
   // only something outside this call can do. Left empty, this is nothing.
   std::function<void(uint64_t)> after_allocate;
+  // Called before each catalog write commit() makes -- the version claim,
+  // each descriptor chunk, the inventory commit -- so that a long pass can
+  // renew its lease when that falls due, instead of running the lease down
+  // while its caller holds the lease lock. The publish renews on its own.
+  // What it throws propagates. Unset: nothing.
+  std::function<void()> keep_lease;
 };
 
 struct IndexFailureData {
@@ -53,15 +59,44 @@ struct IndexResultData {
   std::vector<IndexFailureData> failures;
 };
 
+// One index() pass, split at its object-store reads so that a caller can
+// hold the catalog's lease lock for the catalog phases only: plan() and
+// commit() talk to the catalog, read() only to the object store. A read that
+// stalls then cannot keep the lease from renewing.
+struct IndexPlan {
+  IndexResultData result;            // requested, skipped and failures so far
+  std::vector<PackRefData> pending;  // not yet committed, in read order
+  // The lease the replay guard was read under ("" for none). commit() reads
+  // the guard again if the lease has changed since: a pass that lost its
+  // lease while reading may find the packs committed by another publisher.
+  std::string planned_under;
+  bool read = false;
+  // Filled by read(): the packs read, each with its rendered rows.
+  std::vector<PackRefData> indexed;
+  std::vector<std::vector<std::string>> rows;
+  uint64_t estimated_bytes = 0;
+};
+
 class NativeIndexer {
  public:
   NativeIndexer(dmi_store::S3Client* s3, CatalogWriter* writer,
                 IndexerConfig config);
 
+  // plan(), read() and commit() in one call.
   IndexResultData index(const std::vector<PackRefData>& refs);
+
+  // Deduplicates refs and reads the replay guard (the catalog).
+  IndexPlan plan(const std::vector<PackRefData>& refs);
+  // Reads each pending pack's descriptor rows (the object store only).
+  // Throws kBatchTooLarge past max_estimated_bytes.
+  void read(IndexPlan* plan);
+  // Allocates a version, writes the descriptors, publishes and commits the
+  // inventory (the catalog). Requires read().
+  IndexResultData commit(IndexPlan* plan);
 
  private:
   uint64_t allocate_version();
+  void keep_lease() const;
 
   dmi_store::S3Client* s3_;
   CatalogWriter* writer_;

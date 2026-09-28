@@ -312,6 +312,7 @@ std::string rows_to_json(const std::vector<dmi_catalog::Row>& rows) {
 struct Session {
   std::shared_ptr<const dmi_catalog::ClickHouseClient> client;
   std::unique_ptr<CatalogWriter> writer;
+  dmi_catalog::WriterConfig writer_config;
   std::string database;
   std::string table_prefix;
 };
@@ -380,6 +381,7 @@ Session make_session(const std::string& line) {
   session.client =
       std::make_shared<const dmi_catalog::ClickHouseClient>(connection);
   session.writer = std::make_unique<CatalogWriter>(session.client, config);
+  session.writer_config = config;
   session.database = config.database;
   session.table_prefix = config.table_prefix;
   return session;
@@ -1042,9 +1044,27 @@ std::string respond(const std::string& line, Session* session) {
               {{"version", version + 1}});
         };
       }
-      const dmi_catalog::IndexResultData result =
-          dmi_catalog::NativeIndexer(&s3, &writer, index_config)
+      dmi_catalog::NativeIndexer indexer(&s3, &writer, index_config);
+      dmi_catalog::IndexPlan plan = indexer.plan(refs);
+      indexer.read(&plan);
+      if (jc::FindBool(line, "rival_indexes_before_commit")) {
+        // The window the storage service opens by reading packs without its
+        // lease lock: the lease is lost while the pass reads, another
+        // publisher holds the catalog meanwhile and indexes the same packs,
+        // and a fresh lease is taken before the pass commits.
+        const PublisherLease* held = writer.held_lease();
+        const std::string holder = held != nullptr ? held->holder : "indexer";
+        writer.release_lease();
+        {
+          CatalogWriter rival(session->client, session->writer_config);
+          rival.acquire_lease("rival");
+          dmi_catalog::NativeIndexer(&s3, &rival, dmi_catalog::IndexerConfig{})
               .index(refs);
+          rival.release_lease();
+        }
+        writer.acquire_lease(holder);
+      }
+      const dmi_catalog::IndexResultData result = indexer.commit(&plan);
       out = ",\"result\":{\"requested_packs\":" +
             std::to_string(result.requested_packs) +
             ",\"skipped_packs\":" + std::to_string(result.skipped_packs) +

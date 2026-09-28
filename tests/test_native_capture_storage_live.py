@@ -276,10 +276,11 @@ def test_the_reference_reader_sees_the_same_captures(fake_s3, tmp_path):
 
 
 class _Switch:
-    """A TCP forwarder in front of ClickHouse's HTTP port that can be cut
-    (connections refused), stalled (connections accepted, never answered),
-    made to stall only the requests a predicate picks, or to hold the first
-    request a predicate picks back for a while. Every
+    """A TCP forwarder in front of an HTTP server -- ClickHouse's HTTP port,
+    or the fake S3 -- that can be cut (connections refused), stalled
+    (connections accepted, never answered), made to stall only the requests
+    a predicate picks, or to hold the first request a predicate picks back
+    for a while. Every
     native client opens one connection per request, so one request is one
     connection here."""
 
@@ -300,6 +301,15 @@ class _Switch:
         self._lock = threading.Lock()
         self._sockets: set[socket.socket] = set()
         threading.Thread(target=self._accept, daemon=True).start()
+
+    @classmethod
+    def to_url(cls, url: str) -> "_Switch":
+        host, port = url.split("://", 1)[1].rstrip("/").rsplit(":", 1)
+        return cls(host, int(port))
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
 
     def _accept(self):
         while True:
@@ -1231,6 +1241,108 @@ def test_a_stall_inside_the_index_pass_gives_up_while_the_lease_row_is_live(
 
         captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
         assert sorted(captures) == sorted(tensors)
+
+
+def _ranged_get(request: bytes) -> bool:
+    head = request.partition(b"\r\n\r\n")[0].lower()
+    return head.startswith(b"get ") and b"\r\nrange:" in head
+
+
+def test_a_stalled_object_store_read_does_not_hold_up_the_lease(
+        fake_s3, tmp_path):
+    """The index pass read each pack's footer from the object store with the
+    lease lock held, so a GET that stalled -- bounded only by the S3 read
+    timeout, 120 s by default -- kept the lease thread from renewing, and the
+    row expired while the snapshot said "held". The pass now takes the lock
+    only for its catalog requests and reads packs without it, so the lease
+    keeps renewing through a stalled read."""
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (client, catalog):
+        config = _storage_config(
+            s3.url, catalog.table_prefix, reconcile_on_start=False,
+            lease_ttl_s=3.0, publish_timeout_s=1)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            # The uploader PUTs and HEADs a new pack; only the indexer's
+            # footer reads are ranged GETs.
+            s3.stall_requests(_ranged_get)
+            tensors = _stage(spool_root, range(2))
+            _wait_for(lambda: s3.stalled, timeout_s=10.0)
+            renewals = service.snapshot()["lease_renewals"]
+            # Two TTLs: without renewals the row would be long dead.
+            log = _sample_lease(service, client, catalog.table_prefix, 6.0,
+                                origin=s3.stalled[0])
+            assert all(state == "held" and live
+                       for _, state, live in log), log
+            assert service.snapshot()["lease_renewals"] >= renewals + 3
+
+            # Fail the stalled read: the pack stays owed and indexes after.
+            s3.cut()
+            s3.restore()
+            service.flush(30.0)
+            service.rethrow_if_failed()
+        finally:
+            s3.close()
+            service.stop()
+
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert sorted(captures) == sorted(tensors)
+
+
+def test_a_pass_whose_lease_changed_while_it_read_rereads_the_replay_guard(
+        fake_s3, tmp_path):
+    """Reading packs without the lease lock opens a window the whole-pass
+    lock did not have: the lease can be lost and taken afresh while the pass
+    reads, and another publisher can hold the catalog meanwhile and index
+    the same packs (its reconcile finds them uploaded and uncommitted). The
+    replay guard the pass read first no longer holds then, and a commit that
+    trusted it would publish the packs a second time, at a higher version.
+    The commit reads the guard again when the lease is not the one it was
+    read under."""
+    from tests.test_native_catalog_lease_live import CatalogDriver, _open
+
+    spool_root = tmp_path / "spool"
+    _stage(spool_root, range(4))  # two packs
+    store = _Driver(STORE_DRIVER)
+    try:
+        uploaded = store.call(
+            op="upload_pending", endpoint=fake_s3, bucket=BUCKET,
+            region=REGION, access=ACCESS, secret=SECRET, token=None,
+            insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
+            store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
+        assert uploaded["ok"], uploaded
+    finally:
+        store.close()
+    refs = uploaded["refs"]
+    assert len(refs) == 2, refs
+
+    with _catalog() as (client, catalog):
+        driver = CatalogDriver()
+        try:
+            _open(driver, catalog.table_prefix)
+            assert driver.call(op="ensure_schema")["ok"]
+            assert driver.call(op="acquire", holder="indexer")["ok"]
+            result = driver.call(
+                op="index", refs=refs, endpoint=fake_s3, bucket=BUCKET,
+                region=REGION, access=ACCESS, secret=SECRET, insecure=True,
+                rival_indexes_before_commit=True)
+            assert result["ok"], result
+            assert result["result"]["indexed_packs"] == 0, result
+            assert result["result"]["skipped_packs"] == 2, result
+            assert driver.call(op="release")["ok"]
+        finally:
+            driver.close()
+
+        table = f"`{DATABASE}`.`{catalog.table_prefix}_capture_raw`"
+        # The rival's one publish, not a second copy of every descriptor.
+        assert client.execute(
+            f"SELECT count(), uniqExact(index_version) FROM {table}") == [
+                (4, 1)]
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert len(captures) == 4
 
 
 def _lease_head_read(request: bytes) -> bool:

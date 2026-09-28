@@ -109,7 +109,11 @@ CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
       s3_(config_.s3),
       clickhouse_(std::make_shared<const ClickHouseClient>(config_.clickhouse)),
       writer_(clickhouse_, config_.writer),
-      indexer_(&s3_, &writer_, config_.indexer) {
+      indexer_(&s3_, &writer_, [this] {
+        IndexerConfig indexer = config_.indexer;
+        indexer.keep_lease = [this] { keep_lease_in_pass(); };
+        return indexer;
+      }()) {
   if (config_.spool_root.empty()) {
     throw std::invalid_argument("storage service: spool_root is required");
   }
@@ -490,12 +494,21 @@ void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
     work.pop_back();
     IndexResultData result;
     try {
-      // Nothing here stamps a renewal: the schedule follows the lease itself
-      // (renew_lease_if_due), which only a claim that confirmed moves -- a
-      // pass that published nothing, over packs already committed, renewed
-      // nothing.
+      // The lease lock for the catalog phases only. Between them the pass
+      // reads its packs from the object store, where a stalled GET is bound
+      // only by the S3 client's own timeouts, and must not keep the lease
+      // thread from renewing meanwhile. Nothing here stamps a renewal: the
+      // schedule follows the lease itself (renew_lease_if_due), which only
+      // a claim that confirmed moves -- a pass that published nothing, over
+      // packs already committed, renewed nothing.
+      IndexPlan plan;
+      {
+        LeaseScope lease(this);
+        plan = indexer_.plan(batch);
+      }
+      indexer_.read(&plan);
       LeaseScope lease(this);
-      result = indexer_.index(batch);
+      result = indexer_.commit(&plan);
     } catch (const CatalogError& exc) {
       if (exc.kind() == CatalogError::Kind::kBatchTooLarge && batch.size() > 1) {
         const size_t middle = batch.size() / 2;
@@ -697,7 +710,9 @@ void CaptureStorageService::renew_lease_if_due() {
   // TTL of that send, and has until the lease deadline to be answered: the
   // renewal window the constructor checks (lease_coordinator.h). A stretch
   // under the lease lock delays it, but every request in such a stretch is
-  // bounded by the same deadline. A failed renewal costs the lease at once: a refusal drops it in the coordinator, and any other
+  // bounded by the same deadline, and a pass renews through the indexer's
+  // keep_lease hook before each catalog write. A failed renewal costs the
+  // lease at once: a refusal drops it in the coordinator, and any other
   // error quarantines the writer (renew_for_publish).
   const uint64_t ttl = config_.writer.lease_ttl_ns;
   const uint64_t sent = writer_.lease_sent_ns();
@@ -707,6 +722,18 @@ void CaptureStorageService::renew_lease_if_due() {
   note_lease_success();
   std::lock_guard<std::mutex> lock(state_mutex_);
   ++state_.lease_renewals;
+}
+
+void CaptureStorageService::keep_lease_in_pass() {
+  try {
+    renew_lease_if_due();
+  } catch (const CatalogError&) {
+    throw;  // a refusal: the pass fails with the lease lost
+  } catch (const std::exception& exc) {
+    record_error(std::string("lease renewal failed: ") + exc.what());
+    note_lease_failure(exc);
+    throw;
+  }
 }
 
 void CaptureStorageService::abandon_lease_if_expired() {
