@@ -135,11 +135,16 @@ struct StorageServiceConfig {
   // UploadPending does not stop when the lease is lost: a holder that is
   // quarantined, or refused a renewal or publish, while a batch is in
   // flight finishes that batch (which can outlast the TTL), and only its
-  // later cycles upload nothing while it holds no lease. A stalled one
-  // still holds the lease locally and starts new batches until a renewal
-  // or publish is refused. Two on different (database, table_prefix) pairs
-  // each hold a lease and upload freely. The spool itself is not locked;
-  // one process per spool is the caller's job.
+  // later cycles upload nothing while it holds no lease. One whose catalog
+  // requests stall gives the lease up at its deadline, before its row
+  // lapses: requests made under the lease are cut off there, and a cycle's
+  // check abandons a lease past it (LeaseScope), so no batch starts after
+  // that. Only a holder whose whole process stalls keeps the lease locally
+  // past its row: until it resumes and next checks, or -- after a system
+  // suspend, which the steady clock the deadline runs on does not count --
+  // until a renewal or publish is refused. Two on different (database,
+  // table_prefix) pairs each hold a lease and upload freely. The spool
+  // itself is not locked; one process per spool is the caller's job.
   bool sweep_spool_on_start = true;
   bool reconcile_on_start = true;
 };
