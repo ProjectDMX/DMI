@@ -130,6 +130,19 @@ void refuse_on_record_ring(bool record_mode, const char* what) {
     }
 }
 
+// Free room in a legacy ring of `cap` entries (or bytes) whose CPU
+// accounting has reserved up to `head` and released up to `tail`, saturated
+// at 0. The accounting can hold more than the ring: a flush releases only
+// what producers published, so a reservation nothing publishes (a step that
+// fails after prepare_step) stays, and prepare_step's flushed path reserves
+// on top of it without checking again. Unsaturated, cap - (head - tail) then
+// wraps to ~2^64, every check admits every reservation, and the producers
+// publish over unread slots.
+uint64_t legacy_ring_room(uint64_t cap, uint64_t head, uint64_t tail) {
+    const uint64_t outstanding = head - tail;
+    return outstanding >= cap ? 0 : cap - outstanding;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -620,10 +633,8 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     }
 
     // Case A: step fits.  Check available space for BOTH payload AND tasks.
-    const uint64_t payload_avail = pcap -
-        (drain.cpu_payload_head() - drain.cpu_payload_tail_committed());
-    const uint64_t task_avail = tcap -
-        (drain.cpu_task_head() - drain.cpu_task_tail_committed());
+    const uint64_t payload_avail = available_capacity();
+    const uint64_t task_avail = available_task_slots();
 
     if (step_total_bytes <= payload_avail && num_hooks <= task_avail) {
         drain.reserve(step_total_bytes, num_hooks);
@@ -924,14 +935,16 @@ at::Tensor RingEnginePy::payload_tensor() const {
 
 uint64_t RingEnginePy::available_capacity() const {
     auto& drain = impl_->engine.drain_thread();
-    const uint64_t pcap = impl_->engine.payload_cap();
-    return pcap - (drain.cpu_payload_head() - drain.cpu_payload_tail_committed());
+    const uint64_t head = drain.cpu_payload_head();
+    return legacy_ring_room(impl_->engine.payload_cap(), head,
+                            drain.cpu_payload_tail_committed());
 }
 
 uint64_t RingEnginePy::available_task_slots() const {
     auto& drain = impl_->engine.drain_thread();
-    const uint64_t tcap = impl_->engine.task_cap();
-    return tcap - (drain.cpu_task_head() - drain.cpu_task_tail_committed());
+    const uint64_t head = drain.cpu_task_head();
+    return legacy_ring_room(impl_->engine.task_cap(), head,
+                            drain.cpu_task_tail_committed());
 }
 
 // Per-hook reservation: claim nbytes of payload + 1 task entry for an

@@ -256,6 +256,46 @@ static void test_reserve_one_refuses_without_a_free_task_slot() {
     EXPECT(engine.available_capacity() == bytes);
 }
 
+// A step that fails after prepare_step reserved it (HF's driver swallows the
+// error on the legacy ring) leaves a reservation no producer publishes, and
+// a flush frees only published entries. prepare_step's flushed path then
+// reserves on top of it without checking again, so the CPU accounting can
+// hold more than the ring. The free counts must read 0 there, not wrap to
+// ~2^64: a wrapped count admits every reservation, the eager safety net
+// stops flushing, and producers publish over unread slots.
+static void test_ring_room_saturates_past_capacity() {
+    banner("free task entries and bytes read 0 once reservations pass the ring");
+    ring_py::RingConfig cfg = make_py_config();
+    cfg.task_ring_entries = 2;
+    ring_py::RingEnginePy engine(cfg, ring_py::SubmitFn{});
+    engine.init();
+    engine.start();
+    const uint64_t payload_cap = engine.payload_cap();
+
+    // Two failed steps: the first takes the whole ring, the second flushes
+    // (freeing nothing) and reserves on top.
+    EXPECT(engine.prepare_step(payload_cap, 2) ==
+           ring_py::RingEnginePy::STEP_RING_OK);
+    EXPECT(engine.prepare_step(16, 1) ==
+           ring_py::RingEnginePy::STEP_RING_FLUSHED);
+    EXPECT(engine.available_task_slots() == 0);
+    EXPECT(engine.available_capacity() == 0);
+
+    bool refused = false;
+    try {
+        engine.reserve_one(16);
+    } catch (const std::logic_error& error) {
+        refused = std::strstr(error.what(), "task-ring entry") != nullptr;
+    }
+    EXPECT(refused);
+    // Not the fast path: by its own accounting the ring has no room.
+    EXPECT(engine.prepare_step(16, 1) ==
+           ring_py::RingEnginePy::STEP_RING_FLUSHED);
+    EXPECT(engine.available_task_slots() == 0);
+    EXPECT(engine.available_capacity() == 0);
+    engine.stop();
+}
+
 // A step that fires more hooks than the task ring has entries gets
 // STEP_OVERSIZED, and every hook goes through HookPoint.forward's eager
 // safety net: reserve without a flush only while the bytes AND a task entry
@@ -1322,6 +1362,7 @@ int main() {
     test_ring_geometry_requires_payload_alignment();
     test_native_reservation_uses_transport_alignment();
     test_reserve_one_refuses_without_a_free_task_slot();
+    test_ring_room_saturates_past_capacity();
     test_eager_safety_net_delivers_past_the_task_ring();
     test_record_ring_refuses_every_legacy_producer_entry();
     test_static_force_flush();

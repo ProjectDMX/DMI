@@ -268,11 +268,13 @@ public:
     //      CUDA-graph capture or replay.
 
     // Free bytes in the payload ring not currently reserved and not
-    // pending drain.  CPU-only read.
+    // pending drain.  CPU-only read.  Reads 0, never a wrapped value, once
+    // reservations no producer publishes have pushed the CPU accounting
+    // past the ring.
     uint64_t available_capacity() const;
 
     // Free task-ring entries not currently reserved and not pending
-    // drain.  CPU-only read.
+    // drain.  CPU-only read.  Saturates at 0 like available_capacity().
     uint64_t available_task_slots() const;
 
     // Per-hook reservation: claim `nbytes` of payload ring + 1 task entry
