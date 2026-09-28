@@ -187,8 +187,11 @@ class CaptureStorageService {
   // Ensure the catalog schema, take the publisher lease (waiting up to
   // start_lease_wait_ns for another holder's to expire, or for a claim that
   // timed out to go through), sweep the spool, reconcile once, then start
-  // the background cycle. Throws if the lease is still held by another
-  // publisher when the wait ends, or its claim still times out.
+  // the background cycle. The lease renews from the moment it is taken.
+  // Throws if the lease is still held by another publisher when the wait
+  // ends, or its claim still times out. A lease lost while the reconcile
+  // runs does not fail start(): the loop takes a fresh one, as it would
+  // later, and reconciles then.
   void start();
 
   // Run cycles until one finds the spool empty with every uploaded pack
@@ -224,6 +227,11 @@ class CaptureStorageService {
   class LeaseScope;
 
   void loop();
+  // start()'s spool sweep and reconcile, with the lease held and the lease
+  // thread renewing it. Requires cycle_mutex_.
+  void sweep_and_reconcile_at_start();
+  // Stops the lease thread and waits for it.
+  void stop_lease_thread();
   CycleOutcome run_cycle();  // requires cycle_mutex_
   // Indexes refs in bounded batches, appending every ref that did not index
   // to *unindexed. Only a lost lease propagates; other failures are recorded.
@@ -284,6 +292,9 @@ class CaptureStorageService {
   // hammer the lease table. Guarded by lease_mutex_.
   uint64_t next_claim_ns_ = 0;
   uint64_t last_reconcile_ns_ = 0;
+  // The reconcile at start() lost the lease before it finished; the loop
+  // runs one once it holds a lease again. Guarded by cycle_mutex_.
+  bool reconcile_owed_ = false;
   int failure_streak_ = 0;  // consecutive failed cycles, for the backoff
   // Uploaded, so gone from the spool, but not yet in the catalog.
   std::vector<PackRefData> pending_index_;
@@ -292,11 +303,13 @@ class CaptureStorageService {
 
   std::thread thread_;
   // Renews on its own schedule, so neither the cycle backoff nor a slow
-  // upload can let the lease lapse while the service still runs.
+  // upload can let the lease lapse while the service still runs. It runs
+  // from the moment start() takes the lease until the loop has stopped.
   std::thread lease_thread_;
   std::mutex wake_mutex_;
   std::condition_variable wake_;
-  bool stop_requested_ = false;
+  bool stop_requested_ = false;        // the loop's; guarded by wake_mutex_
+  bool lease_stop_requested_ = false;  // the lease thread's; likewise
   // Set when a lease is re-acquired, so a loop in a long backoff indexes
   // what is owed now rather than after its wait. Guarded by wake_mutex_.
   bool kick_ = false;

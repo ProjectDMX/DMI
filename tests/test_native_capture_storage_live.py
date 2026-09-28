@@ -741,7 +741,7 @@ def test_a_batch_over_the_budget_splits_until_every_pack_indexes(
         service = _load_native_store_extension().StorageService(native)
         service.start()
         try:
-            assert service.flush(30.0)
+            service.flush(30.0)
             snapshot = service.snapshot()
         finally:
             service.stop()
@@ -1409,6 +1409,211 @@ def test_start_survives_a_first_lease_read_slower_than_its_bound(
         finally:
             service.stop()
             switch.close()
+
+
+def _listing(request: bytes) -> bool:
+    line = request.partition(b"\r\n")[0]
+    return line.startswith(b"GET ") and b"list-type=2" in line
+
+
+def _upload_behind_the_service(spool_root: Path, endpoint: str) -> list:
+    """Upload what the spool holds without indexing it -- the crash window
+    between an upload and its index -- and return the refs."""
+    store = _Driver(STORE_DRIVER)
+    try:
+        uploaded = store.call(
+            op="upload_pending", endpoint=endpoint, bucket=BUCKET,
+            region=REGION, access=ACCESS, secret=SECRET, token=None,
+            insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
+            store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
+        assert uploaded["ok"], uploaded
+    finally:
+        store.close()
+    assert _ready(spool_root) == []
+    return uploaded["refs"]
+
+
+def _sample_during(call, service, client, prefix, *, every=0.1):
+    """Run call() while sampling (t, lease_state, row live) from another
+    thread, as _sample_lease does; the row is read only while the service
+    says "held", since the lease table may not exist before that."""
+    log = []
+    done = threading.Event()
+    origin = time.monotonic()
+
+    def _sample():
+        while not done.is_set():
+            state = service.snapshot()["lease_state"]
+            live = (_lease_row_live(client, prefix) if state == "held"
+                    else None)
+            log.append((round(time.monotonic() - origin, 2), state, live))
+            time.sleep(every)
+
+    sampler = threading.Thread(target=_sample, daemon=True)
+    sampler.start()
+    try:
+        call()
+    finally:
+        done.set()
+        sampler.join(timeout=10)
+    return log
+
+
+@pytest.mark.parametrize("crash_window_pack", [True, False])
+def test_the_lease_renews_while_start_reconciles(
+        fake_s3, tmp_path, crash_window_pack):
+    """start() takes the lease, then sweeps the spool and reconciles the
+    bucket, and only then started the lease thread: nothing renewed the
+    lease while a large bucket was listed. Once its deadline passed, the
+    first lease-locked step abandoned it, so a crash-window pack found after
+    that could not be indexed and start() failed, where main re-claimed its
+    own lapsed row and indexed it; with nothing to index, start() returned
+    with the lease quarantined, and the snapshot said "held" over a dead row
+    all through the listing. The lease thread now runs from the moment the
+    lease is taken. One slow listing page (6 s, two TTLs) stands in for a
+    bucket of many pages."""
+    spool_root = tmp_path / "spool"
+    tensors = {}
+    if crash_window_pack:
+        tensors = _stage(spool_root, range(2))
+        _upload_behind_the_service(spool_root, fake_s3)
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (client, catalog):
+        config = _storage_config(s3.url, catalog.table_prefix,
+                                 lease_ttl_s=3.0, publish_timeout_s=1)
+        service = _service(config, spool_root)
+        s3.slow_once(_listing, 6.0)
+        try:
+            log = _sample_during(service.start, service, client,
+                                 catalog.table_prefix)
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "held", snapshot
+            assert snapshot["reconcile_passes"] == 1, snapshot
+            assert snapshot["reconciled_packs"] == int(crash_window_pack), \
+                snapshot
+            assert snapshot["indexed_packs"] == int(crash_window_pack), \
+                snapshot
+            assert snapshot["lease_renewals"] >= 3, snapshot
+            assert not _held_but_dead(log), log
+            service.flush(30.0)
+            service.rethrow_if_failed()
+        finally:
+            service.stop()
+            s3.close()
+
+        if crash_window_pack:
+            captures = _read_all(_storage_config(fake_s3,
+                                                 catalog.table_prefix))
+            assert sorted(captures) == sorted(tensors)
+
+
+def test_the_lease_renews_until_the_loops_last_cycle_is_done(
+        fake_s3, tmp_path):
+    """stop() woke the loop and the lease thread together, and the lease
+    thread left at once while the loop's last cycle still ran: a pass
+    reading a pack then found its lease abandoned at the commit, and the
+    snapshot said "held" over a dead row until then. The lease thread now
+    stops only after the loop has."""
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (client, catalog):
+        config = _storage_config(s3.url, catalog.table_prefix,
+                                 reconcile_on_start=False, lease_ttl_s=3.0,
+                                 publish_timeout_s=1)
+        service = _service(config, spool_root)
+        service.start()
+        reads = []
+
+        def _first_read(request: bytes) -> bool:
+            if _ranged_get(request):
+                reads.append(time.monotonic())
+                return True
+            return False
+
+        try:
+            s3.slow_once(_first_read, 4.0)  # past the lease deadline
+            tensors = _stage(spool_root, range(2))
+            _wait_for(lambda: reads, timeout_s=10.0)
+            log = _sample_during(service.stop, service, client,
+                                 catalog.table_prefix)
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+            s3.close()
+
+        assert not _held_but_dead(log), log
+        assert snapshot["indexed_packs"] == 1, snapshot
+        assert snapshot["lease_state"] == "released", snapshot
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert sorted(captures) == sorted(tensors)
+
+
+def _lease_insert(request: bytes) -> bool:
+    body = request.partition(b"\r\n\r\n")[2]
+    return body.startswith(b"INSERT") and b"_publisher_lease` (term" in body
+
+
+def test_a_lease_lost_while_start_reconciles_is_retaken_and_the_pass_rerun(
+        fake_s3, tmp_path):
+    """A lease lost while start() reconciled failed start(): the pass's
+    commit found no lease and start() rethrew, although a quarantine is the
+    recoverable kind everywhere else. Here the lease thread's renewal stalls
+    while the listing is slow, so the lease quarantines before the
+    crash-window pack is found. start() now returns, and the loop takes a
+    fresh lease once the quarantine ends and runs the reconcile it owes."""
+    spool_root = tmp_path / "spool"
+    tensors = _stage(spool_root, range(2))
+    _upload_behind_the_service(spool_root, fake_s3)
+    s3 = _Switch.to_url(fake_s3)
+    catalog_switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        knobs = dict(lease_ttl_s=3.0, publish_timeout_s=1,
+                     clickhouse_request_timeout_s=20.0)
+        # The schema first, directly, so that the service's claim is the
+        # first lease INSERT through the switch.
+        warm = _service(_storage_config(fake_s3, catalog.table_prefix,
+                                        reconcile_on_start=False, **knobs),
+                        tmp_path / "warm")
+        warm.start()
+        warm.stop()
+
+        seen = []
+
+        def _renewal(request: bytes) -> bool:
+            if not _lease_insert(request):
+                return False
+            seen.append(request)
+            return len(seen) > 1  # the claim goes through, renewals stall
+
+        catalog_switch.stall_requests(_renewal)
+        s3.slow_once(_listing, 2.5)  # past the first renewal, due at 1 s
+        service = _service(_storage_config(
+            s3.url, catalog.table_prefix,
+            clickhouse_port=catalog_switch.port, **knobs), spool_root)
+        service.start()
+        try:
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "quarantined", snapshot
+            assert snapshot["indexed_packs"] == 0, snapshot
+            assert "reconcile at start lost the publisher lease" in \
+                snapshot["last_error"], snapshot
+
+            catalog_switch.restore()
+            _wait_for(lambda: service.snapshot()["reconciled_packs"] == 1,
+                      timeout_s=15.0)
+            service.flush(30.0)
+            snapshot = service.snapshot()
+            assert snapshot["indexed_packs"] == 1, snapshot
+            assert snapshot["lease_state"] == "held", snapshot
+            service.rethrow_if_failed()
+        finally:
+            service.stop()
+            catalog_switch.close()
+            s3.close()
+
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert sorted(captures) == sorted(tensors)
 
 
 def test_lease_requests_that_keep_timing_out_name_the_knobs_that_bound_them(

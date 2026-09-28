@@ -171,6 +171,49 @@ void CaptureStorageService::start() {
     acquire_lease_at_start();  // throws kHeld if another publisher keeps it
   }
 
+  // The lease renews from here on, not once start() is done: the sweep and
+  // the reconcile below can outlast the lease deadline (a large bucket lists
+  // for longer than a TTL), and a lease nobody renewed is abandoned at the
+  // next lease-locked step, when it is reported held over a dead row until
+  // then.
+  {
+    std::lock_guard<std::mutex> lock(wake_mutex_);
+    stop_requested_ = false;
+    lease_stop_requested_ = false;
+    kick_ = false;
+  }
+  lease_thread_ = std::thread([this] { keep_lease(); });
+  try {
+    sweep_and_reconcile_at_start();
+  } catch (...) {
+    // start() must not return holding a lease stop() will never release,
+    // nor leave the lease thread renewing it.
+    stop_lease_thread();
+    try {
+      LeaseScope lease(this);
+      if (writer_.held_lease() != nullptr) writer_.release_lease();
+    } catch (...) {
+    }
+    throw;
+  }
+  last_reconcile_ns_ = steady_ns();
+
+  {
+    std::lock_guard<std::mutex> lock(wake_mutex_);
+    kick_ = false;
+  }
+  {
+    LeaseScope lease(this);  // publishes the lease state
+  }
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_.running = !state_.failed;
+  }
+  started_ = true;
+  thread_ = std::thread([this] { loop(); });
+}
+
+void CaptureStorageService::sweep_and_reconcile_at_start() {
   // After the lease, never before, so a second process pointed at this spool
   // usually learns that the catalog is held before it can delete a live
   // sink's .open files. Only usually: a holder that is quarantined has let
@@ -181,11 +224,6 @@ void CaptureStorageService::start() {
     std::vector<dmi_store::StagedPack> recovered;
     std::string error;
     if (spool_.Recover(&recovered, &error) != dmi_store::SpoolStatus::kOk) {
-      try {
-        LeaseScope lease(this);
-        if (writer_.held_lease() != nullptr) writer_.release_lease();
-      } catch (...) {
-      }
       throw std::runtime_error("storage service: spool recovery failed: " +
                                error);
     }
@@ -193,43 +231,29 @@ void CaptureStorageService::start() {
     state_.swept_on_start = recovered.size();
   }
 
-  // A failed pass is not fatal -- the bucket is still there next time -- but a
-  // lost lease is, and start() must not return holding a lease stop() will
-  // never release.
+  // A failed pass is not fatal -- the bucket is still there next time. Nor
+  // is a lease lost while it runs, to a quarantine or to another holder:
+  // that is the running service's case, and the loop handles it as it does
+  // there, taking a fresh lease once it can (or latching after 2 x TTL of a
+  // rival). The pass it cut short is owed, and the loop runs it once it
+  // holds a lease again.
   if (config_.reconcile_on_start) {
     try {
       reconcile();
     } catch (const CatalogError& exc) {
       if (is_lease_refusal(exc)) {
-        try {
-          LeaseScope lease(this);
-          if (writer_.held_lease() != nullptr) writer_.release_lease();
-        } catch (...) {
-        }
-        throw;
+        reconcile_owed_ = true;
+        record_error(std::string("reconcile at start lost the publisher "
+                                 "lease; the loop reconciles once it holds "
+                                 "one again: ") +
+                     exc.what());
+      } else {
+        record_error(std::string("reconcile at start failed: ") + exc.what());
       }
-      record_error(std::string("reconcile at start failed: ") + exc.what());
     } catch (const std::exception& exc) {
       record_error(std::string("reconcile at start failed: ") + exc.what());
     }
   }
-  last_reconcile_ns_ = steady_ns();
-
-  {
-    std::lock_guard<std::mutex> lock(wake_mutex_);
-    stop_requested_ = false;
-    kick_ = false;
-  }
-  {
-    LeaseScope lease(this);  // publishes the lease state
-  }
-  {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    state_.running = true;
-  }
-  started_ = true;
-  lease_thread_ = std::thread([this] { keep_lease(); });
-  thread_ = std::thread([this] { loop(); });
 }
 
 void CaptureStorageService::stop() {
@@ -239,7 +263,9 @@ void CaptureStorageService::stop() {
   }
   wake_.notify_all();
   if (thread_.joinable()) thread_.join();
-  if (lease_thread_.joinable()) lease_thread_.join();
+  // Only after the loop: its last cycle may still be indexing, and the
+  // lease has to keep renewing until that is done.
+  stop_lease_thread();
   std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
   if (started_) {
     started_ = false;
@@ -262,6 +288,15 @@ void CaptureStorageService::stop() {
   }
   std::lock_guard<std::mutex> lock(state_mutex_);
   state_.running = false;
+}
+
+void CaptureStorageService::stop_lease_thread() {
+  {
+    std::lock_guard<std::mutex> lock(wake_mutex_);
+    lease_stop_requested_ = true;
+  }
+  wake_.notify_all();
+  if (lease_thread_.joinable()) lease_thread_.join();
 }
 
 bool CaptureStorageService::flush(double timeout_s) {
@@ -411,10 +446,14 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
     // 3. Index them.
     index_or_owe(std::move(to_index));
 
-    // 4. Reconcile on its interval. The lease thread keeps the lease alive.
-    if (catalog && config_.reconcile_interval_ns > 0 &&
-        steady_ns() - last_reconcile_ns_ >= config_.reconcile_interval_ns) {
+    // 4. Reconcile on its interval, or when the pass at start() lost the
+    //    lease before it finished. The lease thread keeps the lease alive.
+    if (catalog &&
+        (reconcile_owed_ ||
+         (config_.reconcile_interval_ns > 0 &&
+          steady_ns() - last_reconcile_ns_ >= config_.reconcile_interval_ns))) {
       reconcile();
+      reconcile_owed_ = false;
       last_reconcile_ns_ = steady_ns();
     }
 
@@ -670,8 +709,8 @@ void CaptureStorageService::keep_lease() {
   while (true) {
     {
       std::unique_lock<std::mutex> lock(wake_mutex_);
-      wake_.wait_for(lock, tick, [this] { return stop_requested_; });
-      if (stop_requested_) return;
+      wake_.wait_for(lock, tick, [this] { return lease_stop_requested_; });
+      if (lease_stop_requested_) return;
     }
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
