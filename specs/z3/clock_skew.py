@@ -104,10 +104,12 @@ def start_wait_constraints(s, extra):
     DECLARED bound, is the hypothesis under test.  Rates are equal -- both
     stamps come from now64(9) server-side -- so only the offset matters.
 
-        Tp  the PREDECESSOR's lease_ttl_ns
-        Ts  the SUCCESSOR's lease_ttl_ns
-        p   the successor's publish_timeout_ns
-        S   the successor's clock_skew_ns
+    All in seconds, as ClickHouseCatalogConfig takes them:
+
+        Tp  the PREDECESSOR's lease TTL
+        Ts  the SUCCESSOR's lease_ttl_s
+        p   the successor's publish_timeout_s
+        S   the successor's clock_skew_s
         t_ins    true time of the predecessor's LAST lease row, then it crashes
         t_start  true time the successor's start() begins waiting
 
@@ -126,6 +128,12 @@ def start_wait_constraints(s, extra):
 
     # Non-degenerate knobs (native_capture.py:355-358 rejects the rest).
     s.add(Tp > 0, Ts > 0, p > 0, S >= 0)
+
+    # The successor's own fence margin: native_capture.py:366-372 (and the
+    # native writer, catalog_writer.cpp:148-160) refuses a TTL that does not
+    # exceed publish_timeout_s + clock_skew_s by at least 0.1 s, so a
+    # successor outside it never starts at all.
+    s.add(Ts - p - S >= 0.1)
 
     # Real replica skew within the declared bound, either direction.
     s.add(d <= S, d >= -S)
@@ -187,11 +195,12 @@ def main():
         #     any real skew within it.
         check_start_wait("start wait, predecessor TTL == successor TTL",
                          lambda Tp, Ts, p, S: Tp == Ts, unsat),
-        # (b) The config comment's 30 s case: a predecessor on the native
-        #     30 s default against a successor on 10 s / 10 s / 2 s.
-        check_start_wait("start wait, predecessor 30s vs successor 10s",
-                         lambda Tp, Ts, p, S: And(Tp == 30, Ts == 10,
-                                                  p == 10, S == 2), sat),
+        # (b) The config comment's 30 s case (native_capture.py:278-280): a
+        #     predecessor on the native 30 s default against a successor on
+        #     the shipped defaults, 15 s / 5 s / 0 s -- a 20 s wait.
+        check_start_wait("start wait, predecessor 30s vs 15s/5s/0s",
+                         lambda Tp, Ts, p, S: And(Tp == 30, Ts == 15,
+                                                  p == 5, S == 0), sat),
         # (c) The exact threshold.  The S in the wait pays for the real skew
         #     exactly, so the whole slack for a TTL mismatch is p:
         #         the wait outlasts the predecessor  <=>  Tp <= Ts + p

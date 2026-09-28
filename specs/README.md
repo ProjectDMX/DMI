@@ -38,9 +38,9 @@ rewrites of the renewal, spool-sweep and start-wait comments.
 | Spec | Models | Source of truth |
 |---|---|---|
 | `tla/VersionAllocator.tla` | the sole-claimant version allocation loop: floor read, jittered candidate, claim INSERT, singleton read-back, retry | `native/csrc/catalog/version_allocator.cpp:49-89`, header claim at `version_allocator.h:5-7`, watermark publish at `native/csrc/catalog/catalog_writer.cpp:583-628`, `clickhouse_client.cpp:374` |
-| `tla/PublisherLease.tla` | the lease claim/renew/release protocol and the fenced publish: `claim_with_rival`, `head()`, `fence()`, `fence_eval()`, `reject_live()`, and `publish_snapshot`'s manifest chunks and watermark INSERT | `native/csrc/catalog/lease_coordinator.cpp:83-257`, `native/csrc/catalog/catalog_writer.cpp:148-169,478-669`, `clickhouse_client.cpp:374`, `docs/catalog-descriptor-key.md:290-360,461-560`, `src/dmi/storage/capture/clickhouse_lease.py:83-92,198-210` |
+| `tla/PublisherLease.tla` | the lease claim/renew/release protocol and the fenced publish: `claim_with_rival`, `head()`, `fence()`, `fence_eval()`, `reject_live()`, and `publish_snapshot`'s manifest chunks and watermark INSERT | `native/csrc/catalog/lease_coordinator.cpp:83-257`, `native/csrc/catalog/catalog_writer.cpp:148-169,478-669`, `clickhouse_client.cpp:374`, `docs/catalog-descriptor-key.md:280-420,456-545`, `src/dmi/storage/capture/clickhouse_lease.py:83-92,198-210` |
 | `tla/LeaseLifecycle.tla` | the lease lifecycle *above* that protocol: the lease thread, the quarantine window, the `2 x TTL` latch, the start wait and the spool sweep | `native/csrc/catalog/storage_service.cpp:65-67,102-173,175-205,276-404,437-441,592-632,634-660,662-690,692-741,743-759,782-801`, `catalog_writer.cpp:243-253,268-274,285-293,296-310`, `lease_coordinator.cpp:45-55,57-68,70-81,230-257`, `indexer.cpp:258`, `src/dmi/storage/native_capture.py:270-280,374-378` |
-| `z3/clock_skew.py` | two obligations: the two-host derivation behind the fence margin `publish_timeout_ns + clock_skew_ns`, and the default start wait `lease_ttl_s + publish_timeout_s + clock_skew_s` | the SQL at `docs/catalog-descriptor-key.md:352-362` (emitted by `catalog_writer.cpp:583`), the derivation at `:365-372`, the cap at `catalog_writer.cpp:519`; for the start wait, `native_capture.py:374-378`, `storage_service.cpp:662-690`, `lease_coordinator.cpp:148-163,232` |
+| `z3/clock_skew.py` | two obligations: the two-host derivation behind the fence margin `publish_timeout_ns + clock_skew_ns`, and the default start wait `lease_ttl_s + publish_timeout_s + clock_skew_s` | the SQL at `docs/catalog-descriptor-key.md:352-362` (emitted by `catalog_writer.cpp:583`), the derivation at `:365-372`, the cap at `catalog_writer.cpp:519`; for the start wait, `native_capture.py:366-378`, `storage_service.cpp:662-690`, `lease_coordinator.cpp:148-163,232` |
 | `cbmc/payload_ring_span.cpp` | `payload_compute_spans` and its stated precondition: the span arithmetic only, not the ring's publish/consume protocol | `native/csrc/ring/payload_ring.cuh:44-86` |
 
 All three TLA+ models are written against the **code**, not the prose. Where
@@ -305,7 +305,7 @@ integers. Most configs run one service with `TTL = 6`.
 
 | Config | Invariant | Verdict | States |
 |---|---|---|---|
-| `O1_tries` | `ThreeTriesFit` | **holds** | 11 / 9 |
+| `O1_tries` | `ThreeTriesFit` + `FourTriesFit` | **holds** | 11 / 9 |
 | `O1_tries12` (`TTL 12`) | `ThreeTriesFit` + `FourTriesFit` | **holds** | 6 / 6 |
 | `O1_tries60` (`TTL 60`) | `ThreeTriesFit` + `FourTriesFit` | **holds** | 6 / 6 |
 | `O1_tries5` | `FiveTriesFit` | violated (constant-level) | — |
@@ -336,15 +336,17 @@ while requests are fast, not that the lease survives a slow ClickHouse.
 Nothing in the code bounds a lease request below half the TTL yet; a
 follow-up PR will bound lease request time.
 
-`O1_tries` / `O1_tries5` together pin the tick arithmetic in the comment at
-`storage_service.cpp:635-638`: with no `index()` in the way, *"the renewal
-fires within about a tick of falling due, leaving at least roughly half the
-TTL for it to land before the row expires"*. Exactly **four** lease-thread
-wakes fall between the instant the renewal falls due (`last_renew + ttl/3`)
-and the instant the row dies (`last_renew + ttl`), at every phase offset:
-three fit, four fit, five do not. So the first falls within a tick of due,
-with more than half the TTL still to run. (Before #154 the comment said
-*"which leaves two more tries"*, three wakes; `ThreeTriesFit` is that claim.)
+`O1_tries`, `O1_tries12` and `O1_tries60` (`FourTriesFit` holds at `TTL` 6, 12
+and 60) and `O1_tries5` (`FiveTriesFit` refuted at `TTL` 60) together pin the
+tick arithmetic in the comment at `storage_service.cpp:635-638`: with no
+`index()` in the way, *"the renewal fires within about a tick of falling due,
+leaving at least roughly half the TTL for it to land before the row
+expires"*. Exactly **four** lease-thread wakes fall between the instant the
+renewal falls due (`last_renew + ttl/3`) and the instant the row dies
+(`last_renew + ttl`), at every phase offset: three fit, four fit, five do
+not. So the first falls within a tick of due, with more than half the TTL
+still to run. (Before #154 the comment said *"which leaves two more tries"*,
+three wakes; `ThreeTriesFit` is that claim.)
 The arithmetic is correct on the tick grid, and nominal: it assumes every wake
 is on time and every renewal completes at once, which `O1_slowreq` shows is
 load-bearing, and `last_renew_ns_` is stamped after the round trip returns,
@@ -377,22 +379,28 @@ the lease"*. But `indexer.cpp:258` gates the whole publish on
 `!all_rows.empty() || !indexed.empty()`: an index pass whose packs were all
 already committed returns `skipped_packs > 0` and never calls
 `renew_for_publish()`. The bump pushes the next renewal out by `ttl/3` without
-anything having touched the row. The trace, at `TTL = 6` so `ttl/3 = 2` ticks:
+anything having touched the row. TLC's shortest trace (19 states), at
+`TTL = 6` so `ttl/3 = 2` ticks:
 
-1. Tick 0. `s1` starts, claims lease 1. Its row expires at tick 6.
-2. Tick 1. A cycle indexes a batch whose packs were all already committed.
-   `skipped_packs > 0`, nothing is published, `last_renew_ns_ := 1`. The
-   renewal is now not due until tick 3.
-3. Tick 3. The lease thread wakes, finds `now - last_renew_ns_ < ttl/3`, and
-   returns without renewing. Another skip-bump lands in the same tick:
-   `last_renew_ns_ := 3`. Due date moves to 5.
-4. Tick 5. Same again: the lease thread stands down, a third skip-bump sets
-   `last_renew_ns_ := 5` and the due date to 7.
-5. Tick 6. The row expires. `held_lease() != nullptr` is still true and
-   `phase = run`, so `NoPhantomLease` falls at depth 23.
+1. Tick 0. `s1` starts, claims lease 1. Its row expires at tick 6, and
+   `last_renew_ns_ = 0`, so the renewal falls due at tick 2.
+2. Tick 1. The lease thread wakes, finds `1 - 0 < ttl/3`, and returns without
+   renewing.
+3. Tick 2. Before the lease thread wakes, a cycle indexes a batch whose packs
+   were all already committed. `skipped_packs > 0`, nothing is published,
+   `last_renew_ns_ := 2`. The lease thread then finds `2 - 2 < ttl/3` and
+   stands down. The renewal is now not due until tick 4.
+4. Tick 3. The lease thread stands down again: `3 - 2 < ttl/3`.
+5. Tick 4. Same as tick 2: a second skip-bump lands first,
+   `last_renew_ns_ := 4`, and the lease thread stands down. The due date moves
+   to 6.
+6. Tick 5. The lease thread stands down: `5 - 4 < ttl/3`.
+7. Tick 6. The row, untouched since tick 0, expires. `held_lease() != nullptr`
+   is still true and `phase = run`, so `NoPhantomLease` falls.
 
-Because the bumps arrive at exactly the renewal interval, the lease thread is
-starved indefinitely — it never once reaches its own due test as true.
+Because each bump lands at exactly the renewal interval, ahead of the lease
+thread's wake in the tick the renewal falls due, the lease thread is starved
+indefinitely — it never once reaches its own due test as true.
 **Reachability caveat:** this needs skip-only passes landing close enough
 together to keep resetting the clock, and no single concrete deployment
 scenario chaining them was demonstrated. The state machine reaches it; a
@@ -564,7 +572,7 @@ below takes none, and the run is refuted just the same with `MaxCuts = 0`;
    `Recover()`, which deletes every `.open` file it does not own — including
    `s1`'s in-progress packs — and records the count in
    `state_.swept_on_start` as a success. Both services are now in `run` and
-   `coSweep` is set: `SweepOnlyWhenAlone` falls at depth 23.
+   `coSweep` is set: `SweepOnlyWhenAlone` falls at depth 22.
 
 Nothing reports an error. `s1` keeps writing into files that have been
 unlinked, and `s2`'s `swept_on_start` counts a live sink's work as recovered
@@ -624,7 +632,7 @@ does stop — and is proved non-vacuous by `vac_stops2refusal` and
 | real skew `d > clock_skew_ns` overlaps | `sat` |
 | margin with the `+ clock_skew_ns` term dropped, any `d > 0` | `sat` |
 | start wait, predecessor TTL `==` successor TTL | `unsat` |
-| start wait, predecessor 30 s vs successor 10 s / 10 s / 2 s | `sat` |
+| start wait, predecessor 30 s vs successor 15 s / 5 s / 0 s | `sat` |
 | start wait, `Tp <= Ts + p` (the threshold) | `unsat` |
 | start wait, `Tp >  Ts + p` (above it) | `sat` |
 
@@ -646,8 +654,12 @@ On the shipped Python defaults — `lease_ttl_s = 15`, `publish_timeout_s = 5` �
 any predecessor TTL up to **20 s** is outlasted. The native default TTL is
 30 s (`catalog_writer.h:34`), which processes predating these knobs used, so a
 restart after one of those gives up 10 s early. The script's second start-wait
-check pins the same failure at a different knob set (successor 10 s / 10 s /
-2 s, so a 22 s wait against a 30 s row, 8 s short).
+check pins exactly that case (successor 15 s / 5 s / 0 s, so a 20 s wait
+against a 30 s row, 10 s short). Every start-wait check also carries the
+successor's own fence margin,
+`lease_ttl_s - publish_timeout_s - clock_skew_s >= 0.1 s`
+(`native_capture.py:366-372`, `catalog_writer.cpp:148-160`): a successor
+outside it is refused at construction and never waits at all.
 
 The comment also names the skew that matters *at start*: it *"assumes
 clock_skew_s bounds the offset between the replica that stamped the

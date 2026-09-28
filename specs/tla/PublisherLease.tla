@@ -67,14 +67,14 @@ CONSTANTS
   AllowOverrun,    \* TRUE models doc :503 "max_execution_time is checked
                    \* between processing blocks ... a statement blocked in a
                    \* lock can overrun it"
-  WriterLock,      \* TRUE models the re-entrant writer lock (doc :535)
+  WriterLock,      \* TRUE models the re-entrant writer lock (doc :539-543)
   FreshPublishId   \* TRUE = publish_id minted per call (catalog_writer.cpp:529)
 
 VARIABLES
   rows,            \* the append-only {prefix}_publisher_lease table.
                    \* NO UPDATE ANYWHERE: every action only ever adds.
   settled,         \* rows guaranteed visible to every replica
-  now,             \* the SERVER clock (doc :320: expiries and the fence are
+  now,             \* the SERVER clock (doc :317-320: expiries and the fence are
                    \* both stamped server-side)
   lease,           \* [Writers -> PublisherLease or NoLease]
   pc, ret, ctm, clid, chunk, ver, att,
@@ -109,7 +109,7 @@ WriterOf(p) == IF SelfRace THEN "shared" ELSE p
 (* sees every accepted row.  Without it, the replica it lands on may be    *)
 (* behind: it sees everything already replicated (`settled`) and any       *)
 (* subset of what is accepted but still in flight.  This is the single     *)
-(* load-bearing assumption of the whole safety argument -- doc :296        *)
+(* load-bearing assumption of the whole safety argument -- doc :304        *)
 (* "Where that safety comes from is the read-back" -- so it is a knob.     *)
 (***************************************************************************)
 Views == IF Linearizable THEN {rows}
@@ -120,7 +120,7 @@ HTerm(V)     == SetMax({r.term : r \in V})
 HeadSet(V)   == {r \in V : r.term = HTerm(V)}
 HLids(V)     == {r.lid : r \in HeadSet(V)}
 (* "A lease's expiry at a term is the MINIMUM expires_at_ns written under
-   its (term, lease_id)" -- doc :326, clickhouse_lease.py:83-92.  This is
+   its (term, lease_id)" -- doc :327-328, clickhouse_lease.py:83-92.  This is
    exactly what makes the release tombstone end the lease. *)
 MinExpOf(V, l) == SetMin({r.exp : r \in {q \in HeadSet(V) : q.lid = l}})
 (* ORDER BY lease_id DESC -> the greatest id under the collation *)
@@ -136,7 +136,7 @@ RejectLivePasses(V, l) ==
   \/ LiveUntil(V) <= now
   \/ (NClaim(V) = 1 /\ TopLid(V) = l)
 
-(* fence() -- lease_coordinator.cpp:167-180, doc :350-360.
+(* fence() -- lease_coordinator.cpp:167-180, doc :352-362.
    ONE subquery reading ONE row (doc :378 explains why the two-subquery form
    is unsound).  The margin is publish cap PLUS host clock skew bound
    (clickhouse_lease.py:198-210, the S - (b - a) >= 0 derivation). *)
@@ -235,7 +235,7 @@ ClaimInsert(p) ==
                  manifest, wm, inflight, maxLanded, wmOutOfOrder, used>>
 
 (* Round trip 3: the singleton read-back (:115-137).  THIS is where the
-   safety comes from, per doc :296-303 -- not from the fence. *)
+   safety comes from, per doc :304-314 -- not from the fence. *)
 ClaimRead(p) ==
   LET w == WriterOf(p) IN
   /\ pc[p] = "claim_read"
@@ -284,7 +284,7 @@ ManNext(p) ==
                  manifest, wm, inflight, maxLanded, wmOutOfOrder, used>>
 
 (* The fenced manifest INSERT (catalog_writer.cpp:533-547).  A fence refusal
-   writes ZERO rows WITHOUT raising (doc :452) -- hence the else branch goes
+   writes ZERO rows WITHOUT raising (doc :417) -- hence the else branch goes
    straight to the read-back, which is what catches it. *)
 ManAdmit(p) ==
   LET w == WriterOf(p) IN
@@ -322,7 +322,7 @@ ManAbort(p) ==
                  manifest, wm, maxLanded, wmOutOfOrder, used>>
 
 (* "Every conditional manifest INSERT is read back before the next renewal"
-   -- doc :456, catalog_writer.cpp:556-567.  Then the renewal (:579). *)
+   -- doc :416, catalog_writer.cpp:556-567.  Then the renewal (:579). *)
 ManRead(p) ==
   /\ pc[p] = "man_read"
   /\ \/ /\ \E m \in manifest :
@@ -427,7 +427,7 @@ LandableWmStmts    == {s \in WatermarkStmts : CanStillLand(s)}
 (*-------------------------------------------------------------------------*)
 (* 1. NoOverlappingAdmit  --  THE safety property.                          *)
 (*    catalog_writer.cpp:525-528 ("a publisher whose lease was taken over   *)
-(*    makes NO snapshot visible") and doc :340-346.                         *)
+(*    makes NO snapshot visible") and doc :335-350.                         *)
 (*    No two watermark-admitting statements are in flight at once.          *)
 (*    EXPECTED: HOLDS with Linearizable /\ ~AllowOverrun.                   *)
 (*-------------------------------------------------------------------------*)
@@ -449,7 +449,7 @@ WatermarkMonotonic == ~wmOutOfOrder
 
 (*-------------------------------------------------------------------------*)
 (* 3. CompleteManifest -- every visible watermark row has a complete        *)
-(*    manifest behind it.  catalog_writer.cpp:556-567, doc :456.            *)
+(*    manifest behind it.  catalog_writer.cpp:556-567, doc :416-419.        *)
 (*    EXPECTED: HOLDS.                                                      *)
 (*-------------------------------------------------------------------------*)
 CompleteManifest ==

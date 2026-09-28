@@ -593,7 +593,7 @@ VacCoSweep     == ~coSweep
 (*                                                                          *)
 (*  config              invariant                 verdict     distinct      *)
 (*  ------------------  ------------------------  ----------  ---------     *)
-(*  O1_tries            ThreeTriesFit             HOLDS               9     *)
+(*  O1_tries            Three+FourTriesFit        HOLDS               9     *)
 (*  O1_tries12/60       Three+FourTriesFit        HOLDS               6     *)
 (*  O1_tries5           FiveTriesFit              REFUTED             -     *)
 (*                      -> exactly FOUR wakes fall in the window            *)
