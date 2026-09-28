@@ -1689,6 +1689,72 @@ def test_a_slow_but_healthy_catalog_keeps_its_lease_through_index_passes(
         assert sorted(captures) == sorted(tensors)
 
 
+def test_a_catalog_too_slow_to_keep_its_lease_says_so(fake_s3, tmp_path):
+    """The lease-timeout streak reset on every successful claim, and counted
+    only claims and renewals that timed out. Against a catalog too slow to
+    keep a lease -- each claim goes through, then a renewal or a request of
+    the pass runs out of lease, the writer quarantines, and the next claim
+    goes through again -- the count went 1, 0, 1, 0 and the knobs were
+    never named. Every timeout that costs the lease now counts, and the
+    count clears only once a lease has been held for 2 x TTL. Scaled 1/5:
+    0.9 s INSERTs and 0.4 s reads against a 3 s TTL."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
+                     publish_timeout_s=1, clickhouse_request_timeout_s=20.0)
+        warm = _service(_storage_config(fake_s3, catalog.table_prefix,
+                                        **knobs), tmp_path / "warm")
+        warm.start()
+        warm.stop()
+
+        switch.delay_requests(_slow_catalog(0.9, 0.4))
+        service = _service(_storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            **knobs), spool_root)
+        service.start()
+        states = []
+        stop = threading.Event()
+
+        def _sample():
+            while not stop.is_set():
+                states.append(service.snapshot()["lease_state"])
+                time.sleep(0.1)
+
+        sampler = threading.Thread(target=_sample, daemon=True)
+        sampler.start()
+        try:
+            _stage(spool_root, range(4))
+
+            def _flush():
+                try:
+                    service.flush(40.0)  # never drains; stop() ends it
+                except Exception:  # noqa: BLE001 -- "not started" once stopped
+                    pass
+
+            flusher = threading.Thread(target=_flush, daemon=True)
+            flusher.start()
+            _wait_for(lambda: service.snapshot()["lease_timeout_error"],
+                      timeout_s=30.0)
+            snapshot = service.snapshot()
+        finally:
+            stop.set()
+            switch.close()
+            service.stop()
+            sampler.join(timeout=5)
+
+        # The claims went through: this is the lease lost after each.
+        assert "held" in states and "quarantined" in states, states
+        assert snapshot["lease_timeouts"] >= 3, snapshot
+        assert snapshot["failed"] is False, snapshot
+        for knob in ("lease_ttl_s", "clock_skew_s",
+                     "clickhouse_request_timeout_s", "lease_ttl_s / 3"):
+            assert knob in snapshot["lease_timeout_error"], snapshot
+        # last_error is whatever failed last -- the knobs when the count
+        # reached three, the pass the lost lease failed a moment later.
+        assert "lease" in snapshot["last_error"], snapshot
+
+
 def _lease_insert(request: bytes) -> bool:
     body = request.partition(b"\r\n\r\n")[2]
     return body.startswith(b"INSERT") and b"_publisher_lease` (term" in body
@@ -1762,7 +1828,8 @@ def test_lease_requests_that_keep_timing_out_name_the_knobs_that_bound_them(
     timed out, quarantined, was refused by its own late row, started over --
     and all the snapshot ever said was "curl: Timeout was reached". Once
     three lease requests in a row time out, the snapshot names the bound
-    and the knobs that set it, until the lease renews again."""
+    and the knobs that set it, until a lease has been held for 2 x TTL
+    again."""
     switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
     with _catalog() as (_client, catalog):
         config = _storage_config(

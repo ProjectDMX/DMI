@@ -171,10 +171,13 @@ struct StorageServiceSnapshot {
   // steady_clock ns at which the quarantine ends; 0 when not quarantined.
   uint64_t quarantined_until_ns = 0;
   uint64_t lease_reacquisitions = 0;  // fresh leases taken after a loss
-  // Lease claims and renewals that timed out since one last succeeded.
-  // From the third on, lease_timeout_error says so and names the knobs that
-  // bound them (it is last_error too, when it happens); both clear once a
-  // claim or renewal succeeds.
+  // Timeouts that cost the publisher lease -- a claim or renewal that timed
+  // out (the server's own time limit included), a request made under the
+  // lease that its deadline cut off, a lease abandoned at its deadline --
+  // since a lease was last held for 2 x TTL. From the third on,
+  // lease_timeout_error says so and names the knobs that bound them (it is
+  // last_error too, when it happens); both clear once a lease has been held
+  // for 2 x TTL again.
   uint64_t lease_timeouts = 0;
   std::string lease_timeout_error;
   std::string last_error;
@@ -255,14 +258,18 @@ class CaptureStorageService {
   // LeaseScope's before_request hook: renew_lease_if_due() before each
   // request a stretch under the lease lock sends.
   void keep_lease_in_pass();  // requires lease_mutex_
-  // Gives up a held lease whose deadline has passed. Requires lease_mutex_.
+  // Gives up a held lease whose deadline has passed, counting it towards
+  // lease_timeouts. Requires lease_mutex_.
   void abandon_lease_if_expired();
   // A lease claim or renewal failed (call from its catch block): one that
   // timed out counts towards lease_timeouts. Requires lease_mutex_.
   void note_lease_failure(const std::exception& failure);
-  // A claim or renewal succeeded: clears the timeout count. Requires
-  // lease_mutex_.
-  void note_lease_success();
+  // Counts one timeout that cost the lease; `latest` says what it was.
+  // Requires lease_mutex_.
+  void count_lease_timeout(const std::string& latest);
+  // Clears the timeout count once the lease now held has been held for
+  // 2 x TTL (publish_lease_state runs it). Requires lease_mutex_.
+  void track_stable_lease();
   // Takes the lease at start(), waiting for an expiring predecessor or
   // retrying a claim that timed out.
   void acquire_lease_at_start();  // requires lease_mutex_
@@ -296,9 +303,15 @@ class CaptureStorageService {
   // publish. Taken inside cycle_mutex_, never the other way, and only
   // through a LeaseScope.
   std::mutex lease_mutex_;
-  // Lease claims and renewals timed out since the last that succeeded.
-  // Guarded by lease_mutex_.
+  // Timeouts that cost the lease since one was last held for 2 x TTL, and
+  // every one ever counted (which LeaseScope compares, so that a loss is
+  // counted once). Guarded by lease_mutex_.
   uint64_t lease_timeouts_ = 0;
+  uint64_t lease_timeouts_counted_ = 0;
+  // The lease_id held when publish_lease_state() last looked, and since
+  // when (track_stable_lease). Guarded by lease_mutex_.
+  std::string stable_lease_id_;
+  uint64_t stable_since_ns_ = 0;
   // When a claim or renewal was first refused by another holder since the
   // lease was last held; 0 while none has been. Guarded by lease_mutex_.
   uint64_t held_elsewhere_since_ns_ = 0;

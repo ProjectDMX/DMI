@@ -283,6 +283,13 @@ uint64_t RequestDeadline::current(std::string* bound) {
   return tightest;
 }
 
+void RequestDeadline::note_outcome(const std::string& timeout) {
+  for (RequestDeadline* scope = innermost_deadline; scope != nullptr;
+       scope = scope->outer_) {
+    scope->last_timeout_ = timeout;
+  }
+}
+
 void RequestDeadline::before_request() {
   const RequestDeadline* scope = innermost_deadline;
   if (scope == nullptr || !scope->before_request_ || in_before_request) {
@@ -480,6 +487,20 @@ std::vector<Row> ClickHouseClient::execute(
   // First, so that what it does -- a lease renewal -- moves the deadline
   // before this request reads it.
   RequestDeadline::before_request();
+  // The outcome every scope in force records (RequestDeadline::last_timeout):
+  // a timeout's message, noted where one is thrown, or empty however else
+  // this call ends.
+  struct Outcome {
+    bool noted = false;
+    ~Outcome() {
+      if (!noted) RequestDeadline::note_outcome("");
+    }
+  } outcome;
+  const auto timed_out = [&outcome](const std::string& error, bool sent) {
+    RequestDeadline::note_outcome(error);
+    outcome.noted = true;
+    return ClickHouseError(error, true, sent);
+  };
   const std::string statement = substitute(query, params);
   const bool read = is_read_statement(statement);
 
@@ -589,7 +610,7 @@ std::vector<Row> ClickHouseClient::execute(
         if (number > 1) {
           error += "; the attempt before failed with: " + last_error;
         }
-        throw ClickHouseError(error, true, sent);
+        throw timed_out(error, sent);
       }
       if (left_ms < static_cast<uint64_t>(request_ms)) {
         request_ms = static_cast<long>(left_ms);
@@ -628,7 +649,7 @@ std::vector<Row> ClickHouseClient::execute(
       if (number > 1) {
         error += " (attempt " + std::to_string(number) + ")";
       }
-      throw ClickHouseError(error, true, sent);
+      throw timed_out(error, sent);
     }
     std::string error;
     bool retry = false;
@@ -654,7 +675,7 @@ std::vector<Row> ClickHouseClient::execute(
         if (number > 1) {
           error += " (attempt " + std::to_string(number) + ")";
         }
-        throw ClickHouseError(error, true, sent);
+        throw timed_out(error, sent);
       }
       retry = read && attempt.status >= 500 && attempt.status < 600 &&
               (code < 0 || transient_clickhouse_error(code));

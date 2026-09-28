@@ -86,11 +86,25 @@ class CaptureStorageService::LeaseScope {
                   kLeaseDeadlineBound,
                   [service] { service->keep_lease_in_pass(); }) {
     service_->abandon_lease_if_expired();
+    const PublisherLease* held = service_->writer_.held_lease();
+    if (held != nullptr) held_on_entry_ = held->lease_id;
+    counted_on_entry_ = service_->lease_timeouts_counted_;
   }
 
   ~LeaseScope() {
     try {
       service_->abandon_lease_if_expired();
+      // A lease this stretch lost to a request that timed out -- one its
+      // deadline cut off, or the server's own time limit -- counts towards
+      // lease_timeouts, unless what lost it counted already (a renewal or
+      // claim that timed out, or the abandon above).
+      const PublisherLease* held = service_->writer_.held_lease();
+      const bool lost = !held_on_entry_.empty() &&
+                        (held == nullptr || held->lease_id != held_on_entry_);
+      if (lost && service_->lease_timeouts_counted_ == counted_on_entry_ &&
+          !deadline_.last_timeout().empty()) {
+        service_->count_lease_timeout(deadline_.last_timeout());
+      }
       service_->publish_lease_state();
     } catch (...) {
     }
@@ -103,6 +117,8 @@ class CaptureStorageService::LeaseScope {
   CaptureStorageService* service_;
   std::unique_lock<std::mutex> lock_;
   RequestDeadline deadline_;  // after lock_: released before it
+  std::string held_on_entry_;  // the lease_id held on entry, "" for none
+  uint64_t counted_on_entry_ = 0;
 };
 
 CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
@@ -774,7 +790,6 @@ void CaptureStorageService::renew_lease_if_due() {
   if (ttl == 0 || sent == 0 || steady_ns() - sent < ttl / 3) return;
   writer_.renew_lease();
   held_elsewhere_since_ns_ = 0;
-  note_lease_success();
   std::lock_guard<std::mutex> lock(state_mutex_);
   ++state_.lease_renewals;
 }
@@ -796,23 +811,30 @@ void CaptureStorageService::abandon_lease_if_expired() {
   const uint64_t deadline = writer_.lease_deadline_ns();
   if (deadline == 0 || steady_ns() < deadline) return;
   writer_.abandon_lease();
-  record_error(std::string("publisher lease abandoned: it was not renewed "
-                           "by ") + kLeaseDeadlineBound);
+  const std::string message =
+      std::string("publisher lease abandoned: it was not renewed by ") +
+      kLeaseDeadlineBound;
+  record_error(message);
+  count_lease_timeout(message);
 }
 
 void CaptureStorageService::note_lease_failure(const std::exception& failure) {
   const auto* error = dynamic_cast<const ClickHouseError*>(&failure);
-  if (error == nullptr || !error->timed_out()) return;
+  if (error != nullptr && error->timed_out()) count_lease_timeout(error->what());
+}
+
+void CaptureStorageService::count_lease_timeout(const std::string& latest) {
   ++lease_timeouts_;
+  ++lease_timeouts_counted_;
   std::string message;
   if (lease_timeouts_ >= 3) {
     // The knobs first: last_error keeps only its first 512 bytes.
     const uint64_t claim_bound = writer_.leases().claim_bound_ns();
     message =
         std::to_string(lease_timeouts_) +
-        " publisher lease claims or renewals have timed out since one last "
-        "succeeded. Requests made under the lease have until its deadline, "
-        "lease_ttl_s (" +
+        " timeouts have cost the publisher lease since one was last held "
+        "for 2 x lease_ttl_s. Requests made under the lease have until its "
+        "deadline, lease_ttl_s (" +
         seconds_text(config_.writer.lease_ttl_ns) + ") less clock_skew_s (" +
         seconds_text(config_.writer.clock_skew_ns) + ") and a " +
         seconds_text(kLeaseDeadlineMarginNs) +
@@ -820,7 +842,7 @@ void CaptureStorageService::note_lease_failure(const std::exception& failure) {
         "of a claim made without one has min(clickhouse_request_timeout_s, "
         "lease_ttl_s / 3) = " + seconds_text(claim_bound) +
         ". A catalog this slow needs a longer lease_ttl_s. The latest: " +
-        error->what();
+        latest;
     record_error(message);
   }
   std::lock_guard<std::mutex> lock(state_mutex_);
@@ -828,7 +850,28 @@ void CaptureStorageService::note_lease_failure(const std::exception& failure) {
   state_.lease_timeout_error = message.substr(0, 1024);
 }
 
-void CaptureStorageService::note_lease_success() {
+void CaptureStorageService::track_stable_lease() {
+  // Not on every claim or renewal that succeeds: against a catalog too slow
+  // to keep a lease, each claim goes through and the lease is then lost to
+  // a timeout, and a count cleared by the claim never got past one. A lease
+  // held for 2 x TTL -- renewed through several deadlines -- is one the
+  // catalog can keep. A lease_id names one holding: every claim after a
+  // loss mints a fresh one, and renewals keep it.
+  const PublisherLease* held = writer_.held_lease();
+  if (held == nullptr) {
+    stable_lease_id_.clear();
+    return;
+  }
+  const uint64_t now = steady_ns();
+  if (held->lease_id != stable_lease_id_) {
+    stable_lease_id_ = held->lease_id;
+    stable_since_ns_ = now;
+    return;
+  }
+  if (lease_timeouts_ == 0 ||
+      now - stable_since_ns_ < 2 * config_.writer.lease_ttl_ns) {
+    return;
+  }
   lease_timeouts_ = 0;
   std::lock_guard<std::mutex> lock(state_mutex_);
   state_.lease_timeouts = 0;
@@ -849,7 +892,6 @@ void CaptureStorageService::acquire_lease_at_start() {
   while (true) {
     try {
       writer_.acquire_lease(config_.holder);
-      note_lease_success();
       return;
     } catch (const CatalogError& exc) {
       if (!is_lease_refusal(exc) || config_.start_lease_wait_ns == 0) throw;
@@ -952,7 +994,6 @@ bool CaptureStorageService::ensure_publisher_lease() {
     publish_lease_state();
     return false;
   }
-  note_lease_success();
   held_elsewhere_since_ns_ = 0;
   next_claim_ns_ = 0;
   {
@@ -1004,6 +1045,7 @@ void CaptureStorageService::lease_held_elsewhere(const CatalogError& refusal) {
 }
 
 void CaptureStorageService::publish_lease_state() {
+  track_stable_lease();
   uint64_t until = 0;
   const char* lease_state = "reacquiring";
   if (writer_.held_lease() != nullptr) {

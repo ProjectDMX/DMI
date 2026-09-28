@@ -92,11 +92,18 @@ class RequestDeadline {
   // not already running. What the hook throws propagates.
   static void before_request();
 
+  // What the last request made on this thread while the scope lived (in a
+  // nested scope too) timed out with; empty if it did not time out, or if
+  // none was made. execute() records it, by note_outcome().
+  const std::string& last_timeout() const { return last_timeout_; }
+  static void note_outcome(const std::string& timeout);
+
  private:
   uint64_t fixed_ns_ = 0;
   std::function<uint64_t()> moving_ns_;
   std::string bound_;
   std::function<void()> before_request_;
+  std::string last_timeout_;
   RequestDeadline* outer_;
 };
 
