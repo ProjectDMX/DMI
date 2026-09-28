@@ -1179,6 +1179,72 @@ def test_a_replayed_pack_does_not_flip_a_pinned_read_on_either_side():
             driver.close()
 
 
+@pytest.mark.parametrize("newer_part", ["written last", "written first"])
+def test_within_one_pack_the_row_a_merge_keeps_is_the_row_both_sides_read(
+        newer_part):
+    """A pack's rows at two versions resolve to the newer one, merged or not.
+
+    A pack re-indexed after its publish has its rows at two index_versions,
+    and a merge keeps only the higher (ReplacingMergeTree(index_version)).
+    Both rows share member_version, store_id and pack_id, so the last
+    component of the resolution order, index_version, is all that makes a
+    pinned read pick the row the merge will keep. Without it the tie is
+    undefined, and a pin could read one row before a merge and the other
+    after it. Rows rendered from one pack are identical today, which hides
+    that; here the second rendering moves payload_offset so the pick shows.
+    Which row an undefined tie picks follows the order the parts are read
+    in, so the newer rows go into a part written after the older one and
+    into one written before it: with index_version dropped from
+    kResolutionOrder, the second case returns the older rows. The Python
+    order is also pinned by text, in test_clickhouse_capture_reader
+    (test_one_aggregate_on_a_total_order_resolves_both_query_sites).
+    """
+    from dmi.storage.capture.clickhouse_reader import _RESOLVED
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            pack = str(uuid.uuid4())
+            first = _descriptor_dicts(2, pack_id=pack)
+            again = [dict(entry, payload_offset=entry["payload_offset"] +
+                          1_000_000) for entry in first]
+            if newer_part == "written last":
+                _publish_native(driver, prefix, first, 7)
+            written = driver.call(op="write_descriptors", descriptors=again,
+                                  index_version=9)
+            assert written["ok"], written
+            if newer_part == "written first":
+                _publish_native(driver, prefix, first, 7)
+            assert driver.call(op="current_watermark")["watermark"] == "7"
+
+            reader = _python_reader(client, config)
+            ids = [entry["capture_id"] for entry in first]
+            offset_at = 5 + list(_RESOLVED).index("payload_offset")
+            expected = sorted(str(entry["payload_offset"]) for entry in again)
+            for phase in ("before a merge", "after a merge"):
+                if phase == "after a merge":
+                    client.execute(
+                        f"OPTIMIZE TABLE `{config.database}`."
+                        f"`{prefix}_capture_raw` FINAL")
+                native_search = driver.call(op="search", limit=100)
+                native_ids = driver.call(op="get_by_ids", capture_ids=ids,
+                                         tenant_id="t", watermark="7")
+                assert native_search["ok"] and native_ids["ok"], phase
+                for rows in (native_search["items"], native_ids["items"]):
+                    assert sorted(row[offset_at] for row in rows) == expected, (
+                        phase, rows)
+                page = _python_page_items(reader)
+                python_ids = reader.get_by_ids(ids, tenant_id="t",
+                                               watermark="7")
+                assert _normalize(native_search["items"]) == _normalize(
+                    page.items), phase
+                assert _normalize(native_ids["items"]) == _normalize(
+                    python_ids), phase
+        finally:
+            driver.close()
+
+
 # --- C2: hydration and core summary at parity --------------------------------
 
 def _e2e_setup(fake_s3, prefix, record_count=3, **stage_kwargs):
