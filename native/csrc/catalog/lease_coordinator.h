@@ -15,6 +15,7 @@
 #define DMI_CATALOG_LEASE_COORDINATOR_H
 
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
@@ -111,6 +112,7 @@ struct LeaseHead {
   uint64_t expires_at_ns = 0;
   uint64_t live_until_ns = 0;
   uint64_t now_ns = 0;
+  std::vector<std::string> lease_ids;  // every claimant at the head term
 };
 
 class CatalogError : public std::runtime_error {
@@ -157,6 +159,11 @@ class LeaseCoordinator {
   // never connected, or was not sent because its deadline had passed,
   // wrote nothing, whatever it failed with.
   bool claim_insert_sent() const { return claim_insert_sent_; }
+  // Whether the last refusal (kHeld) came from claim rows this coordinator
+  // itself inserted, and nobody else's: a claim whose request gave up but
+  // which the server still executed, late. Such a row expires one TTL after
+  // it landed and is no rival publisher.
+  bool refused_by_own_claims() const { return refused_by_own_claims_; }
 
   PublisherLease acquire(const std::string& holder);
   PublisherLease renew();
@@ -198,6 +205,13 @@ class LeaseCoordinator {
   bool claim_insert_sent_ = false;
   std::optional<PublisherLease> lease_;
   std::string table_;
+  // The lease_ids of the most recent claim INSERTs this coordinator sent,
+  // whether or not they were confirmed: a claim that timed out may still
+  // land. Only a claim from the last TTL or so can still be live, so a
+  // short history covers it -- each id once, so the renewals of one lease,
+  // which all claim the same id, cannot crowd the others out.
+  std::deque<std::string> claimed_ids_;
+  bool refused_by_own_claims_ = false;
 };
 
 }  // namespace dmi_catalog

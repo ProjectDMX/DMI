@@ -9,6 +9,9 @@ namespace dmi_catalog {
 
 namespace {
 
+// How many recent claim lease_ids to remember (see claimed_ids_).
+constexpr size_t kClaimHistory = 16;
+
 // A Seconds setting from whole milliseconds. Whole seconds wherever the
 // value allows -- what every server parses, and what publish_timeout_ns
 // already requires -- rounded DOWN, so the server's cap never exceeds the
@@ -117,7 +120,9 @@ void LeaseCoordinator::add_write_caps(
   // designated points while the pipeline runs, so the part commit can
   // overrun it, and its clock starts when the server starts the query, not
   // when the client sent it -- a request held up in transit can still land
-  // up to that delay after the client gave up.
+  // up to that delay after the client gave up. The storage service
+  // therefore does not count a refusal by its own claim rows towards its
+  // 2 x TTL latch (refused_by_own_claims()).
   const uint64_t deadline = RequestDeadline::current();  // run() set one
   const uint64_t now = steady_now_ns();
   // 0 when the deadline has passed; execute() then sends nothing.
@@ -194,10 +199,18 @@ PublisherLease LeaseCoordinator::claim_contested(
 PublisherLease LeaseCoordinator::claim_with_rival(
     const std::string& holder, const std::string& lease_id,
     std::optional<std::string> rival_lease_id) {
+  refused_by_own_claims_ = false;
   claim_insert_sent_ = false;
   const LeaseHead current = head();
   reject_live(current, lease_id);
   const uint64_t term = current.term + 1;
+  // Remembered before it is sent: a claim that times out may still land.
+  // Each id once, moved to the back when it is claimed again (a renewal).
+  const auto seen =
+      std::find(claimed_ids_.begin(), claimed_ids_.end(), lease_id);
+  if (seen != claimed_ids_.end()) claimed_ids_.erase(seen);
+  claimed_ids_.push_back(lease_id);
+  if (claimed_ids_.size() > kClaimHistory) claimed_ids_.pop_front();
   // Taken before the INSERT goes out, so never after the server stamps the
   // row: the new lease's deadline counts from here.
   const uint64_t sent_ns = steady_now_ns();
@@ -269,6 +282,7 @@ LeaseHead LeaseCoordinator::head() const {
   for (const Row& row : rows) {
     out.live_until_ns = std::max(
         out.live_until_ns, parse_u64_field(row[3], "lease expiry"));
+    out.lease_ids.push_back(row[1]);
   }
   return out;
 }
@@ -342,6 +356,13 @@ void LeaseCoordinator::reject_live(const LeaseHead& head,
     return;
   }
   lease_.reset();
+  refused_by_own_claims_ =
+      !head.lease_ids.empty() &&
+      std::all_of(head.lease_ids.begin(), head.lease_ids.end(),
+                  [this](const std::string& id) {
+                    return std::find(claimed_ids_.begin(), claimed_ids_.end(),
+                                     id) != claimed_ids_.end();
+                  });
   if (head.claimants > 1) {
     throw CatalogError(
         CatalogError::Kind::kHeld,

@@ -1106,8 +1106,15 @@ std::string respond(const std::string& line, Session* session) {
   } catch (const CatalogError& e) {
     std::string message;
     escape_into(e.what(), &message);
+    // A refusal says whether only this writer's own claim rows made it --
+    // what the storage service keeps out of its 2 x TTL latch.
+    std::string own;
+    if (e.kind() == CatalogError::Kind::kHeld && session->writer != nullptr) {
+      own = std::string(",\"own_claims\":") +
+            (session->writer->refused_by_own_claims() ? "true" : "false");
+    }
     return prefix + "false,\"error\":\"" + error_kind(e.kind()) +
-           "\",\"message\":" + message + "}";
+           "\",\"message\":" + message + own + "}";
   } catch (const ClickHouseError& e) {
     std::string message;
     escape_into(e.what(), &message);

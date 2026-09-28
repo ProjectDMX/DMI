@@ -278,9 +278,9 @@ def test_the_reference_reader_sees_the_same_captures(fake_s3, tmp_path):
 class _Switch:
     """A TCP forwarder in front of an HTTP server -- ClickHouse's HTTP port,
     or the fake S3 -- that can be cut (connections refused), stalled
-    (connections accepted, never answered), made to stall only the requests
-    a predicate picks, or to hold the first request a predicate picks back
-    for a while. Every
+    (connections accepted, never answered), made to hold lease INSERTs back
+    and deliver them late, to stall only the requests a predicate picks, or
+    to hold the first request a predicate picks back for a while. Every
     native client opens one connection per request, so one request is one
     connection here."""
 
@@ -290,6 +290,7 @@ class _Switch:
         self.port = self._listener.getsockname()[1]
         self._up = True
         self._stalled = False
+        self._late_by = 0.0  # seconds a lease INSERT is held back; 0 = never
         # A predicate over one whole request (head and body): matching
         # requests are held open and never answered.
         self._stall_if = None
@@ -324,7 +325,8 @@ class _Switch:
             if not self._up:
                 client.close()
                 continue
-            if self._stall_if is not None or self._slow_once is not None:
+            if (self._late_by > 0 or self._stall_if is not None
+                    or self._slow_once is not None):
                 threading.Thread(target=self._look_then_route,
                                  args=(client,), daemon=True).start()
                 continue
@@ -354,9 +356,12 @@ class _Switch:
                     pass
 
     def _look_then_route(self, client):
-        """Read one HTTP request and route it: a request stall_requests()
-        picks is never answered, the first request slow_once() picks is
-        forwarded late, and anything else goes straight through."""
+        """Read one HTTP request and route it: a lease INSERT held back by
+        deliver_lease_inserts_late() reaches the server only after that delay
+        -- long after the client gave up on it -- and nobody hears the
+        answer; a request stall_requests() picks is never answered; the first
+        request slow_once() picks is forwarded late; anything else goes
+        straight through."""
         request = b""
         continued = False
         try:
@@ -397,17 +402,36 @@ class _Switch:
         if slow is not None and slow[0](request):
             self._slow_once = None
             time.sleep(slow[1])
+        late_by = self._late_by
+        late = (late_by > 0 and b"INSERT INTO" in request
+                and b"_publisher_lease" in request)
+        if late:
+            time.sleep(late_by)
         try:
             upstream = socket.create_connection(self._target)
             upstream.sendall(request)
         except OSError:
             client.close()
             return
+        if late:
+            # Nobody is listening any more; the server runs it regardless.
+            client.close()
+            upstream.settimeout(10.0)
+            try:
+                while upstream.recv(65536):
+                    pass
+            except OSError:
+                pass
+            upstream.close()
+            return
         with self._lock:
             self._sockets |= {client, upstream}
         for source, sink in ((client, upstream), (upstream, client)):
             threading.Thread(target=self._pump, args=(source, sink),
                              daemon=True).start()
+
+    def deliver_lease_inserts_late(self, late_by: float):
+        self._late_by = late_by
 
     def stall_requests(self, predicate):
         """Hold every new request `predicate(request_bytes)` picks open and
@@ -438,6 +462,7 @@ class _Switch:
     def restore(self):
         self._up = True
         self._stalled = False
+        self._late_by = 0.0
         self._stall_if = None
         self._slow_once = None
 
@@ -1567,6 +1592,64 @@ def test_a_rival_that_stops_within_two_ttls_does_not_latch(
         assert snapshot["lease_reacquisitions"] >= 1, snapshot
         assert sorted(_read_all(_storage_config(
             fake_s3, catalog.table_prefix))) == sorted(tensors)
+    assert _latch_lines(capfd.readouterr().err) == []
+
+
+def test_a_late_landing_claim_of_its_own_does_not_latch_the_service(
+        fake_s3, tmp_path, capfd):
+    """The lease INSERT's server-side cap cannot cover a request held up in
+    transit: the server starts the clock only when the statement reaches
+    it. Such a claim lands after the client gave up and quarantined, and its
+    row then refuses the service's own next claim. Refusals by a rival that
+    had since left and by that row of our own added up to 2 x TTL, and the
+    service latched "held by another publisher" against itself. A refusal
+    by the service's own claim row now restarts the refusal clock."""
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
+                     publish_timeout_s=1)
+        first = _service(_storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            holder="first-publisher", **knobs), tmp_path / "first")
+        rival = _service(_storage_config(
+            fake_s3, catalog.table_prefix, holder="rival-publisher",
+            start_lease_wait_s=10.0, **knobs), tmp_path / "rival")
+        first.start()
+        try:
+            # A cut quarantines the first service; the rival takes over.
+            switch.cut()
+            rival.start()
+            switch.restore()
+            # The first service's quarantine ends and the rival refuses it:
+            # the refusal clock starts.
+            _wait_for(lambda: first.snapshot()["lease_state"] == "reacquiring",
+                      timeout_s=10.0)
+            refused_at = time.monotonic()
+            # Well inside 2 x TTL of refusals the rival leaves (a handover),
+            # and the first service's next claim is delivered 1.5 s late:
+            # the 1 s bound on a claim made without a lease (lease_ttl_s / 3)
+            # gives up first, and it quarantines.
+            time.sleep(max(0.0, refused_at + 4.0 - time.monotonic()))
+            switch.deliver_lease_inserts_late(1.5)
+            rival.stop()
+            _wait_for(lambda: first.snapshot()["lease_state"] == "quarantined",
+                      timeout_s=3.0)
+            switch.restore()
+            # The late claim lands inside the quarantine and outlives it by
+            # about a second, refusing the first service's next claim more
+            # than 2 x TTL after the rival's first refusal.
+            _wait_for(lambda: first.snapshot()["lease_state"] == "held"
+                      or first.snapshot()["failed"], timeout_s=10.0)
+            snapshot = first.snapshot()
+            assert time.monotonic() - refused_at > 2 * 3.0, snapshot
+            assert snapshot["failed"] is False, snapshot
+            assert snapshot["lease_state"] == "held", snapshot
+            first.rethrow_if_failed()
+        finally:
+            first.stop()
+            rival.stop()
+            switch.close()
+
     assert _latch_lines(capfd.readouterr().err) == []
 
 

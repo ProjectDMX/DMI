@@ -108,6 +108,9 @@ class CatalogWriter {
   // running, so it goes as an unknown outcome does: no tombstone, and
   // quarantined for a TTL.
   void abandon_lease();
+  // Whether the last lease refusal came only from this writer's own earlier
+  // claim rows (LeaseCoordinator::refused_by_own_claims).
+  bool refused_by_own_claims() const;
   uint64_t allocate_version();
   uint64_t max_version(const std::string& table,
                        const std::string& column) const;

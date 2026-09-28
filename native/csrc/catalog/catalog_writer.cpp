@@ -329,6 +329,12 @@ void CatalogWriter::abandon_lease() {
   if (leases_->lease() != nullptr) quarantine();
 }
 
+bool CatalogWriter::refused_by_own_claims() const {
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
+  return leases_->refused_by_own_claims();
+}
+
 void CatalogWriter::release_lease() {
   require_owned_by_this_process();
   const std::lock_guard<std::recursive_mutex> serial(serial_);

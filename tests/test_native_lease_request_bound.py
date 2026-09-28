@@ -332,6 +332,62 @@ def test_a_slow_but_healthy_head_read_does_not_fail_the_claim(fake, driver):
     assert claimed["ok"], claimed
 
 
+def test_renewals_do_not_crowd_earlier_claims_out_of_the_history(
+        fake, driver):
+    """The history of recent claim lease_ids is what tells the service's own
+    late row from a rival's. Each renewal pushed its (unchanged) lease_id
+    again, so sixteen renewals pushed out a claim that could still land."""
+    assert driver.open()["ok"]
+    earlier = str(uuid.uuid4())
+    assert driver.call(op="claim", holder="h", lease_id=earlier)["ok"]
+    driver.call(op="discard_local_lease")  # as a quarantine drops it
+    assert driver.call(op="acquire", holder="h")["ok"]
+    for _ in range(20):
+        assert driver.call(op="renew")["ok"]
+    driver.call(op="discard_local_lease")
+
+    fake.head_rows = f"1\t{earlier}\th\t{2 * 10**18}\t{10**18}\n"
+    refused = driver.call(op="acquire", holder="h")
+    assert refused["error"] == "PublisherLeaseHeldError", refused
+    assert refused["own_claims"] is True, refused
+
+
+def test_a_refusal_by_the_writers_own_claim_row_is_attributed_to_it(
+        fake, driver):
+    """A claim whose request gave up can still land, and then refuses the
+    writer's next claim. The refusal names it as the writer's own, which the
+    storage service keeps out of its 2 x TTL latch; a rival's row is not."""
+    assert driver.open()["ok"]
+    mine = str(uuid.uuid4())
+    assert driver.call(op="claim", holder="h", lease_id=mine)["ok"]
+    driver.call(op="discard_local_lease")  # as a quarantine drops it
+
+    # Our earlier claim row is the live head; a fresh lease_id is refused.
+    fake.head_rows = f"1\t{mine}\th\t{2 * 10**18}\t{10**18}\n"
+    refused = driver.call(op="acquire", holder="h")
+    assert refused["error"] == "PublisherLeaseHeldError", refused
+    assert refused["own_claims"] is True, refused
+
+    # Contested between our row and a rival's: not ours alone.
+    rival = str(uuid.uuid4())
+    fake.head_rows = (f"1\t{rival}\trival\t{2 * 10**18}\t{10**18}\n"
+                      f"1\t{mine}\th\t{2 * 10**18}\t{10**18}\n")
+    refused = driver.call(op="acquire", holder="h")
+    assert refused["error"] == "PublisherLeaseHeldError", refused
+    assert refused["own_claims"] is False, refused
+
+    # A coordinator that never claimed `mine` sees a rival in it.
+    other = _Driver(fake.port)
+    try:
+        assert other.open()["ok"]
+        fake.head_rows = f"1\t{mine}\th\t{2 * 10**18}\t{10**18}\n"
+        refused = other.call(op="acquire", holder="h2")
+        assert refused["error"] == "PublisherLeaseHeldError", refused
+        assert refused["own_claims"] is False, refused
+    finally:
+        other.close()
+
+
 # --- the storage service's configuration --------------------------------------
 
 

@@ -38,6 +38,8 @@
 // (clickhouse_catalog.py, publish_snapshot). Only a foreign lease that stays
 // live for 2 x TTL is fatal: the service stops (snapshot().failed), writes
 // one line to stderr, and flush() rethrows the refusal naming the holder.
+// A refusal by one of the service's own claim rows -- a claim that landed
+// after its request gave up -- is no rival and restarts that clock.
 //
 // Bounded by the lease. Every catalog request the service makes while it
 // holds the lease -- the renewal's own, and every one an index pass or a
@@ -247,7 +249,8 @@ class CaptureStorageService {
   // and is no longer quarantined. Never throws. Requires lease_mutex_.
   bool ensure_publisher_lease();
   // Another holder refused a claim or renewal; latches once that has lasted
-  // 2 x TTL. Call from the catch block. Requires lease_mutex_.
+  // 2 x TTL. A refusal by the service's own claim rows restarts the clock
+  // instead. Call from the catch block. Requires lease_mutex_.
   void lease_held_elsewhere(const CatalogError& refusal);
   void publish_lease_state();  // requires lease_mutex_
   // Sets a pack aside for good; flush() reports it. Requires cycle_mutex_.

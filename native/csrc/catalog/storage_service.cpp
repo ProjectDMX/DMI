@@ -897,8 +897,25 @@ bool CaptureStorageService::ensure_publisher_lease() {
 void CaptureStorageService::lease_held_elsewhere(const CatalogError& refusal) {
   const uint64_t now = steady_ns();
   const uint64_t ttl = config_.writer.lease_ttl_ns;
-  if (held_elsewhere_since_ns_ == 0) held_elsewhere_since_ns_ = now;
   next_claim_ns_ = now + lease_tick_ns(ttl);
+  if (writer_.refused_by_own_claims()) {
+    // Refused by this process's own claim row: one whose request gave up
+    // but which the server still ran -- late, past the cap on the lease
+    // INSERT (lease_coordinator.cpp says when that can happen). It expires
+    // one TTL after it landed and is no rival, so it restarts the refusal
+    // clock rather than counting towards the latch. Sending that claim at
+    // all meant the head read found no live rival, so a rival's earlier
+    // refusals ended there too. Without this, refusals by a rival that has
+    // since left, then by our own late row, could add up to 2 x TTL and
+    // latch the service against itself.
+    held_elsewhere_since_ns_ = 0;
+    record_error(std::string("publisher lease refused by this service's "
+                             "own earlier claim, which landed after its "
+                             "request gave up; retrying: ") +
+                 refusal.what());
+    return;
+  }
+  if (held_elsewhere_since_ns_ == 0) held_elsewhere_since_ns_ = now;
   // Our own dropped row is dead within one TTL of the loss, and a handover
   // (a rival that stops, releasing with a tombstone) ends sooner still. A
   // refusal that has lasted 2 x TTL is a publisher that means to stay.
