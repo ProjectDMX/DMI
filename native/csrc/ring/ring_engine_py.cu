@@ -130,6 +130,19 @@ void refuse_on_record_ring(bool record_mode, const char* what) {
     }
 }
 
+// Free room in a legacy ring of `cap` entries (or bytes) whose CPU
+// accounting has reserved up to `head` and released up to `tail`, saturated
+// at 0. The accounting can hold more than the ring: a flush releases only
+// what producers published, so a reservation nothing publishes (a step that
+// fails after prepare_step) stays, and prepare_step's flushed path reserves
+// on top of it without checking again. Unsaturated, cap - (head - tail) then
+// wraps to ~2^64, every check admits every reservation, and the producers
+// publish over unread slots.
+uint64_t legacy_ring_room(uint64_t cap, uint64_t head, uint64_t tail) {
+    const uint64_t outstanding = head - tail;
+    return outstanding >= cap ? 0 : cap - outstanding;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -565,7 +578,8 @@ void RingEnginePy::notify_drain() {
 // drain thread to flush all pending entries.
 // ---------------------------------------------------------------------------
 int RingEnginePy::prepare_step(uint64_t step_total_bytes,
-                               uint32_t num_hooks)
+                               uint32_t num_hooks,
+                               bool reserve)
 {
     // Record rings reserve through reserve_record.
     refuse_on_record_ring(impl_->record_mode, "legacy step reservation");
@@ -620,13 +634,11 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     }
 
     // Case A: step fits.  Check available space for BOTH payload AND tasks.
-    const uint64_t payload_avail = pcap -
-        (drain.cpu_payload_head() - drain.cpu_payload_tail_committed());
-    const uint64_t task_avail = tcap -
-        (drain.cpu_task_head() - drain.cpu_task_tail_committed());
+    const uint64_t payload_avail = available_capacity();
+    const uint64_t task_avail = available_task_slots();
 
     if (step_total_bytes <= payload_avail && num_hooks <= task_avail) {
-        drain.reserve(step_total_bytes, num_hooks);
+        if (reserve) drain.reserve(step_total_bytes, num_hooks);
         return STEP_RING_OK;  // fast path -- no CUDA or thread interaction
     }
 
@@ -635,7 +647,7 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
     cudaStreamSynchronize(ms);
     drain.force_flush_and_wait();
-    drain.reserve(step_total_bytes, num_hooks);
+    if (reserve) drain.reserve(step_total_bytes, num_hooks);
     return STEP_RING_FLUSHED;
 }
 
@@ -891,22 +903,29 @@ at::Tensor RingEnginePy::payload_tensor() const {
 //
 // Thread safety of the check-and-reserve pattern used by the safety net:
 //
-//   if nbytes <= available_capacity():
+//   if nbytes <= available_capacity() and available_task_slots() > 0:
 //       reserve_one(nbytes)
 //
+// Both halves are needed.  A step with more hooks than task entries gets
+// STEP_OVERSIZED and runs through the safety net with plenty of payload
+// room, so a bytes-only check lets the (task_cap+1)-th producer publish
+// over slot 0 while its READY word is still unread.
+//
 // The main thread (this thread) is the only writer of cpu_payload_head_
-// (it advances only through reserve / reserve_one calls).  The drain
-// thread only ever advances cpu_payload_tail_committed_ forward as it
-// frees ring space.  Between the check and the reserve:
+// and cpu_task_head_ (they advance only through reserve / reserve_one
+// calls).  The drain thread only ever advances the committed tails
+// forward as it frees ring space.  Between the check and the reserve:
 //   - tail may move forward (drain freed more): actual available at
 //     reserve time is >= what we observed.
 //   - head is unchanged (single-threaded writer).
 // So the check's "fits" decision remains valid at reserve time.  No extra
-// locking around the pair is required.
+// locking around the pair is required.  The same holds for the task
+// head and tail.
 //
-// Within available_capacity(), the two accessor calls happen under
-// separate mutex acquires (drain.cpu_payload_head() and
-// drain.cpu_payload_tail_committed() each take mgmt_mu_ internally).
+// Within available_capacity() (and likewise available_task_slots()), the
+// two accessor calls happen under separate mutex acquires
+// (drain.cpu_payload_head() and drain.cpu_payload_tail_committed() each
+// take mgmt_mu_ internally).
 // The observed snapshot is non-atomic: if drain advances tail between
 // the two reads, available_observed = pcap - head + tail_later, which
 // is >= the true available at the time of the head read.  That is, the
@@ -917,17 +936,41 @@ at::Tensor RingEnginePy::payload_tensor() const {
 
 uint64_t RingEnginePy::available_capacity() const {
     auto& drain = impl_->engine.drain_thread();
-    const uint64_t pcap = impl_->engine.payload_cap();
-    return pcap - (drain.cpu_payload_head() - drain.cpu_payload_tail_committed());
+    const uint64_t head = drain.cpu_payload_head();
+    return legacy_ring_room(impl_->engine.payload_cap(), head,
+                            drain.cpu_payload_tail_committed());
+}
+
+uint64_t RingEnginePy::available_task_slots() const {
+    auto& drain = impl_->engine.drain_thread();
+    const uint64_t head = drain.cpu_task_head();
+    return legacy_ring_room(impl_->engine.task_cap(), head,
+                            drain.cpu_task_tail_committed());
 }
 
 // Per-hook reservation: claim nbytes of payload + 1 task entry for an
 // upcoming producer kernel launch.  Caller must have checked
-// available_capacity() first.  drain.reserve takes mgmt_mu_ internally.
+// available_capacity() and available_task_slots() first.  The task check
+// is repeated here because producers never read the tails: an entry past
+// task_cap silently overwrites an unread slot rather than failing.
+// drain.reserve takes mgmt_mu_ internally.
 void RingEnginePy::reserve_one(uint64_t nbytes) {
     refuse_on_record_ring(impl_->record_mode, "legacy per-hook reservation");
-    impl_->engine.drain_thread().reserve(
-        ring::align_up(nbytes, ring::PAYLOAD_ALIGN), 1);
+    auto& drain = impl_->engine.drain_thread();
+    if (available_task_slots() == 0) {
+        // A failed drain never frees an entry again, and on a legacy ring
+        // its flush_and_wait returns at once without raising (the failure
+        // went to stderr), so a caller that just flushed lands here.  Name
+        // that failure rather than asking for the flush it already made.
+        drain.rethrow_drain_failure();
+        throw std::logic_error(
+            "reserve_one: every task-ring entry is reserved; call "
+            "flush_and_wait first. A flush frees only entries a producer "
+            "published, so right after one the entries belong to "
+            "reservations nothing publishes, such as a step that failed "
+            "after prepare_step");
+    }
+    drain.reserve(ring::align_up(nbytes, ring::PAYLOAD_ALIGN), 1);
 }
 
 // Synchronise the current CUDA stream so all queued producer kernels

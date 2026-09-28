@@ -11,6 +11,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -224,6 +226,194 @@ static void test_native_reservation_uses_transport_alignment() {
     const uint64_t before = engine.available_capacity();
     engine.reserve_one(17);
     EXPECT(before - engine.available_capacity() == 32);
+}
+
+static void test_reserve_one_refuses_without_a_free_task_slot() {
+    banner("reserve_one refuses once every task entry is reserved");
+    // Producers never read the tails, so a reservation past task_cap would
+    // publish over an unread READY word. Payload room is plentiful here:
+    // the task ring is the only limit, as for a STEP_OVERSIZED step whose
+    // hook count exceeds task_ring_entries.
+    ring_py::RingEnginePy engine(make_py_config(), ring_py::SubmitFn{});
+    engine.init();
+    const uint64_t task_cap = engine.task_cap();
+    EXPECT(engine.available_task_slots() == task_cap);
+    for (uint64_t i = 0; i < task_cap; ++i) {
+        engine.reserve_one(16);
+    }
+    EXPECT(engine.available_task_slots() == 0);
+
+    const uint64_t bytes = engine.available_capacity();
+    EXPECT(bytes >= 16);
+    bool refused = false;
+    try {
+        engine.reserve_one(16);
+    } catch (const std::logic_error& error) {
+        refused = std::strstr(error.what(), "task-ring entry") != nullptr;
+    }
+    EXPECT(refused);
+    EXPECT(engine.available_task_slots() == 0);
+    EXPECT(engine.available_capacity() == bytes);
+}
+
+// A step that fails after prepare_step reserved it (HF's driver swallows the
+// error on the legacy ring) leaves a reservation no producer publishes, and
+// a flush frees only published entries. prepare_step's flushed path then
+// reserves on top of it without checking again, so the CPU accounting can
+// hold more than the ring. The free counts must read 0 there, not wrap to
+// ~2^64: a wrapped count admits every reservation, the eager safety net
+// stops flushing, and producers publish over unread slots.
+static void test_ring_room_saturates_past_capacity() {
+    banner("free task entries and bytes read 0 once reservations pass the ring");
+    ring_py::RingConfig cfg = make_py_config();
+    cfg.task_ring_entries = 2;
+    ring_py::RingEnginePy engine(cfg, ring_py::SubmitFn{});
+    engine.init();
+    engine.start();
+    const uint64_t payload_cap = engine.payload_cap();
+
+    // Two failed steps: the first takes the whole ring, the second flushes
+    // (freeing nothing) and reserves on top.
+    EXPECT(engine.prepare_step(payload_cap, 2) ==
+           ring_py::RingEnginePy::STEP_RING_OK);
+    EXPECT(engine.prepare_step(16, 1) ==
+           ring_py::RingEnginePy::STEP_RING_FLUSHED);
+    EXPECT(engine.available_task_slots() == 0);
+    EXPECT(engine.available_capacity() == 0);
+
+    bool refused = false;
+    try {
+        engine.reserve_one(16);
+    } catch (const std::logic_error& error) {
+        refused = std::strstr(error.what(), "task-ring entry") != nullptr;
+    }
+    EXPECT(refused);
+    // Not the fast path: by its own accounting the ring has no room.
+    EXPECT(engine.prepare_step(16, 1) ==
+           ring_py::RingEnginePy::STEP_RING_FLUSHED);
+    EXPECT(engine.available_task_slots() == 0);
+    EXPECT(engine.available_capacity() == 0);
+    engine.stop();
+}
+
+// A step that fires more hooks than the task ring has entries gets
+// STEP_OVERSIZED, and every hook goes through HookPoint.forward's eager
+// safety net: reserve without a flush only while the bytes AND a task entry
+// are free, otherwise flush_and_wait first. The task ring wraps several
+// times inside the one step, so each payload must still reach the consumer
+// byte for byte and paired with its own TensorMeta. Row counts differ per
+// hook, so a payload paired with its neighbour's meta fails the shape check
+// in the consumer and goes undelivered.
+static void check_eager_delivery_past_the_task_ring(uint32_t task_slots) {
+    constexpr int hooks = 9;
+    constexpr int64_t cols = 24;  // not a multiple of PAYLOAD_ALIGN
+    ring_py::RingConfig cfg = make_py_config();
+    cfg.task_ring_entries = task_slots;
+
+    struct Delivery {
+        std::string act_name;
+        int32_t layer_no;
+        std::vector<int64_t> shape;
+        std::vector<uint8_t> bytes;
+    };
+    std::mutex delivered_mu;
+    std::vector<Delivery> delivered;
+    ring_py::RingEnginePy engine(
+        cfg,
+        [&](const std::string&, int32_t, const std::string&,
+            const std::string& act_name, int32_t layer_no, int32_t, int32_t,
+            at::Tensor slice) {
+            const uint8_t* data = slice.data_ptr<uint8_t>();
+            Delivery delivery{act_name, layer_no, slice.sizes().vec(),
+                              std::vector<uint8_t>(data, data + slice.nbytes())};
+            std::lock_guard<std::mutex> lock(delivered_mu);
+            delivered.push_back(std::move(delivery));
+        });
+    engine.init();
+    engine.start();
+
+    std::vector<std::vector<uint8_t>> sources;
+    std::vector<uint8_t*> devices;
+    std::vector<ring_py::TensorMeta> metas;
+    uint64_t step_bytes = 0;
+    for (int hook = 0; hook < hooks; ++hook) {
+        const int64_t rows = 1 + hook % 3;
+        sources.push_back(pattern(static_cast<uint64_t>(rows * cols),
+                                  static_cast<uint8_t>(17 * hook + task_slots)));
+        uint8_t* device = nullptr;
+        CUDA_CHECK(cudaMalloc(&device, sources.back().size()));
+        CUDA_CHECK(cudaMemcpy(device, sources.back().data(),
+                              sources.back().size(), cudaMemcpyHostToDevice));
+        devices.push_back(device);
+        ring_py::TensorMeta meta;
+        meta.hook_type = ring_py::HOOK_TYPE_RESID_PRE;
+        meta.layer_no = hook;
+        meta.shape = {1, rows, cols};
+        meta.dtype = static_cast<int>(at::kByte);
+        meta.last_in_step = hook == hooks - 1;
+        metas.push_back(std::move(meta));
+        step_bytes += ring::align_up(sources.back().size(), ring::PAYLOAD_ALIGN);
+    }
+    auto* context = new ring_py::StepContext();
+    context->model_id = "model";
+    context->requests.push_back({"request", 0, 4, 0, 0});
+    engine.push_step(context, metas);
+
+    EXPECT(engine.prepare_step(step_bytes, hooks) ==
+           ring_py::RingEnginePy::STEP_OVERSIZED);
+    const uint64_t effective_cap =
+        std::min(engine.payload_cap(), engine.staging_cap());
+    uint64_t most_outstanding = 0;
+    bool refused = false;
+    for (int hook = 0; hook < hooks; ++hook) {
+        const uint64_t nbytes = sources[hook].size();
+        const uint64_t transport_bytes =
+            ring::align_up(nbytes, ring::PAYLOAD_ALIGN);
+        try {
+            if (transport_bytes > std::min(engine.available_capacity(),
+                                           effective_cap) ||
+                engine.available_task_slots() == 0) {
+                engine.flush_and_wait();
+            }
+            engine.reserve_one(nbytes);
+        } catch (const std::logic_error&) {
+            refused = true;
+            break;
+        }
+        most_outstanding = std::max(
+            most_outstanding,
+            engine.task_cap() - engine.available_task_slots());
+        engine.hook_no_notify(reinterpret_cast<uint64_t>(devices[hook]),
+                              nbytes, ring_py::HOOK_TYPE_RESID_PRE, 0);
+    }
+    engine.flush_and_wait();
+    EXPECT(!refused);
+    EXPECT(most_outstanding <= task_slots);
+    EXPECT(engine.available_task_slots() == task_slots);
+    EXPECT(engine.available_capacity() == engine.payload_cap());
+    // stop() lets the consumer finish every task already drained.
+    engine.stop();
+
+    EXPECT(delivered.size() == static_cast<size_t>(hooks));
+    for (size_t hook = 0; hook < delivered.size() && hook < sources.size();
+         ++hook) {
+        const Delivery& delivery = delivered[hook];
+        const int64_t rows = 1 + static_cast<int64_t>(hook) % 3;
+        EXPECT(delivery.layer_no == static_cast<int32_t>(hook));
+        EXPECT(delivery.act_name == "blocks.hook_resid_pre");
+        EXPECT((delivery.shape == std::vector<int64_t>{rows, cols}));
+        EXPECT(delivery.bytes == sources[hook]);
+    }
+    for (uint8_t* device : devices) {
+        CUDA_CHECK(cudaFree(device));
+    }
+}
+
+static void test_eager_safety_net_delivers_past_the_task_ring() {
+    banner("eager safety net delivers nine hooks through 1, 2 and 4 task slots");
+    for (uint32_t task_slots : {1u, 2u, 4u}) {
+        check_eager_delivery_past_the_task_ring(task_slots);
+    }
 }
 
 template <typename Fn>
@@ -1171,6 +1361,9 @@ int main() {
     std::printf("test_ring_engine (current drain pipeline)\n");
     test_ring_geometry_requires_payload_alignment();
     test_native_reservation_uses_transport_alignment();
+    test_reserve_one_refuses_without_a_free_task_slot();
+    test_ring_room_saturates_past_capacity();
+    test_eager_safety_net_delivers_past_the_task_ring();
     test_record_ring_refuses_every_legacy_producer_entry();
     test_static_force_flush();
     test_prefix_force_flush();

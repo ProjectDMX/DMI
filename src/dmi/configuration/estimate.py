@@ -799,13 +799,14 @@ def check_ring_fit(
     # step than task_ring_entries returns OVERSIZED regardless of bytes.
     # The hook counts are already on every rank; the cap is the caller's
     # ring configuration, so it arrives as an argument.
-    over_task_cap = 0
+    busiest_hooks = 0
+    over_task_cap = False
     if task_entries is not None and task_entries >= 1:
         for load in estimate.ranks:
-            worst_hooks = max(load.prefill_hooks, load.decode_hooks)
-            if worst_hooks > over_task_cap:
-                over_task_cap = worst_hooks
-        if over_task_cap > task_entries:
+            busiest_hooks = max(busiest_hooks, load.prefill_hooks,
+                                load.decode_hooks)
+        over_task_cap = busiest_hooks > task_entries
+        if over_task_cap:
             fits = False
 
     if fits:
@@ -815,10 +816,11 @@ def check_ring_fit(
         )
     elif over_task_cap:
         detail = (
-            f"The busiest rank fires {over_task_cap} hooks in one step, "
+            f"The busiest rank fires {busiest_hooks} hooks in one step, "
             f"above the {task_entries} task entries the ring was configured "
             "with. prepare_step returns STEP_OVERSIZED regardless of bytes "
-            "and the adapter falls back to eager CPU-direct dispatch -- "
+            "and the adapter falls back to eager per-hook dispatch, which "
+            "syncs and flushes the ring each time its task entries fill -- "
             "capture keeps working, but the serving path pays for it. "
             "Raise ring task entries, narrow the layer range, or deselect "
             "observations."

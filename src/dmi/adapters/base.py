@@ -387,9 +387,15 @@ class BackendAdapter(abc.ABC):
         # their internal loops produce nothing to push when the
         # active-spec list is empty or every shape was empty.
         if plan.hook_count > 0:
+            # A needs_eager step runs every hook through the eager safety
+            # net, which reserves each hook's entry itself (reserve_one), so
+            # prepare_step only makes room for it. Reserving the step as
+            # well would hold hook_count entries and total_bytes that no
+            # producer publishes and no flush frees, every such step.
             reservation = StepReservation(
                 self.ring_engine.prepare_step(
-                    plan.total_bytes, plan.hook_count
+                    plan.total_bytes, plan.hook_count,
+                    reserve=not plan.needs_eager,
                 )
             )
             self.transport.force_eager = (

@@ -673,7 +673,10 @@ hook metadata is emitted. Exceptions propagate; the driver does not roll back
 partial state.
 
 For each firing spec, `_spec_needs_eager()` is ORed into the step's eager
-decision even when reservation succeeds. For an oversized step the callback
+decision even when the step fits. Such a step is not reserved as a whole:
+`commit_step()` still returns `RESERVED` or `FLUSHED` to say whether the ring
+had room for it, but the eager safety net reserves each hook as it fires. For
+an oversized step the callback
 order is `adapt_for_cpu_direct()`, `on_capacity_exceeded()`, then
 `_warn_once_capacity()`, and metadata is built from the adapted context.
 

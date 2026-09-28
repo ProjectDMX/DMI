@@ -55,9 +55,12 @@ class FakeRingEngine:
     def __init__(self, prepare_step_result: int = 0) -> None:
         self._result = prepare_step_result
         self.prepare_step_calls: list = []
+        self.reserve_flags: list = []
 
-    def prepare_step(self, total_bytes: int, n_hooks: int) -> int:
+    def prepare_step(self, total_bytes: int, n_hooks: int,
+                     reserve: bool = True) -> int:
         self.prepare_step_calls.append((total_bytes, n_hooks))
+        self.reserve_flags.append(reserve)
         return self._result
 
 
@@ -168,6 +171,8 @@ def test_commit_step_uses_supplied_plan_without_replanning():
     assert reservation is StepReservation.FLUSHED
     assert a.call_order == []
     assert a.engine._ring_engine.prepare_step_calls == [(2048, 4)]
+    # needs_eager: the safety net reserves each hook, so the step is not.
+    assert a.engine._ring_engine.reserve_flags == [False]
     assert a.transport.force_eager is True
     assert len(a.transport.set_step_context_calls) == 1
     assert len(a.transport.pre_push_all_metas_calls) == 1
@@ -181,6 +186,7 @@ def test_commit_step_plans_once_when_plan_is_omitted():
     assert reservation is StepReservation.RESERVED
     assert a.call_order == ["plan_step"]
     assert a.engine._ring_engine.prepare_step_calls == [(1024, 3)]
+    assert a.engine._ring_engine.reserve_flags == [True]
 
 
 def test_commit_step_returns_skipped_without_hooks_but_publishes_context():

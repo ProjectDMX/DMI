@@ -209,7 +209,12 @@ public:
     //                        Synced + flushed.  All hooks must use .cpu() path.
     //
     // For cases 0 and 1, advances cpu_payload_head_ and cpu_task_head_
-    // under mgmt_mu_ to pre-allocate ring space for this step's producers.
+    // under mgmt_mu_ to pre-allocate ring space for this step's producers,
+    // unless `reserve` is false: then it only makes room.  A step whose
+    // hooks all take the eager safety net although it fits (the adapter's
+    // needs_eager) passes false: each hook reserves its own entry with
+    // reserve_one, and a step reservation on top would never be released,
+    // since the producers publish one entry per hook.
     // Also resets the internal hook index counter for hook_no_notify.
     static constexpr int STEP_RING_OK      = 0;
     static constexpr int STEP_RING_FLUSHED = 1;
@@ -218,7 +223,8 @@ public:
     // safety net in HookPoint.forward via transport.force_eager = True.
     static constexpr int STEP_OVERSIZED    = 2;
 
-    int prepare_step(uint64_t step_total_bytes, uint32_t num_hooks);
+    int prepare_step(uint64_t step_total_bytes, uint32_t num_hooks,
+                     bool reserve = true);
 
     // Each item is (aligned upper bound, needs actual-byte reconciliation).
     // When the ring has no room, waits for the drain within the step's
@@ -268,13 +274,23 @@ public:
     //      CUDA-graph capture or replay.
 
     // Free bytes in the payload ring not currently reserved and not
-    // pending drain.  CPU-only read.
+    // pending drain.  CPU-only read.  Reads 0, never a wrapped value, once
+    // reservations no producer publishes have pushed the CPU accounting
+    // past the ring.
     uint64_t available_capacity() const;
+
+    // Free task-ring entries not currently reserved and not pending
+    // drain.  CPU-only read.  Saturates at 0 like available_capacity().
+    uint64_t available_task_slots() const;
 
     // Per-hook reservation: claim `nbytes` of payload ring + 1 task entry
     // for an upcoming producer kernel launch.  Used by the safety net
     // when force_eager is on and the spec is dynamic-shape.  Advances
-    // cpu_payload_head/cpu_task_head atomically.
+    // cpu_payload_head/cpu_task_head atomically.  Reserves nothing and
+    // throws when no task entry is free, since the producer would
+    // overwrite an unconsumed READY word: the drain's failure when the
+    // drain has failed, std::logic_error otherwise.  Callers
+    // flush_and_wait() first.
     void reserve_one(uint64_t nbytes);
 
     // Synchronise the current CUDA stream + force drain to process all

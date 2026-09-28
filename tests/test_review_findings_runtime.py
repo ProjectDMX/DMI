@@ -61,7 +61,8 @@ class FakeRingEngine:
     def __init__(self) -> None:
         self.prepare_step_calls: list = []
 
-    def prepare_step(self, total_bytes: int, n_hooks: int) -> int:
+    def prepare_step(self, total_bytes: int, n_hooks: int,
+                     reserve: bool = True) -> int:
         self.prepare_step_calls.append((total_bytes, n_hooks))
         return 0
 
@@ -857,6 +858,31 @@ class TestRingFitCountsTaskEntries:
         )
         fit = check_ring_fit(est, payload_bytes=1024 * 1024, task_entries=1024)
         assert fit.fits is True
+
+    def test_a_bytes_overflow_within_the_task_cap_blames_the_bytes(self):
+        """The configurator always passes task_entries, so a step that
+        overflows on bytes alone must still get the bytes explanation, not
+        one claiming its 10 hooks exceed 1024 task entries."""
+        from dmi.configuration.estimate import Estimate, RankLoad, check_ring_fit
+
+        est = Estimate(
+            peak_step_bytes=4096,
+            peak_step_rank="pp0/tp0",
+            decode_step_bytes=4096,
+            bytes_per_request=4096,
+            aggregate_peak_step_bytes=4096,
+            sustained_bytes_per_second=None,
+            bytes_per_day=None,
+            ranks=(
+                RankLoad(label="pp0/tp0", pp_stage=0, tp_rank=0,
+                         prefill_step_bytes=4096, decode_step_bytes=4096,
+                         prefill_hooks=10, decode_hooks=10),
+            ),
+        )
+        fit = check_ring_fit(est, payload_bytes=1024, task_entries=1024)
+        assert fit.fits is False
+        assert "effective ring" in fit.detail
+        assert "task entries" not in fit.detail
 
 
 class TestPPSplitMatchesVLLM:
