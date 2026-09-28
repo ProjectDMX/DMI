@@ -52,7 +52,9 @@ namespace dmi_catalog {
 // requests is bounded by min(the client's request timeout, lease_ttl_ns /
 // 3): long enough for a slow catalog, short enough that a claim which hangs
 // fails well inside a TTL. So is a request made under a lease whose deadline
-// has already passed (run() says why it is still sent).
+// has already passed (run() says why it is still sent). From its INSERT on,
+// a claim is also bounded by the deadline of the lease it takes: a claim
+// confirmed after that would hand its holder a lease it could not use.
 //
 // Each attempt of a lease INSERT carries the time the client gives it -- the
 // time left before its deadline, recomputed for a retry -- to the server as

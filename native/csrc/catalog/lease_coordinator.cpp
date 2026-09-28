@@ -217,6 +217,17 @@ PublisherLease LeaseCoordinator::claim_with_rival(
   // Taken before the INSERT goes out, so never after the server stamps the
   // row: the new lease's deadline counts from here.
   const uint64_t sent_ns = steady_now_ns();
+  const uint64_t deadline_ns =
+      lease_deadline_ns(sent_ns, config_.lease_ttl_ns, config_.clock_skew_ns);
+  // The lease this claim takes is good only until deadline_ns, so the claim
+  // has to be confirmed by then: from its INSERT on, every request of it is
+  // bounded by that deadline as well as by its own (run()). A claim made
+  // without a lease otherwise gave its read-back a fresh claim bound, and
+  // with a clock skew over TTL / 3 - 0.1 s an INSERT and read-back each
+  // inside the bound could confirm a lease already past its deadline -- a
+  // success its holder had to abandon at once, with no timeout to say why.
+  // On a renewal the old lease's deadline, earlier still, is what binds.
+  const RequestDeadline confirmed_by(deadline_ns, kLeaseDeadlineBound);
   claim_insert_sent_ = true;
   try {
     insert(term, lease_id, holder);
@@ -256,8 +267,7 @@ PublisherLease LeaseCoordinator::claim_with_rival(
         parse_u64_field(rows[0][1], "lease acquisition"),
         parse_u64_field(rows[0][2], "lease expiry"),
         sent_ns,
-        lease_deadline_ns(sent_ns, config_.lease_ttl_ns,
-                          config_.clock_skew_ns)};
+        deadline_ns};
     return *lease_;
   }
   lease_.reset();

@@ -66,6 +66,8 @@ class _FakeClickHouse:
         self.stall: str | None = None  # a statement prefix to never answer
         # (statement prefix, seconds): answer the first such statement late.
         self.delay: tuple[str, float] | None = None
+        # statement prefix -> seconds: answer every such statement late.
+        self.delays: dict[str, float] = {}
         # (statement prefix, seconds): answer every such statement that late,
         # with a 503 -- a failure the client retries for a read.
         self.unavailable: tuple[str, float] | None = None
@@ -93,6 +95,9 @@ class _FakeClickHouse:
                     seconds = fake.delay[1]
                     fake.delay = None
                     time.sleep(seconds)
+                for prefix, seconds in list(fake.delays.items()):
+                    if body.startswith(prefix):
+                        time.sleep(seconds)
                 unavailable = fake.unavailable
                 if unavailable is not None and body.startswith(unavailable[0]):
                     time.sleep(unavailable[1])
@@ -327,6 +332,42 @@ def test_a_claim_quarantines_only_once_its_insert_may_have_landed(
     assert not response["ok"], response
     assert "Timeout" in response["message"], response
     assert driver.call(op="quarantined")["quarantined"] is quarantined
+
+
+@pytest.mark.parametrize("op", ["claim", "acquire"])
+def test_a_claim_is_confirmed_by_the_deadline_of_the_lease_it_takes(
+        fake, driver, op):
+    """Each request of a claim made without a lease had the claim bound,
+    min(request timeout, TTL / 3), from when it started -- the read-back
+    after the INSERT another full one. The lease the claim takes has until
+    sent + TTL - skew - 0.1 s. With a skew over TTL / 3 - 0.1 s (which
+    validation accepts), an INSERT and read-back each inside the bound could
+    confirm the claim after its own deadline: a success the service then
+    abandoned at once, blaming a renewal that never happened, and no
+    timeout counted. The requests after the INSERT are bounded by that
+    deadline too, so such a claim fails as a timeout that names the knobs,
+    and -- its INSERT sent -- quarantines."""
+    assert driver.open(lease_ttl_ns=3_000_000_000,
+                       publish_timeout_ns=1_000_000_000,
+                       clock_skew_ns=1_200_000_000)["ok"]
+    # 0.9 s each, inside the 1 s claim bound; 1.8 s together, past the
+    # 3 - 1.2 - 0.1 = 1.7 s the new lease has.
+    fake.delays = {"INSERT": 0.9, READ_BACK: 0.9}
+    fields = {"holder": "h"}
+    if op == "claim":
+        fields["lease_id"] = str(uuid.uuid4())
+    response, _ = _timed(lambda: driver.call(op=op, **fields))
+    arrived = next(at for at, body in fake.arrivals
+                   if body.startswith("INSERT"))
+    assert not response["ok"], response
+    assert response["error"] == "ClickHouseError", response
+    assert "Timeout" in response["message"], response
+    for knob in ("lease_ttl_s", "clock_skew_s"):
+        assert knob in response["message"], response
+    # Given up at the lease deadline, 1.7 s after the INSERT went out.
+    assert 1.55 < time.monotonic() - arrived < 1.9
+    if op == "acquire":
+        assert driver.call(op="quarantined")["quarantined"] is True
 
 
 def test_a_slow_but_healthy_head_read_does_not_fail_the_claim(fake, driver):
