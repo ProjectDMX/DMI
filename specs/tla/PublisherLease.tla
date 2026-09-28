@@ -24,7 +24,7 @@
 (*               The claimants>1 branch is the contested-head quarantine.  *)
 (*                                                                         *)
 (*   native/csrc/catalog/catalog_writer.cpp                                *)
-(*     :478-640  publish_snapshot  -- renew, then per manifest chunk       *)
+(*     :478-669  publish_snapshot  -- renew, then per manifest chunk       *)
 (*               (fenced INSERT, read-back, renew), then the fenced        *)
 (*               watermark INSERT, then the owners read-back.              *)
 (*     :583      "The barrier, the fence and the visibility write are ONE  *)
@@ -32,12 +32,12 @@
 (*               evaluated at admission) + WmLand (row becomes durable     *)
 (*               LATER) -- these are deliberately NOT atomic, because the  *)
 (*               doc's "takeover instant" residual lives in that gap.      *)
-(*     :148-158  config precondition lease_ttl > publish_timeout +         *)
+(*     :148-169  config precondition lease_ttl > publish_timeout +         *)
 (*               clock_skew + margin, and clock_skew != 0 with quorum.     *)
 (*     :519      max_execution_time = publish_timeout -- modelled as the   *)
 (*               statement deadline `dl` and the ManAbort/WmAbort actions. *)
 (*                                                                         *)
-(*   native/csrc/catalog/clickhouse_client.cpp:107                         *)
+(*   native/csrc/catalog/clickhouse_client.cpp:374                         *)
 (*     deciding_read() == {select_sequential_consistency = 1}.             *)
 (*     Modelled by the constant Linearizable (see Views below).            *)
 (*                                                                         *)
@@ -61,7 +61,7 @@ CONSTANTS
   TTL,             \* lease_ttl_ns
   PT,              \* publish_timeout_ns  == max_execution_time
   SKEW,            \* clock_skew_ns
-  NumChunks,       \* manifest chunks per publish (catalog_writer.cpp:530)
+  NumChunks,       \* manifest chunks per publish (catalog_writer.cpp:531)
   Linearizable,    \* TRUE  = select_sequential_consistency=1 honoured
                    \* FALSE = a deciding read may MISS an accepted insert
   AllowOverrun,    \* TRUE models doc :503 "max_execution_time is checked
@@ -105,7 +105,7 @@ WriterOf(p) == IF SelfRace THEN "shared" ELSE p
 (* THE STORE MODEL.                                                        *)
 (*                                                                         *)
 (* Views is the set of table images a single deciding read may observe.    *)
-(* With select_sequential_consistency=1 (clickhouse_client.cpp:107) a read *)
+(* With select_sequential_consistency=1 (clickhouse_client.cpp:374) a read *)
 (* sees every accepted row.  Without it, the replica it lands on may be    *)
 (* behind: it sees everything already replicated (`settled`) and any       *)
 (* subset of what is accepted but still in flight.  This is the single     *)
@@ -266,7 +266,7 @@ Release(w) ==
   /\ UNCHANGED <<now, pc, ret, ctm, clid, chunk, ver, att,
                  manifest, wm, inflight, maxLanded, wmOutOfOrder, used>>
 
-(* ---- publish: catalog_writer.cpp:478-640 ---- *)
+(* ---- publish: catalog_writer.cpp:478-669 ---- *)
 
 PubAlloc(p) ==
   /\ pc[p] = "pub_alloc"
@@ -322,7 +322,7 @@ ManAbort(p) ==
                  manifest, wm, maxLanded, wmOutOfOrder, used>>
 
 (* "Every conditional manifest INSERT is read back before the next renewal"
-   -- doc :456, catalog_writer.cpp:556-567.  Then the renewal (:578). *)
+   -- doc :456, catalog_writer.cpp:556-567.  Then the renewal (:579). *)
 ManRead(p) ==
   /\ pc[p] = "man_read"
   /\ \/ /\ \E m \in manifest :
@@ -379,7 +379,7 @@ WmAbort(p) ==
   /\ UNCHANGED <<rows, settled, now, lease, ret, ctm, clid, chunk, ver, att,
                  manifest, wm, maxLanded, wmOutOfOrder, used>>
 
-(* "Ownership, not occupancy" -- catalog_writer.cpp:604-613 *)
+(* "Ownership, not occupancy" -- catalog_writer.cpp:608-628 *)
 WmRead(p) ==
   /\ pc[p] = "wm_read"
   /\ \/ /\ \E r \in wm : r.ver = ver[p] /\ r.pid = PubId(p)

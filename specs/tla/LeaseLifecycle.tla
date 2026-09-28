@@ -2,7 +2,7 @@
 (***************************************************************************)
 (* The LEASE LIFECYCLE LAYER of                                            *)
 (*   native/csrc/catalog/storage_service.cpp                               *)
-(* on projectdmx/dmi branch fix/lease-recovery @ c0361d7 (789 lines).      *)
+(* on projectdmx/dmi main @ 71be2af (787 lines).                           *)
 (*                                                                         *)
 (* SCOPE.  This models the SERVICE's lease lifecycle -- the lease thread,  *)
 (* the quarantine window, the 2 x TTL latch, the start wait and the spool  *)
@@ -19,20 +19,20 @@
 (* this directory.  Anything this module says about the coordinator is     *)
 (* only as strong as that discharge; see LIMITS at the foot of the file.   *)
 (*                                                                         *)
-(* SOURCE LINES (c0361d7).  Every action names the code it stands for.     *)
+(* SOURCE LINES (71be2af).  Every action names the code it stands for.     *)
 (*   storage_service.cpp                                                   *)
 (*     :65-67   lease_tick_ns   = max(ttl/6, 10ms)      -> Tick            *)
-(*     :104-175 start()         schema, lease, sweep, reconcile            *)
-(*     :121-135 the spool sweep, AFTER the lease                           *)
-(*     :177-207 stop()          release only if a lease is held            *)
-(*     :278-406 run_cycle()     ensure_publisher_lease at :286             *)
-(*     :439-443 "a publish renews the lease"                               *)
-(*     :594-634 keep_lease()    the lease thread                           *)
-(*     :636-646 renew_lease_if_due()                                       *)
-(*     :648-676 acquire_lease_at_start()                                   *)
-(*     :678-727 ensure_publisher_lease()                                   *)
-(*     :729-745 lease_held_elsewhere()  the 2 x TTL latch                  *)
-(*     :768-787 latch_failure()  permanent                                 *)
+(*     :102-173 start()         schema, lease, sweep, reconcile            *)
+(*     :119-133 the spool sweep, AFTER the lease                           *)
+(*     :175-205 stop()          release only if a lease is held            *)
+(*     :276-404 run_cycle()     ensure_publisher_lease at :284             *)
+(*     :437-441 "a publish renews the lease"                               *)
+(*     :592-632 keep_lease()    the lease thread                           *)
+(*     :634-644 renew_lease_if_due()                                       *)
+(*     :646-674 acquire_lease_at_start()                                   *)
+(*     :676-725 ensure_publisher_lease()                                   *)
+(*     :727-743 lease_held_elsewhere()  the 2 x TTL latch                  *)
+(*     :766-785 latch_failure()  permanent                                 *)
 (*   catalog_writer.cpp                                                    *)
 (*     :243-253 quarantine_in_force()  now < quarantine_until              *)
 (*     :268-274 quarantine()     drop the lease, window = now + lease_ttl  *)
@@ -45,7 +45,7 @@
 (*     :220-247 reject_live()                                              *)
 (*   indexer.cpp:258  "if (!all_rows.empty() || !indexed.empty())" -- the   *)
 (*                    publish is SKIPPED when every pack was already       *)
-(*                    committed, yet storage_service.cpp:441 still treats  *)
+(*                    committed, yet storage_service.cpp:439 still treats  *)
 (*                    skipped_packs > 0 as "a publish renews the lease".   *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
@@ -58,9 +58,9 @@ CONSTANTS
   Skew,              \* clock_skew: ticks of extra life a row is seen to have
                      \* on a LAGGING replica (lease_coordinator.cpp:222)
   PredTTL,           \* the TTL a crashed PREDECESSOR ran with.  The config
-                     \* comment (native_capture.py:140-145) admits a larger
+                     \* comment (native_capture.py:271-276) admits a larger
                      \* one can outlast the default start wait
-  StartWait,         \* start_lease_wait_ns (storage_service.cpp:653)
+  StartWait,         \* start_lease_wait_ns (storage_service.cpp:651)
   MaxTime,
   MaxLate,           \* ticks of OS lateness allowed on a lease-thread wake
   Foreign,           \* TRUE: a rival publisher may claim the catalog
@@ -70,15 +70,15 @@ CONSTANTS
                      \* "rival that stops within two TTLs" can be pinned)
   MaxCuts,           \* how many ClickHouse cut/restore pairs are allowed
   AllowUnknown,      \* TRUE: a write to a LIVE ClickHouse may time out with
-                     \* its outcome unknown (the branch's bounded timeouts)
+                     \* its outcome unknown (the client's bounded timeouts)
   AllowSkipPublish,  \* TRUE: model indexer.cpp:258 -- an index pass whose
                      \* packs were all already committed returns
                      \* skipped_packs > 0 WITHOUT publishing, while
-                     \* storage_service.cpp:441-443 bumps last_renew_ns_ anyway
+                     \* storage_service.cpp:439-441 bumps last_renew_ns_ anyway
   ReuseLid,          \* COUNTERFACTUAL for obligation 2: TRUE makes a
                      \* post-quarantine acquire present the DROPPED lease_id
                      \* instead of a fresh one
-  CycleOn,           \* TRUE: model run_cycle()'s ensure_publisher_lease (:286)
+  CycleOn,           \* TRUE: model run_cycle()'s ensure_publisher_lease (:284)
   PredHolds,         \* TRUE: a crashed predecessor's row is live at Init
   AllowStop,         \* TRUE: a service may call stop()
   MaxReacq           \* cap on the re-acquisition counter (a state bound only)
@@ -107,9 +107,9 @@ vars     == <<envVars, headVars, locVars, resVars, rivVars>>
 \* 10 ms floor only bites for a TTL under 60 ms, which the writer's own
 \* config precondition (catalog_writer.cpp:148-158) already forbids.
 Tick      == IF TTL \div 6 > 0 THEN TTL \div 6 ELSE 1
-DueAfter  == TTL \div 3        \* storage_service.cpp:640
-LatchWin  == 2 * TTL           \* storage_service.cpp:737
-\* storage_service.cpp:654-655  clamp(ttl/10, 50ms, 500ms).  One tick is the
+DueAfter  == TTL \div 3        \* storage_service.cpp:638
+LatchWin  == 2 * TTL           \* storage_service.cpp:735
+\* storage_service.cpp:652-653  clamp(ttl/10, 50ms, 500ms).  One tick is the
 \* finest grain this model has and is COARSER than the real poll, so the
 \* model can only under-report how promptly a start wait notices an expiry.
 StartPoll == 1
@@ -137,9 +137,9 @@ CanRefused(lid) == chUp /\ ~Admits(lid)
 CanUnknown      == (~chUp) \/ AllowUnknown
 CanLand(lid)    == chUp /\ AllowUnknown /\ Admits(lid)
 
-\* storage_service.cpp:729-745, in the code's own evaluation order: :732
+\* storage_service.cpp:727-743, in the code's own evaluation order: :730
 \* sets held_elsewhere_since_ns_ to now when it was 0, and only THEN does
-\* :737 compare, so the FIRST refusal in a run never latches.
+\* :735 compare, so the FIRST refusal in a run never latches.
 NewSince(s) == IF heSince[s] = 0 THEN now ELSE heSince[s]
 LatchNow(s) == now - NewSince(s) >= LatchWin
 
@@ -147,7 +147,7 @@ LatchNow(s) == now - NewSince(s) >= LatchWin
 Init ==
   /\ now = 0  /\ chUp = TRUE  /\ cuts = 0  /\ lidGen = 1
   \* A crashed predecessor that ran with PredTTL and was renewed at t = 0:
-  \* its row stays live with no tombstone (storage_service.cpp:188-190 -- a
+  \* its row stays live with no tombstone (storage_service.cpp:186-188 -- a
   \* killed or quarantined holder writes none).
   /\ hOwner = IF PredHolds THEN "P" ELSE "none"
   /\ hLid   = 0
@@ -173,38 +173,38 @@ Init ==
   /\ fHeld = FALSE
 
 -----------------------------------------------------------------------------
-(* storage_service.cpp:678-727  ensure_publisher_lease().                   *)
-(* Called from the lease thread (:614) and from every cycle (:286).         *)
+(* storage_service.cpp:676-725  ensure_publisher_lease().                   *)
+(* Called from the lease thread (:612) and from every cycle (:284).         *)
 (* Constrains headVars and locVars only.                                    *)
 
 EnsureLease(s) ==
-  \/ \* :679 already holds one; :682 already failed; :684-690 quarantined,
-     \* which takes NO claim at all, not even a fresh lease_id; :692 the
+  \/ \* :677 already holds one; :680 already failed; :682-688 quarantined,
+     \* which takes NO claim at all, not even a fresh lease_id; :690 the
      \* post-refusal backoff.  All four are no-ops on the lease state.
      /\ \/ held[s]
         \/ phase[s] = "failed"
         \/ Quarantined(s)
         \/ now < nextClaim[s]
      /\ UNCHANGED <<headVars, locVars>>
-  \/ \* :696  writer_.acquire_lease(holder)
+  \/ \* :694  writer_.acquire_lease(holder)
      /\ ~held[s] /\ phase[s] # "failed"
      /\ ~Quarantined(s) /\ now >= nextClaim[s]
      /\ LET lid == IF ReuseLid /\ myLid[s] # 0
                      THEN myLid[s]        \* the COUNTERFACTUAL
-                     ELSE lidGen          \* :694-695 a fresh lease_id
-        IN \/ \* admitted  :713-719
+                     ELSE lidGen          \* :692-693 a fresh lease_id
+        IN \/ \* admitted  :711-717
               /\ CanOk(lid)
               /\ hOwner' = s /\ hLid' = lid /\ hExp' = now + TTL + Skew
               /\ lidGen' = IF lid = lidGen THEN lidGen + 1 ELSE lidGen
               /\ held'      = [held      EXCEPT ![s] = TRUE]
               /\ myLid'     = [myLid     EXCEPT ![s] = lid]
-              /\ lastRenew' = [lastRenew EXCEPT ![s] = now]      \* :713
-              /\ heSince'   = [heSince   EXCEPT ![s] = 0]        \* :714
-              /\ nextClaim' = [nextClaim EXCEPT ![s] = 0]        \* :715
+              /\ lastRenew' = [lastRenew EXCEPT ![s] = now]      \* :711
+              /\ heSince'   = [heSince   EXCEPT ![s] = 0]        \* :712
+              /\ nextClaim' = [nextClaim EXCEPT ![s] = 0]        \* :713
               /\ reacq'     = [reacq     EXCEPT ![s] =
                                  IF @ < MaxReacq THEN @ + 1 ELSE @]
               /\ UNCHANGED <<qUntil, phase, dropped>>
-           \/ \* :698-699  refused as held -> lease_held_elsewhere()
+           \/ \* :696-697  refused as held -> lease_held_elsewhere()
               /\ CanRefused(lid)
               /\ heSince'   = [heSince   EXCEPT ![s] = NewSince(s)]
               /\ nextClaim' = [nextClaim EXCEPT ![s] = now + Tick]
@@ -212,7 +212,7 @@ EnsureLease(s) ==
                                  IF LatchNow(s) THEN "failed" ELSE "run"]
               /\ UNCHANGED <<headVars, held, myLid, qUntil, lastRenew,
                              reacq, dropped>>
-           \/ \* :706-712 unknown outcome -> catalog_writer.cpp:307 quarantine()
+           \/ \* :704-710 unknown outcome -> catalog_writer.cpp:307 quarantine()
               /\ CanUnknown
               /\ \E landed \in {TRUE, FALSE} :
                    /\ landed => CanLand(lid)
@@ -230,21 +230,21 @@ EnsureLease(s) ==
                              phase, reacq>>
 
 -----------------------------------------------------------------------------
-(* storage_service.cpp:636-646  renew_lease_if_due().                       *)
+(* storage_service.cpp:634-644  renew_lease_if_due().                       *)
 
 RenewIfDue(s) ==
-  \/ \* :640  not due yet
+  \/ \* :638  not due yet
      /\ now - lastRenew[s] < DueAfter
      /\ UNCHANGED <<headVars, locVars>>
   \/ /\ now - lastRenew[s] >= DueAfter
-     /\ \/ \* :641-645  renewed.  lease_coordinator.cpp:67 presents the HELD id
+     /\ \/ \* :639-643  renewed.  lease_coordinator.cpp:67 presents the HELD id
            /\ CanOk(myLid[s])
            /\ hOwner' = s /\ hLid' = myLid[s] /\ hExp' = now + TTL + Skew
-           /\ lastRenew' = [lastRenew EXCEPT ![s] = now]   \* :642
-           /\ heSince'   = [heSince   EXCEPT ![s] = 0]     \* :643
+           /\ lastRenew' = [lastRenew EXCEPT ![s] = now]   \* :640
+           /\ heSince'   = [heSince   EXCEPT ![s] = 0]     \* :641
            /\ UNCHANGED <<lidGen, held, myLid, qUntil, nextClaim, phase,
                           reacq, dropped>>
-        \/ \* :619-623  kHeld from reject_live.  lease_coordinator.cpp:226
+        \/ \* :617-621  kHeld from reject_live.  lease_coordinator.cpp:226
            \* resets lease_ BEFORE throwing, so the local lease is gone too.
            /\ CanRefused(myLid[s])
            /\ held'      = [held      EXCEPT ![s] = FALSE]
@@ -253,9 +253,10 @@ RenewIfDue(s) ==
            /\ phase'     = [phase     EXCEPT ![s] =
                               IF LatchNow(s) THEN "failed" ELSE "run"]
            /\ UNCHANGED <<headVars, myLid, qUntil, lastRenew, reacq, dropped>>
-        \/ \* :627-630 unknown outcome.  catalog_writer.cpp:285-292
-           \* renew_for_publish(): ONE std::exception quarantines the writer
-           \* and discards the lease.  There is no second try.
+        \/ \* :625-628 unknown outcome.  catalog_writer.cpp:285-292
+           \* renew_for_publish(): ONE std::exception -- the first to outlast
+           \* the client's read retries -- quarantines the writer and
+           \* discards the lease.  There is no second try.
            /\ CanUnknown
            /\ \E landed \in {TRUE, FALSE} :
                 /\ landed => CanLand(myLid[s])
@@ -269,7 +270,7 @@ RenewIfDue(s) ==
            /\ UNCHANGED <<myLid, lastRenew, heSince, nextClaim, phase, reacq>>
 
 -----------------------------------------------------------------------------
-(* storage_service.cpp:602-633  the lease thread's body.                    *)
+(* storage_service.cpp:600-631  the lease thread's body.                    *)
 
 \* The step just taken was ensure_publisher_lease()'s claim, refused kHeld
 \* by a head row this service wrote itself.  Only the refused branch of
@@ -289,12 +290,12 @@ LeaseThreadTick(s) ==
   /\ now = wake[s]
   /\ \E late \in 0..MaxLate :
        wake' = [wake EXCEPT ![s] = now + Tick + late]
-  /\ IF ~held[s] THEN EnsureLease(s) ELSE RenewIfDue(s)   \* :613-618
+  /\ IF ~held[s] THEN EnsureLease(s) ELSE RenewIfDue(s)   \* :611-616
   /\ selfRef' = (selfRef \/ SelfRefused(s))
   /\ UNCHANGED <<envVars, cwake, swept, runBroken, startWaited, coSweep,
                  rivVars>>
 
-\* :609-610 the thread returns for good once the service has latched.
+\* :607-608 the thread returns for good once the service has latched.
 LeaseThreadExit(s) ==
   /\ phase[s] = "failed" /\ wake[s] # Never
   /\ wake'  = [wake  EXCEPT ![s] = Never]
@@ -303,29 +304,29 @@ LeaseThreadExit(s) ==
                  selfRef, coSweep, rivVars>>
 
 -----------------------------------------------------------------------------
-(* storage_service.cpp:278-406  the cycle loop, reduced to its two          *)
-(* lease-relevant acts: ensure_publisher_lease() at :286, and the           *)
-(* last_renew_ns_ bump at :439-443.                                         *)
+(* storage_service.cpp:276-404  the cycle loop, reduced to its two          *)
+(* lease-relevant acts: ensure_publisher_lease() at :284, and the           *)
+(* last_renew_ns_ bump at :437-441.                                         *)
 
 CycleTick(s) ==
   /\ CycleOn
   /\ phase[s] = "run"
   /\ now = cwake[s]
   /\ cwake' = [cwake EXCEPT ![s] = now + 1]
-  /\ \/ EnsureLease(s)                                          \* :286
-     \/ \* :439-443  a publish that DID reach the catalog: the fenced
-        \* statement renewed the row (catalog_writer.cpp:489) and :442
+  /\ \/ EnsureLease(s)                                          \* :284
+     \/ \* :437-441  a publish that DID reach the catalog: the fenced
+        \* statement renewed the row (catalog_writer.cpp:490) and :440
         \* records that.
         /\ held[s] /\ CanOk(myLid[s])
         /\ hOwner' = s /\ hLid' = myLid[s] /\ hExp' = now + TTL + Skew
         /\ lastRenew' = [lastRenew EXCEPT ![s] = now]
         /\ UNCHANGED <<lidGen, held, myLid, qUntil, heSince, nextClaim,
                        phase, reacq, dropped>>
-     \/ \* :441 + indexer.cpp:258 -- every pack in the batch was already
+     \/ \* :439 + indexer.cpp:258 -- every pack in the batch was already
         \* committed, so `all_rows` and `indexed` are both empty, the
         \* publish block is SKIPPED and renew_for_publish() is never
         \* called.  index() still returns skipped_packs > 0, and
-        \* :441-443 bumps last_renew_ns_ as if the row had been renewed.
+        \* :439-441 bumps last_renew_ns_ as if the row had been renewed.
         /\ AllowSkipPublish /\ held[s] /\ chUp
         /\ lastRenew' = [lastRenew EXCEPT ![s] = now]
         /\ UNCHANGED <<headVars, held, myLid, qUntil, heSince, nextClaim,
@@ -335,34 +336,34 @@ CycleTick(s) ==
                  coSweep, rivVars>>
 
 -----------------------------------------------------------------------------
-(* storage_service.cpp:104-175  start().                                    *)
+(* storage_service.cpp:102-173  start().                                    *)
 
 StartClaim(s) ==
   /\ phase[s] = "start"
   /\ (wake[s] = Never \/ now = wake[s])
   /\ LET lid == lidGen IN
-     \/ \* :658-660 acquired
+     \/ \* :656-658 acquired
         /\ CanOk(lid)
         /\ hOwner' = s /\ hLid' = lid /\ hExp' = now + TTL + Skew
         /\ lidGen' = lidGen + 1
         /\ held'      = [held      EXCEPT ![s] = TRUE]
         /\ myLid'     = [myLid     EXCEPT ![s] = lid]
-        /\ lastRenew' = [lastRenew EXCEPT ![s] = now]      \* :659
+        /\ lastRenew' = [lastRenew EXCEPT ![s] = now]      \* :657
         /\ phase'     = [phase     EXCEPT ![s] = "sweep"]
         /\ wake'      = [wake      EXCEPT ![s] = now + Tick]
         /\ cwake'     = [cwake     EXCEPT ![s] = now + 1]
         /\ UNCHANGED <<qUntil, heSince, nextClaim, reacq, dropped, startWaited>>
-     \/ \* :661-673 refused; retry every poll until the deadline, then throw
+     \/ \* :659-671 refused; retry every poll until the deadline, then throw
         /\ CanRefused(lid)
-        /\ IF now >= StartWait                                  \* :664
-             THEN /\ phase' = [phase EXCEPT ![s] = "refused"]   \* :665-670
+        /\ IF now >= StartWait                                  \* :662
+             THEN /\ phase' = [phase EXCEPT ![s] = "refused"]   \* :663-668
                   /\ UNCHANGED <<wake, startWaited>>
              ELSE /\ UNCHANGED phase
-                  /\ wake' = [wake EXCEPT ![s] = now + StartPoll]   \* :672
+                  /\ wake' = [wake EXCEPT ![s] = now + StartPoll]   \* :670
                   /\ startWaited' = [startWaited EXCEPT ![s] = TRUE]
         /\ UNCHANGED <<headVars, held, myLid, qUntil, lastRenew, heSince,
                        nextClaim, reacq, dropped, cwake>>
-     \/ \* a ClickHouse error at start is NOT a lease refusal (:662), so it
+     \/ \* a ClickHouse error at start is NOT a lease refusal (:660), so it
         \* propagates and start() fails outright.
         /\ CanUnknown
         /\ phase' = [phase EXCEPT ![s] = "refused"]
@@ -370,28 +371,28 @@ StartClaim(s) ==
                        nextClaim, reacq, dropped, wake, cwake, startWaited>>
   /\ UNCHANGED <<envVars, swept, runBroken, selfRef, coSweep, rivVars>>
 
-\* storage_service.cpp:121-135  the sweep, AFTER the lease and never before.
+\* storage_service.cpp:119-133  the sweep, AFTER the lease and never before.
 Sweep(s) ==
   /\ phase[s] = "sweep"
   /\ swept' = [swept EXCEPT ![s] = TRUE]
   /\ phase' = [phase EXCEPT ![s] = "run"]
   \* Obligation 5: was ANOTHER service live (its sink writing into a spool)
-  \* when this sweep ran?  storage_service.cpp:115-120 admits this is only
+  \* when this sweep ran?  storage_service.cpp:113-118 admits this is only
   \* "usually" prevented.
   /\ coSweep' = (coSweep \/ \E t \in Services \ {s} : phase[t] = "run")
   /\ UNCHANGED <<envVars, headVars, held, myLid, qUntil, lastRenew, heSince,
                  nextClaim, reacq, dropped, wake, cwake, runBroken,
                  startWaited, selfRef, rivVars>>
 
-\* storage_service.cpp:177-207  stop().  A quarantined writer holds no lease,
-\* so it writes NO tombstone (:188-190) and its row stays live to its TTL.
+\* storage_service.cpp:175-205  stop().  A quarantined writer holds no lease,
+\* so it writes NO tombstone (:186-188) and its row stays live to its TTL.
 Stop(s) ==
   /\ AllowStop /\ phase[s] \in {"run", "failed"}
   /\ phase' = [phase EXCEPT ![s] = "stopped"]
   /\ wake'  = [wake  EXCEPT ![s] = Never]
   /\ cwake' = [cwake EXCEPT ![s] = Never]
   /\ IF held[s] /\ chUp
-       THEN /\ hExp' = now /\ UNCHANGED <<hOwner, hLid, lidGen>>  \* :195
+       THEN /\ hExp' = now /\ UNCHANGED <<hOwner, hLid, lidGen>>  \* :193
        ELSE UNCHANGED headVars
   /\ held' = [held EXCEPT ![s] = FALSE]
   /\ UNCHANGED <<envVars, myLid, qUntil, lastRenew, heSince, nextClaim,
@@ -456,7 +457,7 @@ TimeTick ==
   /\ now' = now + 1
   \* History for obligation 3: since the latch clock started, was there an
   \* instant at which NO foreign publisher held a live row?  If so, the
-  \* "refusal that has lasted 2 x TTL" (storage_service.cpp:734-736) did
+  \* "refusal that has lasted 2 x TTL" (storage_service.cpp:732-734) did
   \* not in fact last.
   /\ runBroken' = [s \in Services |->
         runBroken[s] \/ (heSince[s] # 0 /\ ~ForeignLive)]
@@ -489,13 +490,15 @@ TypeOK ==
 
 \* --- O1  renewal keeps the lease alive -----------------------------------
 \* O1a.  The service never BELIEVES it holds a lease whose row is not the
-\* live head.  storage_service.cpp:594-599: "so neither the cycle backoff
-\* nor a slow upload can let the lease lapse while the service still runs."
+\* live head.  storage_service.h:233-234, on the thread that runs
+\* keep_lease() (storage_service.cpp:592-632): "so neither the cycle
+\* backoff nor a slow upload can let the lease lapse while the service
+\* still runs."
 NoPhantomLease ==
   \A s \in Services :
      (held[s] /\ phase[s] \in {"run","sweep"}) => (hLid = myLid[s] /\ HeadLive)
 
-\* O1b.  storage_service.cpp:637-638: "Renew once a third of the TTL has
+\* O1b.  storage_service.cpp:635-636: "Renew once a third of the TTL has
 \* passed without a publish, which leaves two more tries before a rival
 \* could claim it."  Read literally: between the instant the renewal falls
 \* due (last_renew + ttl/3) and the instant the row dies (last_renew + ttl),
@@ -515,7 +518,7 @@ OneFailureAbsorbed ==
   \A s \in Services : (phase[s] = "run" /\ Quarantined(s)) => held[s]
 
 \* --- O2  quarantine ------------------------------------------------------
-\* storage_service.cpp:684-690 -- a quarantined writer takes no claim at all.
+\* storage_service.cpp:682-688 -- a quarantined writer takes no claim at all.
 QuarantineTakesNothing ==
   \A s \in Services : Quarantined(s) => ~held[s]
 
@@ -524,7 +527,7 @@ NoConcurrentHolder ==
   /\ \A s \in Services : held[s] => (hOwner = s /\ hLid = myLid[s] /\ HeadLive)
   /\ fHeld => (hOwner = "F" \/ ~HeadLive)
 
-\* storage_service.cpp:685-687: "no claim ... until the window (one TTL) has
+\* storage_service.cpp:683-685: "no claim ... until the window (one TTL) has
 \* passed AND THAT LEASE'S ROW HAS EXPIRED WITH IT".  Checked directly: at
 \* every instant at or after the window's end, the row the quarantine
 \* dropped is dead.
@@ -542,7 +545,7 @@ QuarantineOutlastsItsRow ==
 NoSelfRefusal == ~selfRef
 
 \* --- O3  the 2 x TTL latch ----------------------------------------------
-\* storage_service.cpp:734-736: "our own dropped row is dead within one TTL
+\* storage_service.cpp:732-734: "our own dropped row is dead within one TTL
 \* of the loss, and a handover ends sooner still.  A refusal that has lasted
 \* 2 x TTL is a publisher that means to stay."  The latch is justified only
 \* if the refusals really did LAST -- a foreign publisher held a live row at
@@ -560,7 +563,7 @@ StartAlwaysSucceeds == \A s \in Services : phase[s] # "refused"
 RefusedStartNeverSweeps ==
   \A s \in Services : (phase[s] = "refused") => ~swept[s]
 
-\* storage_service.cpp:115-120, weakened by 204a8d2 from a guarantee to
+\* storage_service.cpp:113-118, weakened by #150's 204a8d2 from a guarantee to
 \* "only usually".  The STRONG form, which the header (storage_service.h
 \* :104-108) still states:
 SweepOnlyWhenAlone == ~coSweep
@@ -640,14 +643,16 @@ VacCoSweep     == ~coSweep
 (* 3. EVERY CLICKHOUSE CALL TAKES ZERO TIME.  RenewIfDue, EnsureLease and   *)
 (*    StartClaim settle a request in the step that issues it.  In the code  *)
 (*    keep_lease() holds lease_mutex_ across renew_lease(), which is up to  *)
-(*    three requests each bounded only by the client's request_s (60 s by   *)
-(*    default, against a 15 s TTL), so a slow request delays every later    *)
-(*    wake.  MaxLate stands in for that delay (and for OS lateness): with   *)
-(*    no publishes (CycleOn FALSE) NoPhantomLease holds at MaxLate = 3,     *)
-(*    half the TTL (O1_slowreq3), and is refuted at MaxLate = 4             *)
-(*    (O1_slowreq).  So O1_clean, O1_cut and O1_late hold only if each      *)
-(*    lease request completes within about half the TTL; nothing in the     *)
-(*    code bounds it there yet.                                             *)
+(*    three requests, each attempt bounded only by the client's request_s   *)
+(*    (60 s by default, against a 15 s TTL), and a read that fails          *)
+(*    transiently is repeated, up to max_attempts (3 by default) attempts   *)
+(*    in all, so a slow request delays every later wake.  MaxLate stands in *)
+(*    for that delay (and for OS lateness): with no publishes (CycleOn      *)
+(*    FALSE) NoPhantomLease holds at MaxLate = 3, half the TTL              *)
+(*    (O1_slowreq3), and is refuted at MaxLate = 4 (O1_slowreq).  So        *)
+(*    O1_clean, O1_cut and O1_late hold only if each lease request          *)
+(*    completes within about half the TTL; nothing in the code bounds it    *)
+(*    there yet.                                                            *)
 (* 4. The cycle loop is reduced to ensure_publisher_lease() plus the        *)
 (*    last_renew_ns_ bump.  Uploads, backoff and pending_index_ never touch *)
 (*    the lease and are omitted.                                            *)

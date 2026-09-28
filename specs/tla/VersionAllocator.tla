@@ -5,21 +5,21 @@
 (* SOURCE OF TRUTH                                                         *)
 (*   native/csrc/catalog/version_allocator.cpp:49-89  (allocate_version)   *)
 (*   native/csrc/catalog/version_allocator.h:5-7      (the claim we check) *)
-(*   native/csrc/catalog/clickhouse_client.cpp:107    (deciding_read)      *)
+(*   native/csrc/catalog/clickhouse_client.cpp:374    (deciding_read)      *)
 (*   native/csrc/catalog/catalog_writer.cpp:587-620   (watermark publish)  *)
 (*                                                                         *)
 (* The C++ loop, verbatim in structure:                                    *)
 (*                                                                         *)
 (*   for (attempt = 0; attempt < allocation_attempts; ++attempt) {         *)
-(*     claimed   = max_version("capture_version_claims","version");   //:53*)
-(*     floor     = max(claimed, max_version("index_watermark",...));  //:54*)
-(*     spread    = attempt == 0 ? 0 : rng() % (8*attempt + 1);        //:59*)
-(*     candidate = floor + 1 + spread;                                //:63*)
-(*     INSERT (candidate, claim_id) with insert_quorum;               //:66*)
-(*     owners    = SELECT claim_id WHERE version = candidate;         //:73*)
-(*     if (owners == {claim_id}) return candidate;                    //:81*)
+(*     claimed   = max_version("capture_version_claims","version");   //:52*)
+(*     floor     = max(claimed, max_version("index_watermark",...));  //:53*)
+(*     spread    = attempt == 0 ? 0 : rng() % (8*attempt + 1);        //:57*)
+(*     candidate = floor + 1 + spread;                                //:61*)
+(*     INSERT (candidate, claim_id) with insert_quorum;               //:63*)
+(*     owners    = SELECT claim_id WHERE version = candidate;         //:72*)
+(*     if (owners == {claim_id}) return candidate;                    //:79*)
 (*   }                                                                     *)
-(*   throw CatalogError(kAllocation, ...);                            //:86*)
+(*   throw CatalogError(kAllocation, ...);                            //:85*)
 (*                                                                         *)
 (* Both reads carry deciding_read() = select_sequential_consistency=1.     *)
 (* The whole point of this spec is to ask what that setting buys and what  *)
@@ -49,7 +49,7 @@ CONSTANTS
 
 (***************************************************************************)
 (* One claim_id per (process, attempt): the code mints a fresh uuid_v4 on  *)
-(* every attempt (version_allocator.cpp:64), so ids never repeat.          *)
+(* every attempt (version_allocator.cpp:62), so ids never repeat.          *)
 (***************************************************************************)
 ClaimIds == Allocators \X (0 .. Attempts - 1)
 
@@ -83,13 +83,13 @@ MaxOf(S)   == CHOOSE x \in S : \A y \in S : y <= x
 Inserted    == { c \in ClaimIds : at[c] # 0 }      \* durably accepted rows
 Visible(a)  == { c \in Inserted : c \in seen[a] }   \* what a's reads return
 
-\* max_version("capture_version_claims","version")  -- version_allocator.cpp:53
+\* max_version("capture_version_claims","version")  -- version_allocator.cpp:52
 MaxClaimVersion(a) ==
     IF Visible(a) = {} THEN 0 ELSE MaxOf({ at[c] : c \in Visible(a) })
 \* max_version("index_watermark","index_version")   -- version_allocator.cpp:54
 MaxPublished    == IF published = {} THEN 0 ELSE MaxOf(published)
 
-\* spread -- version_allocator.cpp:57-61. 0 on the first attempt, otherwise
+\* spread -- version_allocator.cpp:57-60. 0 on the first attempt, otherwise
 \* uniform in [0, 8*attempt]. We bound it by MaxSpread to close the model.
 Spreads(k) == IF k = 0 THEN {0} ELSE 0 .. MaxSpread
 
@@ -116,7 +116,7 @@ Init ==
 
 (***************************************************************************)
 (* Pick: the two deciding reads that compute `floor`, plus the choice of   *)
-(* jitter.  version_allocator.cpp:53-63.                                   *)
+(* jitter.  version_allocator.cpp:52-61.                                   *)
 (*                                                                         *)
 (* MODELLING NOTE: the code does TWO separate reads (claims, then the      *)
 (* watermark); we take them in one atomic step.  Both quantities are       *)
@@ -136,7 +136,7 @@ Pick(a) ==
 
 (***************************************************************************)
 (* Insert: the quorum INSERT of (candidate, claim_id).                     *)
-(* version_allocator.cpp:65-71 + quorum_write() at :32-38.                 *)
+(* version_allocator.cpp:63-71 + quorum_write() at :32-38.                 *)
 (***************************************************************************)
 Insert(a) ==
     /\ pc[a] = "picked"
@@ -151,7 +151,7 @@ Insert(a) ==
 (***************************************************************************)
 (* Reveal: an accepted-but-not-yet-visible row becomes readable.  Disabled *)
 (* under Linearizable.  This is precisely what                             *)
-(* select_sequential_consistency=1 (clickhouse_client.cpp:107) is supposed *)
+(* select_sequential_consistency=1 (clickhouse_client.cpp:374) is supposed *)
 (* to rule out: a replica answering a read from behind the quorum.         *)
 (*                                                                         *)
 (* EventuallyConsistent reveals the row to ONE allocator -- two allocators *)
@@ -173,7 +173,7 @@ Reveal ==
 (***************************************************************************)
 (* ReadBack: the deciding read of every claim_id at `candidate`, and the   *)
 (* ownership test.  version_allocator.cpp:72-84, and the budget throw at   *)
-(* :86-89.                                                                 *)
+(* :85-88.                                                                 *)
 (***************************************************************************)
 ReadBack(a) ==
     /\ pc[a] = "inserted"
@@ -196,7 +196,7 @@ ReadBack(a) ==
 (* Publish: the conditional watermark INSERT the caller runs with the      *)
 (* allocated version.  catalog_writer.cpp:587-596 guards it with           *)
 (*   coalesce((SELECT max(index_version) FROM index_watermark),0) < V      *)
-(* and the read-back at :613-620 turns a refusal into kPublishRace.        *)
+(* and the read-back at :611-627 turns a refusal into kPublishRace.        *)
 (* This action is NOT part of the allocator; it is here so obligation 4    *)
 (* (FloorMonotonic) has something to be about.                            *)
 (***************************************************************************)
@@ -254,13 +254,13 @@ FloorMonotonic ==
 (* O4  NoPublishRefused -- a returned version is always publishable.       *)
 (*     EXPECTED: FALSE, and it is the same race as O3 seen downstream:     *)
 (*     the conditional INSERT at catalog_writer.cpp:595 refuses, and       *)
-(*     :613-620 raises kPublishRace.                                       *)
+(*     :611-627 raises kPublishRace.                                       *)
 (***************************************************************************)
 NoPublishRefused == \A a \in Allocators : pc[a] # "refused"
 
 (***************************************************************************)
 (* O5  NoBudgetExhaustion -- nobody burns the whole attempt budget.        *)
-(*     EXPECTED: FALSE.  version_allocator.cpp:86 throws kAllocation.      *)
+(*     EXPECTED: FALSE.  version_allocator.cpp:85 throws kAllocation.      *)
 (***************************************************************************)
 NoBudgetExhaustion == \A a \in Allocators : pc[a] # "failed"
 

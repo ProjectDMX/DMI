@@ -19,19 +19,26 @@ specs/
 └── cbmc/   C++ harness, checked with CBMC
 ```
 
-Line references point at `fix/lease-recovery` @ `c0361d7`, the head of #150.
-The models were written against `204a8d2` (first published as `2b74d14`, the
-same tree); `c0361d7` changes only `run_cycle()`'s upload gate and comments,
-which no model covers.
+Line references point at `main` @ `71be2af`. The models were written against
+`204a8d2` (first published as `2b74d14`, the same tree), a commit on #150's
+branch `fix/lease-recovery`; #150 was squash-merged into main as `7419fd0`,
+and its later commits change only `run_cycle()`'s upload gate and comments,
+which no model covers. Of what main took after `204a8d2`, only #151
+(`ef2a12f`) changes cited behaviour: `ClickHouseClient` now takes a
+`ClickHouseConnection` (credentials, TLS, retry attempts), and `execute()`
+retries a read after a transient failure but never a write that may have
+reached the server. A repeated read, or a repeated write that never reached
+the server, is one later request to these models, so no modelled outcome
+changes; the retries only lengthen a lease request's worst case (see `O1`).
 
 ## What each spec models
 
 | Spec | Models | Source of truth |
 |---|---|---|
-| `tla/VersionAllocator.tla` | the sole-claimant version allocation loop: floor read, jittered candidate, claim INSERT, singleton read-back, retry | `native/csrc/catalog/version_allocator.cpp:49-89`, header claim at `version_allocator.h:5-7`, watermark publish at `native/csrc/catalog/catalog_writer.cpp:587-620`, `clickhouse_client.cpp:107` |
-| `tla/PublisherLease.tla` | the lease claim/renew/release protocol and the fenced publish: `claim_with_rival`, `head()`, `fence()`, `fence_eval()`, `reject_live()`, and `publish_snapshot`'s manifest chunks and watermark INSERT | `native/csrc/catalog/lease_coordinator.cpp:83-247`, `native/csrc/catalog/catalog_writer.cpp:148-158,478-640`, `clickhouse_client.cpp:107`, `docs/catalog-descriptor-key.md:290-360,461-560`, `src/dmi/storage/capture/clickhouse_lease.py:83-92,198-210` |
-| `tla/LeaseLifecycle.tla` | the lease lifecycle *above* that protocol: the lease thread, the quarantine window, the `2 x TTL` latch, the start wait and the spool sweep | `native/csrc/catalog/storage_service.cpp:65-67,104-175,177-207,278-406,439-443,594-634,636-646,648-676,678-727,729-745,768-787`, `catalog_writer.cpp:243-253,268-274,285-293,296-310`, `lease_coordinator.cpp:45-55,57-68,70-81,220-247`, `indexer.cpp:258`, `src/dmi/storage/native_capture.py:139-145,215-219` |
-| `z3/clock_skew.py` | two obligations: the two-host derivation behind the fence margin `publish_timeout_ns + clock_skew_ns`, and the default start wait `lease_ttl_s + publish_timeout_s + clock_skew_s` | the SQL at `docs/catalog-descriptor-key.md:352-362` (emitted by `catalog_writer.cpp:583`), the derivation at `:365-372`, the cap at `catalog_writer.cpp:519`; for the start wait, `native_capture.py:215-219`, `storage_service.cpp:648-676`, `lease_coordinator.cpp:138-153,225-233` |
+| `tla/VersionAllocator.tla` | the sole-claimant version allocation loop: floor read, jittered candidate, claim INSERT, singleton read-back, retry | `native/csrc/catalog/version_allocator.cpp:49-89`, header claim at `version_allocator.h:5-7`, watermark publish at `native/csrc/catalog/catalog_writer.cpp:587-620`, `clickhouse_client.cpp:374` |
+| `tla/PublisherLease.tla` | the lease claim/renew/release protocol and the fenced publish: `claim_with_rival`, `head()`, `fence()`, `fence_eval()`, `reject_live()`, and `publish_snapshot`'s manifest chunks and watermark INSERT | `native/csrc/catalog/lease_coordinator.cpp:83-247`, `native/csrc/catalog/catalog_writer.cpp:148-169,478-669`, `clickhouse_client.cpp:374`, `docs/catalog-descriptor-key.md:290-360,461-560`, `src/dmi/storage/capture/clickhouse_lease.py:83-92,198-210` |
+| `tla/LeaseLifecycle.tla` | the lease lifecycle *above* that protocol: the lease thread, the quarantine window, the `2 x TTL` latch, the start wait and the spool sweep | `native/csrc/catalog/storage_service.cpp:65-67,102-173,175-205,276-404,437-441,592-632,634-644,646-674,676-725,727-743,766-785`, `catalog_writer.cpp:243-253,268-274,285-293,296-310`, `lease_coordinator.cpp:45-55,57-68,70-81,220-247`, `indexer.cpp:258`, `src/dmi/storage/native_capture.py:270-276,370-374` |
+| `z3/clock_skew.py` | two obligations: the two-host derivation behind the fence margin `publish_timeout_ns + clock_skew_ns`, and the default start wait `lease_ttl_s + publish_timeout_s + clock_skew_s` | the SQL at `docs/catalog-descriptor-key.md:352-362` (emitted by `catalog_writer.cpp:583`), the derivation at `:365-372`, the cap at `catalog_writer.cpp:519`; for the start wait, `native_capture.py:370-374`, `storage_service.cpp:646-674`, `lease_coordinator.cpp:138-153,222` |
 | `cbmc/payload_ring_span.cpp` | `payload_compute_spans` and its stated precondition: the span arithmetic only, not the ring's publish/consume protocol | `native/csrc/ring/payload_ring.cuh:44-86` |
 
 All three TLA+ models are written against the **code**, not the prose. Where
@@ -312,19 +319,23 @@ integers. Most configs run one service with `TTL = 6`.
 the TTL.** The model settles each ClickHouse call in the step that issues it:
 `RenewIfDue`, `EnsureLease` and `StartClaim` take zero time. The code does not.
 `keep_lease()` holds `lease_mutex_` across `renew_lease()`, which is three
-requests (head read, claim `INSERT`, read-back), each bounded only by the
-client's `request_s` — 60 s by default, against a 15 s default TTL. A slow
-request delays every later wake exactly as a late wake does, so `MaxLate`
-stands in for it. With no publishes to renew the row (`CycleOn = FALSE`, the
-idle service), `NoPhantomLease` holds at `MaxLate = 3`, half the TTL
-(`O1_slowreq3`), and falls at `MaxLate = 4` (`O1_slowreq`): the row expires
-under a service that still believes it holds it. So `O1_clean`, `O1_cut` and
-`O1_late` show the renewal schedule is sound while requests are fast, not that
-the lease survives a slow ClickHouse. Nothing in the code bounds a lease
-request below half the TTL yet; a follow-up PR will bound lease request time.
+requests (head read, claim `INSERT`, read-back). Each attempt is bounded only
+by the client's `request_s` — 60 s by default, against a 15 s default TTL —
+and a read that fails transiently is repeated, up to the client's
+`max_attempts` (3 by default) attempts in all, so one read can take three
+request timeouts plus a short backoff (`clickhouse_client.cpp:484-520`). A
+slow request delays every later wake exactly as a late wake does, so
+`MaxLate` stands in for it. With no publishes to renew the row
+(`CycleOn = FALSE`, the idle service), `NoPhantomLease` holds at
+`MaxLate = 3`, half the TTL (`O1_slowreq3`), and falls at `MaxLate = 4`
+(`O1_slowreq`): the row expires under a service that still believes it holds
+it. So `O1_clean`, `O1_cut` and `O1_late` show the renewal schedule is sound
+while requests are fast, not that the lease survives a slow ClickHouse.
+Nothing in the code bounds a lease request below half the TTL yet; a
+follow-up PR will bound lease request time.
 
 `O1_tries` / `O1_tries5` together pin the comment at
-`storage_service.cpp:637-638` — *"which leaves two more tries"*. Exactly **four**
+`storage_service.cpp:635-636` — *"which leaves two more tries"*. Exactly **four**
 lease-thread wakes fall between the instant the renewal falls due
 (`last_renew + ttl/3`) and the instant the row dies (`last_renew + ttl`), at
 every phase offset: three fit, four fit, five do not. The arithmetic is
@@ -350,7 +361,7 @@ by `O1_absorb`; the second is a model result:
 * `O1_skip` is a real defect, not a modelling artefact. See below.
 
 **`O1_skip` — a lease can lapse under a service that still believes it holds
-it.** `storage_service.cpp:441-443` bumps `last_renew_ns_` when
+it.** `storage_service.cpp:439-441` bumps `last_renew_ns_` when
 `indexed_packs > 0 || skipped_packs > 0`, with the comment *"a publish renews
 the lease"*. But `indexer.cpp:258` gates the whole publish on
 `!all_rows.empty() || !indexed.empty()`: an index pass whose packs were all
@@ -389,7 +400,7 @@ alone, or the indexer should report whether it actually published.
 
 `QuarantineTakesNothing` holds everywhere it is checked: a quarantined writer
 takes no claim at all, not even with a fresh `lease_id`
-(`storage_service.cpp:684-690`).
+(`storage_service.cpp:682-688`).
 
 With `Skew = 0` the window at `catalog_writer.cpp:273` does outlast the row it
 dropped. With one tick of skew it does not — the window is
@@ -451,10 +462,10 @@ needed:
    from a replica that may still report it live. `204a8d2` gave the start wait
    a `+ clock_skew_s` term; the quarantine window did not get one. The writer
    therefore comes out of quarantine and is refused by its own corpse.
-2. `storage_service.cpp:737` tests `now - held_elsewhere_since_ns_ >= 2 * ttl`,
-   and `held_elsewhere_since_ns_` is set on the **first** refusal (`:732`) and
-   cleared only by a **successful** claim (`:714`). The justification written
-   directly above it at `:734-736` — *"a refusal that has lasted 2 x TTL is a
+2. `storage_service.cpp:735` tests `now - held_elsewhere_since_ns_ >= 2 * ttl`,
+   and `held_elsewhere_since_ns_` is set on the **first** refusal (`:730`) and
+   cleared only by a **successful** claim (`:712`). The justification written
+   directly above it at `:732-734` — *"a refusal that has lasted 2 x TTL is a
    publisher that means to stay"* — requires an unbroken **run** of refusals.
    The code measures elapsed time since the first one instead, and nothing in
    between resets it.
@@ -474,7 +485,7 @@ The trace, at `TTL = 6` and `Skew = 1`:
    (`runBroken := TRUE`), which is exactly what `NoFalsePositiveLatch` watches.
 5. Ticks 9 and 15. Two further acquire attempts return unknown outcomes and
    take the `catalog_writer.cpp:296-310` path, quarantining again each time.
-   Neither is a refusal, and neither is a success — so `:714` never runs and
+   Neither is a refusal, and neither is a success — so `:712` never runs and
    `held_elsewhere_since_ns_` stays at 8. (The second of these does leave a
    live row on the server, expiring at 22.)
 6. Tick 21. The last window ends, the claim is refused by that row, and
@@ -550,7 +561,7 @@ unlinked, and `s2`'s `swept_on_start` counts a live sink's work as recovered
 debris.
 
 This is not a new discovery so much as the **witness for the comment `204a8d2`
-already weakened**. `storage_service.cpp:115-120` now says *"usually"* and
+already weakened**. `storage_service.cpp:113-118` now says *"usually"* and
 names exactly this gap: *"a holder that is quarantined has let its row lapse,
 and a second process can take the lease in that gap"*. That comment is correct.
 `storage_service.h:104-108` was not updated with it and still reads as the
@@ -609,13 +620,13 @@ declared bound, any expiry and any schedule — not a sample of one. All
 quantities are reals: no discretisation and no bound on the magnitudes.
 
 The second obligation discharges the change `204a8d2` made at
-`native_capture.py:215-219`, which added `+ clock_skew_s` to the default start
+`native_capture.py:370-374`, which added `+ clock_skew_s` to the default start
 wait. The result: **the wait outlasts a crashed predecessor iff
 `predecessor_ttl <= successor_ttl + publish_timeout`**, and `clock_skew_s`
 cancels out of that condition entirely. It pays for real replica skew exactly
 and buys **zero** headroom against a TTL mismatch.
 
-The hand-written caveat at `native_capture.py:139-145` is therefore true but
+The hand-written caveat at `native_capture.py:270-276` is therefore true but
 conservative. On the shipped Python defaults — `lease_ttl_s = 15`,
 `publish_timeout_s = 5` — any predecessor TTL up to **20 s** is outlasted. The
 native default TTL is 30 s (`catalog_writer.h:34`), which processes predating
@@ -626,7 +637,7 @@ script's second start-wait check pins the same failure at a different knob set
 One clarification the caveat does not make: the skew that matters *at start* is
 between ClickHouse **replicas**, not between DMI hosts. `reject_live` compares
 `head.live_until_ns > head.now_ns` with both sides stamped server-side inside
-one query (`lease_coordinator.cpp:138-153,225-233`), so the successor's own
+one query (`lease_coordinator.cpp:138-153,222`), so the successor's own
 clock never enters it. The relevant step is between the replica that took the
 predecessor's INSERT and the replica that answers the successor's `head()`.
 
@@ -674,7 +685,7 @@ sees every accepted row whenever `Linearizable = TRUE`, which is every config
 except the three `nonlin_*`. That is the single load-bearing assumption of the
 safety argument. On a replicated deployment it takes two settings, not one:
 `select_sequential_consistency=1` on every deciding read
-(`clickhouse_client.cpp:107`) is only the read half, and means something only
+(`clickhouse_client.cpp:374`) is only the read half, and means something only
 if every deciding write waited for the same quorum, which is `insert_quorum`
 (`LeaseCoordinator::quorum_write`, `lease_coordinator.cpp:37-43`, and its twin
 in `version_allocator.cpp`). `insert_quorum` is optional and unset by default,
@@ -693,11 +704,13 @@ a probability.
 HOLDS verdicts assume each lease request completes in about half the TTL.**
 `RenewIfDue`, `EnsureLease` and `StartClaim` issue and settle a request in one
 step. In the code `keep_lease()` holds `lease_mutex_` across `renew_lease()`,
-three requests each bounded only by `request_s` (60 s by default, against a
-15 s TTL). `O1_slowreq3` / `O1_slowreq` put the threshold at half the TTL for
-the idle service: `NoPhantomLease` holds at `MaxLate = 3` and falls at 4.
-Nothing in the code bounds lease requests that tightly yet; a follow-up PR will
-bound lease request time. See the `O1` section.
+three requests, each attempt bounded only by `request_s` (60 s by default,
+against a 15 s TTL), and a read that fails transiently is repeated, up to
+`max_attempts` (3 by default) attempts in all. `O1_slowreq3` / `O1_slowreq`
+put the threshold at half the TTL for the idle service: `NoPhantomLease` holds
+at `MaxLate = 3` and falls at 4. Nothing in the code bounds lease requests
+that tightly yet; a follow-up PR will bound lease request time. See the `O1`
+section.
 
 **An outcome-unknown statement lands at once or never.** The model's "landed"
 branch stamps the row at the instant the client sees the failure. The code

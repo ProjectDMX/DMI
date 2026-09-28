@@ -35,15 +35,15 @@ Expected: UNSAT for d <= S (no overlap exists, for any p, S, e and any
 schedule), SAT for d > S (the documented race is reachable).  UNSAT is a proof
 over all timings, which is strictly more than a two-host experiment can show.
 
-Second obligation: the default START WAIT.  204a8d2 ("Count clock skew in the
-default start wait") changed the default in
-src/dmi/storage/native_capture.py:215-219 from
+Second obligation: the default START WAIT.  #150's commit 204a8d2 ("Count
+clock skew in the default start wait") changed the default in
+src/dmi/storage/native_capture.py:370-374 from
 
     lease_ttl_s + publish_timeout_s
 to
     lease_ttl_s + publish_timeout_s + clock_skew_s
 
-and the config comment at :139-145 records a caveat by hand:
+and the config comment at :270-276 records a caveat by hand:
 
     "None waits lease_ttl_s + publish_timeout_s + clock_skew_s, enough to
      outlast a crashed predecessor that ran with the same knobs; 0 fails at
@@ -52,11 +52,11 @@ and the config comment at :139-145 records a caveat by hand:
 
 start_wait_constraints() below encodes that claim and its caveat against the
 code that decides it: the successor gives up at start + start_lease_wait_ns
-(native/csrc/catalog/storage_service.cpp:648-676, a steady-clock deadline),
+(native/csrc/catalog/storage_service.cpp:646-674, a steady-clock deadline),
 and a claim is refused while the predecessor's row still reads live under
 LeaseCoordinator::reject_live -- head.live_until_ns > head.now_ns, with BOTH
 sides of that comparison stamped by the ClickHouse replica serving the read
-(native/csrc/catalog/lease_coordinator.cpp:138-153, :225-233).  The skew that
+(native/csrc/catalog/lease_coordinator.cpp:138-153, :222).  The skew that
 matters here is therefore between REPLICAS, not between DMI hosts: the
 predecessor's expires_at_ns was stamped on the replica that took its INSERT,
 and the successor's now64() comes from whichever replica answers head().
@@ -68,8 +68,9 @@ def overlap_constraints(s, d_vs_S):
     p, S, e, a, b, d, t_adm, t_end, t_claim = Reals(
         "p S e a b d t_adm t_end t_claim")
 
-    # Configuration is non-degenerate; catalog_writer.cpp:148-158 requires a
-    # positive publish timeout and a non-negative declared skew bound.
+    # Configuration is non-degenerate: catalog_writer.cpp:132-147 requires a
+    # positive publish timeout, and the declared skew bound is unsigned
+    # (clock_skew_ns, catalog_writer.h:36), so never negative.
     s.add(p > 0, S >= 0)
 
     # B's host is stepped ahead of A's by d.
@@ -113,7 +114,7 @@ def start_wait_constraints(s, extra):
     t reads now_ns = t + rb and is refused while expires_at_ns > now_ns, i.e.
     while t < t_ins + Tp + d.  The successor polls until t_start + W, with
 
-        W = Ts + p + S          (native_capture.py:217-219)
+        W = Ts + p + S          (native_capture.py:372-374)
 
     THE FAILURE STATE: the whole window is refused, so start() raises kHeld on
     a predecessor that is already dead --
@@ -122,7 +123,7 @@ def start_wait_constraints(s, extra):
     """
     Tp, Ts, p, S, d, t_ins, t_start = Reals("Tp Ts p S d t_ins t_start")
 
-    # Non-degenerate knobs (native_capture.py:147-166 rejects the rest).
+    # Non-degenerate knobs (native_capture.py:351-354 rejects the rest).
     s.add(Tp > 0, Ts > 0, p > 0, S >= 0)
 
     # Real replica skew within the declared bound, either direction.
