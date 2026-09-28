@@ -751,6 +751,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &ring_py::RingEnginePy::prepare_step,
            py::arg("step_total_bytes"),
            py::arg("num_hooks"),
+           py::arg("reserve") = true,
            py::call_guard<py::gil_scoped_release>())
       .def("reserve_record",
            &ring_py::RingEnginePy::reserve_record,

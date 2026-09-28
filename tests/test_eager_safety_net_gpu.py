@@ -5,11 +5,11 @@ check-and-reserve against a fake engine, and
 test_eager_safety_net_delivers_past_the_task_ring in
 tests/native/ring/test_ring_engine.cu runs a C++ copy of it against the
 native ring. Neither goes through point.py and the pybind surface together
-(``available_task_slots``, ``reserve_one``, ``flush_and_wait``), so binding
-``available_task_slots`` to the wrong method passed every committed test
-while the model forward raised. These drive the real composition: a
-``MonitoringEngine``'s legacy ring, its ``RingTransport``, and real
-``HookPoint`` modules on CUDA tensors.
+(``available_task_slots``, ``reserve_one``, ``flush_and_wait`` and
+``prepare_step``'s ``reserve``), so binding ``available_task_slots`` to the
+wrong method passed every committed test while the model forward raised.
+These drive the real composition: a ``MonitoringEngine``'s legacy ring, its
+``RingTransport``, and real ``HookPoint`` modules on CUDA tensors.
 
 Needs CUDA and the full native backend. The ring has no host engine, so its
 consumer drops what it drains; delivering each payload byte for byte with
@@ -99,3 +99,71 @@ def test_an_oversized_step_fires_every_hook_through_a_small_task_ring(
         transport.force_eager = False
         engine.close()
 
+
+def test_needs_eager_steps_that_fit_leave_no_reservation_behind():
+    """_spec_needs_eager turns the safety net on for steps that fit, and
+    each hook then reserves its own entry. commit_step used to reserve the
+    whole step as well: each step kept its hook count of task entries after
+    the flush, and the second step's forward raised from reserve_one."""
+    from types import SimpleNamespace
+
+    from dmi.adapters.base import BackendAdapter, StepReservation
+    from dmi.adapters.types import StepContext
+    from dmi.hooks.point import HookPoint
+    from dmi.hooks.specs import (
+        HOOK_TYPE_RESID_PRE, HookSpec, ModelShapeConfig)
+
+    class DynamicShapeAdapter(BackendAdapter):
+        def detect_model_shape(self, model):
+            return self._cfg
+
+        def detect_parallel_ranks(self):
+            return (0, 0, 0, 0)
+
+        def is_pp_first(self):
+            return True
+
+        def is_pp_last(self):
+            return True
+
+        def build_step_context(self, *raw):
+            return None
+
+        def on_capacity_exceeded(self, ctx):
+            pass
+
+        def _spec_needs_eager(self, spec):
+            return True
+
+    task_entries = 4
+    engine = _legacy_engine(task_entries)
+    transport = engine._ring_transport
+    ring = engine._ring_engine
+    try:
+        adapter = DynamicShapeAdapter(engine, "eager-safety-net")
+        adapter._cfg = ModelShapeConfig(
+            hidden_dim=16, num_heads=4, num_kv_heads=4, head_dim=4,
+            dtype=torch.float16, vocab_size=32, intermediate_dim=0)
+        hooks = [HookPoint(), HookPoint()]
+        model = SimpleNamespace(get_hook_specs=lambda: [
+            HookSpec(HOOK_TYPE_RESID_PRE, hook, layer)
+            for layer, hook in enumerate(hooks)])
+        adapter.attach_model(model)
+        assert [spec.module for spec in adapter.active_specs] == hooks
+        ctx = StepContext(
+            model_id="eager-safety-net", flattened=False, req_ids=["0:0"],
+            token_ranges=[(0, 4)], dim0_offsets=[0], kv_offsets=[0],
+            batch=1, q_len=4, kv_dim=4)
+        value = torch.ones(1, 4, 16, dtype=torch.float16, device="cuda")
+
+        for step in range(3):
+            assert adapter.commit_step(ctx) is StepReservation.RESERVED
+            assert transport.force_eager
+            for hook in hooks:
+                hook(value)
+            ring.flush_and_wait()
+            assert ring.available_task_slots() == task_entries, step
+            assert ring.available_capacity() == ring.payload_cap(), step
+    finally:
+        transport.force_eager = False
+        engine.close()

@@ -84,7 +84,7 @@ class _SpyRingEngine:
     def staging_cap(self):
         return 1 << 20
 
-    def prepare_step(self, total_bytes, num_hooks):
+    def prepare_step(self, total_bytes, num_hooks, reserve=True):
         self.prepare_step_calls.append((total_bytes, num_hooks))
         if self.prepare_step_error is not None:
             raise self.prepare_step_error

@@ -93,7 +93,8 @@ class RecordingRingEngine:
         self._result = prepare_step_result
         self.prepare_step_calls: list = []
 
-    def prepare_step(self, total_bytes: int, n_hooks: int) -> int:
+    def prepare_step(self, total_bytes: int, n_hooks: int,
+                     reserve: bool = True) -> int:
         self.prepare_step_calls.append((total_bytes, n_hooks))
         return self._result
 

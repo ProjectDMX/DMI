@@ -578,7 +578,8 @@ void RingEnginePy::notify_drain() {
 // drain thread to flush all pending entries.
 // ---------------------------------------------------------------------------
 int RingEnginePy::prepare_step(uint64_t step_total_bytes,
-                               uint32_t num_hooks)
+                               uint32_t num_hooks,
+                               bool reserve)
 {
     // Record rings reserve through reserve_record.
     refuse_on_record_ring(impl_->record_mode, "legacy step reservation");
@@ -637,7 +638,7 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     const uint64_t task_avail = available_task_slots();
 
     if (step_total_bytes <= payload_avail && num_hooks <= task_avail) {
-        drain.reserve(step_total_bytes, num_hooks);
+        if (reserve) drain.reserve(step_total_bytes, num_hooks);
         return STEP_RING_OK;  // fast path -- no CUDA or thread interaction
     }
 
@@ -646,7 +647,7 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
     cudaStreamSynchronize(ms);
     drain.force_flush_and_wait();
-    drain.reserve(step_total_bytes, num_hooks);
+    if (reserve) drain.reserve(step_total_bytes, num_hooks);
     return STEP_RING_FLUSHED;
 }
 
