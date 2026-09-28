@@ -53,7 +53,12 @@ What it establishes, all measured on 25.12:
    (`CatalogVersionAllocationError`).
 6. An unsatisfiable quorum is refused immediately (Code 285,
    TOO_FEW_LIVE_REPLICAS) rather than parking for ClickHouse's 600-second
-   default, because `insert_quorum_timeout` is bounded to `publish_timeout_ns`.
+   default, because `insert_quorum_timeout` is bounded to `publish_timeout_ns`
+   -- and, on the publisher lease's own INSERTs, also to the time left before
+   the request's deadline (native/csrc/catalog/lease_coordinator.h): the lease
+   deadline while a lease is held, min(request timeout, TTL / 3) for a claim
+   made without one. At the 30 s TTL the native leg runs with, that is 10 s or
+   more, so the lease's timeout is `publish_timeout_ns` too.
 """
 from __future__ import annotations
 
@@ -399,6 +404,9 @@ def _main_native(client, prefix: str, control_prefix: str, driver_path) -> None:
             assert quorum == "2", f"{fragment}: insert_quorum was {quorum!r}"
             assert parallel == "0", (
                 f"{fragment}: insert_quorum_parallel was {parallel!r}")
+            # publish_timeout_ns for every table. The lease's own INSERTs
+            # are capped by the time left before their deadline as well,
+            # which at the 30 s TTL (DEFAULTS) is never below 10 s.
             assert timeout_ms == "5000", (
                 f"{fragment}: insert_quorum_timeout was {timeout_ms!r}")
         print("PASS  server recorded insert_quorum=2, parallel=0 and the "

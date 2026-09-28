@@ -121,6 +121,17 @@ std::string url_encode(const std::string& value) {
   return out;
 }
 
+// The innermost RequestDeadline on this thread; each links to the one it
+// nests in.
+thread_local RequestDeadline* innermost_deadline = nullptr;
+
+// "60 s", "0.25 s": a timeout for a message.
+std::string seconds_text(double seconds) {
+  char out[32];
+  std::snprintf(out, sizeof(out), "%g s", seconds);
+  return out;
+}
+
 bool has_header_breaking_byte(const std::string& value) {
   return value.find_first_of(std::string("\r\n\0", 3)) != std::string::npos;
 }
@@ -218,6 +229,42 @@ std::vector<Row> parse_tsv(const std::string& body) {
 }
 
 }  // namespace
+
+uint64_t steady_now_ns() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+RequestDeadline::RequestDeadline(uint64_t deadline_ns, std::string bound)
+    : fixed_ns_(deadline_ns), bound_(std::move(bound)),
+      outer_(innermost_deadline) {
+  innermost_deadline = this;
+}
+
+RequestDeadline::RequestDeadline(std::function<uint64_t()> deadline_ns,
+                                 std::string bound)
+    : moving_ns_(std::move(deadline_ns)), bound_(std::move(bound)),
+      outer_(innermost_deadline) {
+  innermost_deadline = this;
+}
+
+RequestDeadline::~RequestDeadline() { innermost_deadline = outer_; }
+
+uint64_t RequestDeadline::current(std::string* bound) {
+  uint64_t tightest = 0;
+  for (const RequestDeadline* scope = innermost_deadline; scope != nullptr;
+       scope = scope->outer_) {
+    const uint64_t at = scope->moving_ns_ ? scope->moving_ns_()
+                                          : scope->fixed_ns_;
+    if (at != 0 && (tightest == 0 || at < tightest)) {
+      tightest = at;
+      if (bound != nullptr) *bound = scope->bound_;
+    }
+  }
+  return tightest;
+}
 
 void validate(const ClickHouseConnection& c) {
   if (c.scheme != "http" && c.scheme != "https") {
@@ -431,7 +478,7 @@ std::vector<Row> ClickHouseClient::execute(
     }
   }
 
-  const auto perform = [&]() {
+  const auto perform = [&](long connect_ms, long request_ms) {
     Attempt attempt;
     CURL* curl = curl_easy_init();
     if (curl == nullptr) throw ClickHouseError("libcurl init failed");
@@ -470,10 +517,8 @@ std::vector<Row> ClickHouseClient::execute(
     }
     // NOSIGNAL: timeouts must not use SIGALRM in a multi-threaded process.
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
-                     timeout_ms(connection_.timeouts.connect_s));
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
-                     timeout_ms(connection_.timeouts.request_s));
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, connect_ms);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, request_ms);
     attempt.code = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &attempt.status);
     curl_easy_cleanup(curl);
@@ -481,11 +526,63 @@ std::vector<Row> ClickHouseClient::execute(
     return attempt;
   };
 
+  // Whether any attempt may have reached the server (ClickHouseError::sent).
+  bool sent = false;
+  std::string last_error;  // the previous attempt's, for a retry not sent
   for (int number = 1;; ++number) {
-    const Attempt attempt = perform();
+    // The client's timeouts, cut to the RequestDeadline in force: read
+    // afresh for every attempt, since its owner may have moved it.
+    long connect_ms = timeout_ms(connection_.timeouts.connect_s);
+    long request_ms = timeout_ms(connection_.timeouts.request_s);
+    std::string bound;
+    const uint64_t deadline_ns = RequestDeadline::current(&bound);
+    bool by_deadline = false;
+    if (deadline_ns != 0) {
+      const uint64_t now_ns = steady_now_ns();
+      // Rounded down, so the attempt never outlasts the deadline.
+      const uint64_t left_ms =
+          deadline_ns > now_ns ? (deadline_ns - now_ns) / 1'000'000 : 0;
+      if (left_ms == 0) {
+        std::string error =
+            "Timeout: not sent, because " + bound + " had already passed";
+        if (number > 1) {
+          error += "; the attempt before failed with: " + last_error;
+        }
+        throw ClickHouseError(error, true, sent);
+      }
+      if (left_ms < static_cast<uint64_t>(request_ms)) {
+        request_ms = static_cast<long>(left_ms);
+        by_deadline = true;
+      }
+      connect_ms = std::min(connect_ms, request_ms);
+    }
+
+    const Attempt attempt = perform(connect_ms, request_ms);
     if (attempt.code == CURLE_OK && attempt.status == 200) {
       if (attempts != nullptr) *attempts = number;
       return parse_tsv(attempt.body);
+    }
+    if (attempt.code == CURLE_OK || !never_connected(attempt.code)) {
+      sent = true;
+    }
+    if (attempt.code == CURLE_OPERATION_TIMEDOUT) {
+      // Never retried (above). Named, so whoever reads it knows which knob
+      // to turn: the deadline that cut the attempt short, or the client's
+      // own timeouts.
+      std::string error = std::string("curl: ") +
+                          curl_easy_strerror(attempt.code);
+      if (!attempt.detail.empty()) error += ": " + attempt.detail;
+      error += by_deadline
+                   ? " -- bounded by " + bound
+                   : " -- bounded by the client's timeouts "
+                     "(clickhouse_request_timeout_s = " +
+                         seconds_text(connection_.timeouts.request_s) +
+                         ", clickhouse_connect_timeout_s = " +
+                         seconds_text(connection_.timeouts.connect_s) + ")";
+      if (number > 1) {
+        error += " (attempt " + std::to_string(number) + ")";
+      }
+      throw ClickHouseError(error, true, sent);
     }
     std::string error;
     bool retry = false;
@@ -510,13 +607,23 @@ std::vector<Row> ClickHouseClient::execute(
       if (number > 1) {
         error += " (after " + std::to_string(number) + " attempts)";
       }
-      throw ClickHouseError(error);
+      throw ClickHouseError(error, false, sent);
     }
     // 100 ms, doubling, capped at 1 s: enough for a restarting server or a
     // flapping connection, short beside the request timeout it adds to.
     const int shift = std::min(number - 1, 4);
-    std::this_thread::sleep_for(std::chrono::milliseconds(
-        std::min(100 << shift, 1000)));
+    const uint64_t backoff_ms =
+        static_cast<uint64_t>(std::min(100 << shift, 1000));
+    if (deadline_ns != 0 &&
+        steady_now_ns() + backoff_ms * 1'000'000 >= deadline_ns) {
+      throw ClickHouseError(
+          error + " (after " + std::to_string(number) +
+              " attempt(s); not retried, because " + bound +
+              " leaves no time for another)",
+          false, sent);
+    }
+    last_error = error;
+    std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
   }
 }
 

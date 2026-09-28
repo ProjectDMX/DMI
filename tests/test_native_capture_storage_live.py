@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import socket
 import subprocess
 import threading
@@ -276,7 +277,11 @@ def test_the_reference_reader_sees_the_same_captures(fake_s3, tmp_path):
 
 class _Switch:
     """A TCP forwarder in front of ClickHouse's HTTP port that can be cut
-    (connections refused) or stalled (connections accepted, never answered)."""
+    (connections refused), stalled (connections accepted, never answered),
+    made to stall only the requests a predicate picks, or to hold the first
+    request a predicate picks back for a while. Every
+    native client opens one connection per request, so one request is one
+    connection here."""
 
     def __init__(self, host: str, port: int):
         self._target = (host, port)
@@ -284,6 +289,14 @@ class _Switch:
         self.port = self._listener.getsockname()[1]
         self._up = True
         self._stalled = False
+        # A predicate over one whole request (head and body): matching
+        # requests are held open and never answered.
+        self._stall_if = None
+        # (predicate, seconds): the first matching request reaches the server
+        # only that much later; its answer is relayed if anyone still listens.
+        self._slow_once = None
+        # time.monotonic() of every request stall_requests() held.
+        self.stalled: list[float] = []
         self._lock = threading.Lock()
         self._sockets: set[socket.socket] = set()
         threading.Thread(target=self._accept, daemon=True).start()
@@ -300,6 +313,10 @@ class _Switch:
                 continue
             if not self._up:
                 client.close()
+                continue
+            if self._stall_if is not None or self._slow_once is not None:
+                threading.Thread(target=self._look_then_route,
+                                 args=(client,), daemon=True).start()
                 continue
             try:
                 upstream = socket.create_connection(self._target)
@@ -326,6 +343,71 @@ class _Switch:
                 except OSError:
                     pass
 
+    def _look_then_route(self, client):
+        """Read one HTTP request and route it: a request stall_requests()
+        picks is never answered, the first request slow_once() picks is
+        forwarded late, and anything else goes straight through."""
+        request = b""
+        continued = False
+        try:
+            client.settimeout(2.0)
+            while True:
+                head, found, body = request.partition(b"\r\n\r\n")
+                if found:
+                    length = re.search(rb"(?i)content-length:\s*(\d+)", head)
+                    if length is None or len(body) >= int(length.group(1)):
+                        break
+                    # libcurl holds a body over 1 KiB back until the server
+                    # says 100 Continue, or for a second; answer for it, so
+                    # routing a large statement does not add that second.
+                    if not continued and re.search(
+                            rb"(?i)\r\nexpect:\s*100-continue", head):
+                        client.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+                        continued = True
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                request += chunk
+            client.settimeout(None)
+        except OSError:
+            client.close()
+            return
+        if continued:
+            # The server must not answer 100 Continue a second time.
+            head, _, body = request.partition(b"\r\n\r\n")
+            request = (re.sub(rb"(?i)\r\nexpect:[^\r\n]*", b"", head)
+                       + b"\r\n\r\n" + body)
+        stall_if = self._stall_if
+        if stall_if is not None and stall_if(request):
+            with self._lock:
+                self.stalled.append(time.monotonic())
+                self._sockets.add(client)  # held open, never answered
+            return
+        slow = self._slow_once
+        if slow is not None and slow[0](request):
+            self._slow_once = None
+            time.sleep(slow[1])
+        try:
+            upstream = socket.create_connection(self._target)
+            upstream.sendall(request)
+        except OSError:
+            client.close()
+            return
+        with self._lock:
+            self._sockets |= {client, upstream}
+        for source, sink in ((client, upstream), (upstream, client)):
+            threading.Thread(target=self._pump, args=(source, sink),
+                             daemon=True).start()
+
+    def stall_requests(self, predicate):
+        """Hold every new request `predicate(request_bytes)` picks open and
+        never answer it; the rest go through."""
+        self._stall_if = predicate
+
+    def slow_once(self, predicate, seconds: float):
+        """Forward the first request `predicate` picks `seconds` late."""
+        self._slow_once = (predicate, seconds)
+
     def cut(self):
         self._up = False
         with self._lock:
@@ -346,6 +428,8 @@ class _Switch:
     def restore(self):
         self._up = True
         self._stalled = False
+        self._stall_if = None
+        self._slow_once = None
 
     def close(self):
         self.cut()
@@ -961,6 +1045,23 @@ def _lease_row_live(client, prefix) -> bool:
         f"FROM {table} WHERE term = (SELECT max(term) FROM {table})")[0][0] == 1
 
 
+def _sample_lease(service, client, prefix, seconds, *, origin=None,
+                  every=0.1):
+    """(t, lease_state, row live) every `every` s for `seconds`, t measured
+    from `origin` (time.monotonic(); the first sample by default). The state
+    is read before the row, so a sample that says "held" over a dead row
+    means the service called the lease held after the row had expired."""
+    log = []
+    origin = time.monotonic() if origin is None else origin
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        state = service.snapshot()["lease_state"]
+        log.append((round(time.monotonic() - origin, 2), state,
+                    _lease_row_live(client, prefix)))
+        time.sleep(every)
+    return log
+
+
 def _held_but_dead(log):
     return [sample for sample in log if sample[1] == "held" and not sample[2]]
 
@@ -1034,6 +1135,234 @@ def test_passes_over_committed_packs_do_not_hold_off_the_renewal(
         assert min(left) > 1.0, left
         # One every 1 to 1.5 s over the 6 s.
         assert after["lease_renewals"] - before["lease_renewals"] >= 3, after
+
+
+def test_a_stalled_renewal_gives_up_while_the_lease_row_is_still_live(
+        fake_s3, tmp_path):
+    """One renewal is three ClickHouse requests, and each was bounded only by
+    the client's request timeout -- 60 s by default, against a 15 s TTL --
+    while the lease thread held the lease lock. A ClickHouse that accepted
+    the renewal's connection and never answered let the row expire with the
+    service still reporting the lease held, so a rival could take the
+    catalog before any error surfaced. Every request made under the lease is
+    now bounded by the lease deadline -- when the claim that stamped the row
+    was sent, plus the TTL, less the skew and a margin -- so the stalled
+    renewal fails, and the writer quarantines, while its row still keeps
+    rivals out."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (client, catalog):
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            reconcile_on_start=False, lease_ttl_s=3.0, publish_timeout_s=1,
+            # Longer than the TTL, so only the lease deadline can end the
+            # stalled request in time.
+            clickhouse_request_timeout_s=20.0)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            assert service.snapshot()["lease_state"] == "held"
+            stalled_at = time.monotonic()
+            switch.stall()
+            # Past the row's whole TTL, so the row has expired by the end.
+            log = _sample_lease(service, client, catalog.table_prefix, 4.0,
+                                origin=stalled_at)
+            assert not _held_but_dead(log), log
+            quarantined = [t for t, state, _ in log if state == "quarantined"]
+            assert quarantined and quarantined[0] < 3.0, log
+            snapshot = service.snapshot()
+            assert "lease renewal failed" in snapshot["last_error"], snapshot
+            assert "Timeout" in snapshot["last_error"], snapshot
+            assert snapshot["failed"] is False, snapshot
+
+            # The quarantine is the recoverable kind: the lease comes back.
+            switch.restore()
+            _wait_for(lambda: service.snapshot()["lease_state"] == "held",
+                      timeout_s=10.0)
+            service.rethrow_if_failed()
+        finally:
+            switch.close()  # releases the stalled connections
+            service.stop()
+
+
+def _catalog_insert_but_the_lease(request: bytes) -> bool:
+    body = request.partition(b"\r\n\r\n")[2]
+    return body.startswith(b"INSERT") and b"_publisher_lease` (term" not in body
+
+
+def test_a_stall_inside_the_index_pass_gives_up_while_the_lease_row_is_live(
+        fake_s3, tmp_path):
+    """The index pass holds the lease lock across its catalog requests -- the
+    version claim, the descriptor INSERTs, the publish and its read-backs --
+    and those were bounded only by the client's request timeout. One that
+    stalled kept the lease thread from renewing: the row expired while the
+    snapshot still said "held", until the 20 s request timeout. The lease
+    deadline now bounds every request sent under the lease, not only the
+    lease's own, so the stalled INSERT fails, and the lease quarantines,
+    while the row is still live."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (client, catalog):
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            reconcile_on_start=False, lease_ttl_s=3.0, publish_timeout_s=1,
+            clickhouse_request_timeout_s=20.0)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            # Every catalog INSERT but the lease's own stalls, so the lease
+            # thread alone could keep the row alive -- if it got the lock.
+            switch.stall_requests(_catalog_insert_but_the_lease)
+            tensors = _stage(spool_root, range(2))
+            _wait_for(lambda: switch.stalled, timeout_s=10.0)
+            log = _sample_lease(service, client, catalog.table_prefix, 8.0,
+                                origin=switch.stalled[0])
+            assert not _held_but_dead(log), log
+            quarantined = [t for t, state, _ in log if state == "quarantined"]
+            assert quarantined and quarantined[0] < 3.0, log
+            assert service.snapshot()["failed"] is False
+
+            switch.restore()
+            service.flush(30.0)
+            service.rethrow_if_failed()
+        finally:
+            switch.close()
+            service.stop()
+
+        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
+        assert sorted(captures) == sorted(tensors)
+
+
+def _lease_head_read(request: bytes) -> bool:
+    return b"SELECT term, toString(lease_id)" in request
+
+
+def test_start_survives_a_first_lease_read_slower_than_its_bound(
+        fake_s3, tmp_path):
+    """A claim made without a lease has min(clickhouse_request_timeout_s,
+    lease_ttl_s / 3) per request, and a cold server's first read can take
+    longer. start() failed outright when its claim timed out; it now retries
+    one that did, as it retries one another holder refused, until
+    start_lease_wait_s runs out. A head read that timed out wrote nothing,
+    so it does not quarantine the writer and the retry need not wait."""
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
+                     publish_timeout_s=1)
+        # The schema first, directly: then the service's own claim is the
+        # first lease read through the switch.
+        warm = _service(_storage_config(fake_s3, catalog.table_prefix,
+                                        **knobs), tmp_path / "warm")
+        warm.start()
+        warm.stop()
+
+        switch.slow_once(_lease_head_read, 1.5)  # past the 1 s claim bound
+        service = _service(_storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            **knobs), tmp_path / "spool")
+        started = time.monotonic()
+        service.start()
+        try:
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "held", snapshot
+            # Retried at once, without waiting out a 3 s quarantine.
+            assert 1.0 <= elapsed < 2.5, elapsed
+            assert "Timeout" in snapshot["last_error"], snapshot
+        finally:
+            service.stop()
+            switch.close()
+
+
+def test_lease_requests_that_keep_timing_out_name_the_knobs_that_bound_them(
+        fake_s3, tmp_path):
+    """On a catalog too slow for its lease the service went round -- a claim
+    timed out, quarantined, was refused by its own late row, started over --
+    and all the snapshot ever said was "curl: Timeout was reached". Once
+    three lease requests in a row time out, the snapshot names the bound
+    and the knobs that set it, until the lease renews again."""
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            reconcile_on_start=False, lease_ttl_s=3.0, publish_timeout_s=1,
+            clickhouse_request_timeout_s=20.0)
+        service = _service(config, tmp_path / "spool")
+        service.start()
+        try:
+            snapshot = service.snapshot()
+            assert snapshot["lease_timeouts"] == 0, snapshot
+            assert snapshot["lease_timeout_error"] == "", snapshot
+
+            # The renewal times out at the lease deadline, then every claim
+            # at its own bound.
+            switch.stall()
+            _wait_for(lambda: service.snapshot()["lease_timeout_error"],
+                      timeout_s=15.0)
+            snapshot = service.snapshot()
+            assert snapshot["lease_timeouts"] >= 3, snapshot
+            assert snapshot["failed"] is False, snapshot
+            for text in (snapshot["lease_timeout_error"],
+                         snapshot["last_error"]):
+                for knob in ("lease_ttl_s", "clickhouse_request_timeout_s",
+                             "lease_ttl_s / 3"):
+                    assert knob in text, snapshot
+
+            switch.restore()
+            _wait_for(lambda: service.snapshot()["lease_timeout_error"] == "",
+                      timeout_s=15.0)
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "held", snapshot
+            assert snapshot["lease_timeouts"] == 0, snapshot
+            service.rethrow_if_failed()
+        finally:
+            switch.close()
+            service.stop()
+
+
+def test_the_lease_statements_carry_a_server_side_cap(fake_s3, tmp_path):
+    """The claim INSERT went out with no max_execution_time, unlike every
+    fenced publish statement. A request the client gave up on could still
+    land its claim row later -- after the quarantine that was meant to
+    outlive it had ended. The cap makes the server abandon the INSERT no
+    later than the client does: the time left before the request's
+    deadline, rounded down, and lock_acquire_timeout the same."""
+    with _catalog() as (client, catalog):
+        # The production knobs: a 15 s TTL.
+        config = _storage_config(fake_s3, catalog.table_prefix,
+                                 reconcile_on_start=False, holder="cap-test")
+        service = _service(config, tmp_path / "spool")
+        service.start()
+        service.stop()  # the release tombstone is a lease INSERT too
+
+        rows = []
+        for _ in range(25):
+            client.execute("SYSTEM FLUSH LOGS")
+            rows = client.execute(
+                "SELECT query, Settings['max_execution_time'], "
+                "Settings['timeout_overflow_mode'], "
+                "Settings['lock_acquire_timeout'] FROM system.query_log "
+                "WHERE type = 'QueryFinish' AND query LIKE 'INSERT%' "
+                f"AND query LIKE '%{catalog.table_prefix}_publisher_lease%'")
+            ours = [query for query, *_ in rows if "'cap-test'" in query]
+            if len(ours) >= 2:
+                break
+            time.sleep(0.2)
+        # The service's claim and its tombstone, beside the schema check's.
+        assert len(ours) == 2, rows
+        for query, cap, overflow, lock in rows:
+            if "now_ns + toUInt64" in query:
+                # A claim with no lease held: min(clickhouse_request_timeout_s,
+                # lease_ttl_s / 3) = 5 s, less the microseconds since.
+                assert cap == "4", (query, cap)
+            else:
+                # A tombstone, under the lease: what is left of 15 s less
+                # the 0.1 s margin since the claim was sent.
+                assert cap in ("13", "14"), (query, cap)
+            assert lock == cap, (query, lock)
+            # The log lists only settings that differ from the default, and
+            # throw is the default; break would insert what had been read.
+            assert overflow in ("", "throw"), (query, overflow)
 
 
 def _latch_lines(err: str) -> list[str]:

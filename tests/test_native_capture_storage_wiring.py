@@ -690,6 +690,44 @@ def test_a_lease_that_outlasts_the_fence_is_accepted(ttl, publish, skew):
     assert config.lease_ttl_s == ttl
 
 
+@pytest.mark.parametrize("ttl, publish, skew", [
+    (30.0, 5.0, 15.0),   # the skew spends the renewal's whole half
+    (15.0, 5.0, 7.3),    # 100 ms left for a renewal
+    (3.0, 1.0, 1.25),    # 150 ms, at the live suites' TTL
+    (3.0, 1.0, 1.21),    # 190 ms: just under the 200 ms floor
+])
+def test_the_skew_must_leave_a_renewal_time_to_finish(ttl, publish, skew):
+    # Each clears the fence margin, but a renewal starts up to lease_ttl_s/2
+    # after the claim that stamped the row was sent, and has to be answered
+    # by the lease deadline, lease_ttl_s less the skew and a 0.1 s margin
+    # after that send. The native service refuses these too.
+    with pytest.raises(ValueError, match="clock_skew_s") as refusal:
+        _storage_config(lease_ttl_s=ttl, publish_timeout_s=publish,
+                        clock_skew_s=skew)
+    assert "lease_ttl_s" in str(refusal.value)
+
+
+@pytest.mark.parametrize("ttl, publish, skew", [
+    (15.0, 5.0, 0.0),    # the defaults
+    (15.0, 5.0, 7.2),    # exactly the 200 ms floor
+    (15.0, 5.0, 5.0),    # 2.4 s, where (TTL / 3 - skew) / 4 leaves 0
+    (3.0, 1.0, 1.2),     # the floor at a 3 s TTL
+    (7.0, 5.0, 1.5),
+])
+def test_a_skew_that_leaves_a_renewal_its_time_is_accepted(ttl, publish, skew):
+    config = _storage_config(lease_ttl_s=ttl, publish_timeout_s=publish,
+                             clock_skew_s=skew)
+    assert config.clock_skew_s == skew
+
+
+def test_the_request_timeout_does_not_bound_the_lease():
+    # Requests under the lease are bounded by the lease deadline as well, so
+    # a generic request timeout longer than the TTL is not refused.
+    config = _storage_config(lease_ttl_s=3.0, publish_timeout_s=1,
+                             clickhouse_request_timeout_s=120.0)
+    assert config.clickhouse_request_timeout_s == 120.0
+
+
 @pytest.mark.parametrize("publish", [1.5, 0.5, 4.999])
 def test_the_publish_timeout_is_whole_seconds(publish):
     # The native writer sends it as max_execution_time in whole seconds; a

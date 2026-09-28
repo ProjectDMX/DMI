@@ -299,12 +299,20 @@ PublisherLease CatalogWriter::acquire_lease(const std::string& holder) {
   require_owned_by_this_process();
   const std::lock_guard<std::recursive_mutex> serial(serial_);
   require_not_quarantined();
+  const bool renewing = leases_->lease() != nullptr;
   try {
     return leases_->acquire(holder);
   } catch (const CatalogError&) {
     throw;
   } catch (const std::exception&) {
-    quarantine();
+    // An unknown outcome only if a claim row may have been written: a
+    // renewal's, or a claim whose INSERT may have reached the server. One
+    // that failed before that -- its head read timed out, or could not
+    // connect -- wrote nothing, and a quarantine would only keep a writer
+    // with nothing to wait out from trying again. Deliberately unlike the
+    // Python oracle (clickhouse_catalog.py, acquire_publisher_lease), which
+    // quarantines on any error here.
+    if (renewing || leases_->claim_insert_sent()) quarantine();
     throw;
   }
 }
@@ -313,6 +321,12 @@ PublisherLease CatalogWriter::renew_lease() {
   require_owned_by_this_process();
   const std::lock_guard<std::recursive_mutex> serial(serial_);
   return renew_for_publish();
+}
+
+void CatalogWriter::abandon_lease() {
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
+  if (leases_->lease() != nullptr) quarantine();
 }
 
 void CatalogWriter::release_lease() {

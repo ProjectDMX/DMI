@@ -61,12 +61,48 @@ bool is_lease_refusal(const CatalogError& exc) {
 
 // The lease thread's tick, which is also the retry interval for a claim
 // another holder refused: a sixth of the TTL, so a renewal due at ttl/3 is
-// never more than a tick late.
+// never more than a tick late. renewal_window_ns (lease_coordinator.h) takes
+// the least time a renewal has from this schedule -- it starts within ttl/2
+// of the claim that stamped the row -- so change one and the other must
+// follow.
 uint64_t lease_tick_ns(uint64_t ttl_ns) {
   return std::max<uint64_t>(ttl_ns / 6, 10'000'000ull);
 }
 
+std::string seconds_text(uint64_t ns) {
+  char out[32];
+  std::snprintf(out, sizeof(out), "%g s", static_cast<double>(ns) / 1e9);
+  return out;
+}
+
 }  // namespace
+
+class CaptureStorageService::LeaseScope {
+ public:
+  explicit LeaseScope(CaptureStorageService* service)
+      : service_(service),
+        lock_(service->lease_mutex_),
+        deadline_([service] { return service->writer_.lease_deadline_ns(); },
+                  kLeaseDeadlineBound) {
+    service_->abandon_lease_if_expired();
+  }
+
+  ~LeaseScope() {
+    try {
+      service_->abandon_lease_if_expired();
+      service_->publish_lease_state();
+    } catch (...) {
+    }
+  }
+
+  LeaseScope(const LeaseScope&) = delete;
+  LeaseScope& operator=(const LeaseScope&) = delete;
+
+ private:
+  CaptureStorageService* service_;
+  std::unique_lock<std::mutex> lock_;
+  RequestDeadline deadline_;  // after lock_: released before it
+};
 
 CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
     : config_(std::move(config)),
@@ -82,6 +118,27 @@ CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
   }
   if (config_.uploader.store_id.empty()) {
     throw std::invalid_argument("storage service: uploader.store_id is required");
+  }
+  // A renewal that fails must fail while its row still keeps rivals out,
+  // so it has until the lease deadline (lease_coordinator.h). A skew bound
+  // that leaves it too little time is refused here rather than turned into
+  // renewals that time out against a healthy server.
+  const uint64_t window_ns = renewal_window_ns(config_.writer.lease_ttl_ns,
+                                               config_.writer.clock_skew_ns);
+  if (window_ns < kMinimumRenewalWindowNs) {
+    throw std::invalid_argument(
+        "storage service: clock_skew_ns leaves a lease renewal no time to "
+        "finish while its row is live. A renewal starts up to lease_ttl_ns "
+        "/ 2 after the claim that stamped the row was sent, and has to be "
+        "answered by lease_ttl_ns less clock_skew_ns and a " +
+        std::to_string(kLeaseDeadlineMarginNs / 1'000'000) +
+        " ms margin after it: " + std::to_string(window_ns / 1'000'000) +
+        " ms, under the " +
+        std::to_string(kMinimumRenewalWindowNs / 1'000'000) +
+        " ms minimum. Keep clock_skew_ns at most lease_ttl_ns / 2 - " +
+        std::to_string((kMinimumRenewalWindowNs + kLeaseDeadlineMarginNs) /
+                       1'000'000) +
+        " ms, or raise lease_ttl_ns");
   }
   std::string error;
   if (dmi_store::Spool::Open({config_.spool_root, config_.spool_max_bytes},
@@ -106,7 +163,7 @@ void CaptureStorageService::start() {
   CatalogSchema(clickhouse_, config_.writer.database, config_.writer.table_prefix)
       .ensure(&writer_.leases(), config_.schema_retry_sleep_ns);
   {
-    std::lock_guard<std::mutex> lease(lease_mutex_);
+    LeaseScope lease(this);
     acquire_lease_at_start();  // throws kHeld if another publisher keeps it
   }
 
@@ -121,7 +178,7 @@ void CaptureStorageService::start() {
     std::string error;
     if (spool_.Recover(&recovered, &error) != dmi_store::SpoolStatus::kOk) {
       try {
-        std::lock_guard<std::mutex> lease(lease_mutex_);
+        LeaseScope lease(this);
         if (writer_.held_lease() != nullptr) writer_.release_lease();
       } catch (...) {
       }
@@ -141,7 +198,7 @@ void CaptureStorageService::start() {
     } catch (const CatalogError& exc) {
       if (is_lease_refusal(exc)) {
         try {
-          std::lock_guard<std::mutex> lease(lease_mutex_);
+          LeaseScope lease(this);
           if (writer_.held_lease() != nullptr) writer_.release_lease();
         } catch (...) {
         }
@@ -160,8 +217,7 @@ void CaptureStorageService::start() {
     kick_ = false;
   }
   {
-    std::lock_guard<std::mutex> lease(lease_mutex_);
-    publish_lease_state();
+    LeaseScope lease(this);  // publishes the lease state
   }
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -188,7 +244,7 @@ void CaptureStorageService::stop() {
     // live until the TTL keeps a successor out of that window.
     bool released = false;
     try {
-      std::lock_guard<std::mutex> lease(lease_mutex_);
+      LeaseScope lease(this);
       if (writer_.held_lease() != nullptr) {
         writer_.release_lease();
         released = true;
@@ -280,7 +336,7 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
   // nothing either: whatever it uploaded it could only owe, in memory.
   bool catalog = false;
   {
-    std::lock_guard<std::mutex> lease(lease_mutex_);
+    LeaseScope lease(this);
     catalog = ensure_publisher_lease();
   }
   // Indexes refs, keeping whatever does not index owed: it is already gone
@@ -438,7 +494,7 @@ void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
       // (renew_lease_if_due), which only a claim that confirmed moves -- a
       // pass that published nothing, over packs already committed, renewed
       // nothing.
-      std::lock_guard<std::mutex> lease(lease_mutex_);
+      LeaseScope lease(this);
       result = indexer_.index(batch);
     } catch (const CatalogError& exc) {
       if (exc.kind() == CatalogError::Kind::kBatchTooLarge && batch.size() > 1) {
@@ -535,7 +591,7 @@ void CaptureStorageService::reconcile() {
     if (packs.empty()) continue;
     std::set<PackIdentity> committed;
     {
-      std::lock_guard<std::mutex> lease(lease_mutex_);
+      LeaseScope lease(this);
       committed = writer_.committed_pack_ids(identities);
     }
 
@@ -608,7 +664,7 @@ void CaptureStorageService::keep_lease() {
       std::lock_guard<std::mutex> lock(state_mutex_);
       if (failure_) return;
     }
-    std::lock_guard<std::mutex> lease(lease_mutex_);
+    LeaseScope lease(this);  // publishes the lease state when done
     if (writer_.held_lease() == nullptr) {
       ensure_publisher_lease();
       continue;
@@ -627,8 +683,8 @@ void CaptureStorageService::keep_lease() {
       // An unknown outcome: the writer quarantined itself and dropped the
       // lease. ensure_publisher_lease() replaces it after the window.
       record_error(std::string("lease renewal failed: ") + exc.what());
+      note_lease_failure(exc);
     }
-    publish_lease_state();
   }
 }
 
@@ -638,14 +694,62 @@ void CaptureStorageService::renew_lease_if_due() {
   // its fenced statements -- as the writer records it, so nothing but a
   // confirmed claim moves the schedule. The lease thread looks every sixth
   // of the TTL, so with the lease lock free a renewal starts within half the
-  // TTL of that send, and the row has the other half left.
+  // TTL of that send, and has until the lease deadline to be answered: the
+  // renewal window the constructor checks (lease_coordinator.h). A stretch
+  // under the lease lock delays it, but every request in such a stretch is
+  // bounded by the same deadline. A failed renewal costs the lease at once: a refusal drops it in the coordinator, and any other
+  // error quarantines the writer (renew_for_publish).
   const uint64_t ttl = config_.writer.lease_ttl_ns;
   const uint64_t sent = writer_.lease_sent_ns();
   if (ttl == 0 || sent == 0 || steady_ns() - sent < ttl / 3) return;
   writer_.renew_lease();
   held_elsewhere_since_ns_ = 0;
+  note_lease_success();
   std::lock_guard<std::mutex> lock(state_mutex_);
   ++state_.lease_renewals;
+}
+
+void CaptureStorageService::abandon_lease_if_expired() {
+  const uint64_t deadline = writer_.lease_deadline_ns();
+  if (deadline == 0 || steady_ns() < deadline) return;
+  writer_.abandon_lease();
+  record_error(std::string("publisher lease abandoned: it was not renewed "
+                           "by ") + kLeaseDeadlineBound);
+}
+
+void CaptureStorageService::note_lease_failure(const std::exception& failure) {
+  const auto* error = dynamic_cast<const ClickHouseError*>(&failure);
+  if (error == nullptr || !error->timed_out()) return;
+  ++lease_timeouts_;
+  std::string message;
+  if (lease_timeouts_ >= 3) {
+    // The knobs first: last_error keeps only its first 512 bytes.
+    const uint64_t claim_bound = writer_.leases().claim_bound_ns();
+    message =
+        std::to_string(lease_timeouts_) +
+        " publisher lease claims or renewals have timed out since one last "
+        "succeeded. Requests made under the lease have until its deadline, "
+        "lease_ttl_s (" +
+        seconds_text(config_.writer.lease_ttl_ns) + ") less clock_skew_s (" +
+        seconds_text(config_.writer.clock_skew_ns) + ") and a " +
+        seconds_text(kLeaseDeadlineMarginNs) +
+        " margin after the claim that stamped its row was sent; each request "
+        "of a claim made without one has min(clickhouse_request_timeout_s, "
+        "lease_ttl_s / 3) = " + seconds_text(claim_bound) +
+        ". A catalog this slow needs a longer lease_ttl_s. The latest: " +
+        error->what();
+    record_error(message);
+  }
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  state_.lease_timeouts = lease_timeouts_;
+  state_.lease_timeout_error = message.substr(0, 1024);
+}
+
+void CaptureStorageService::note_lease_success() {
+  lease_timeouts_ = 0;
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  state_.lease_timeouts = 0;
+  state_.lease_timeout_error.clear();
 }
 
 void CaptureStorageService::acquire_lease_at_start() {
@@ -659,6 +763,7 @@ void CaptureStorageService::acquire_lease_at_start() {
   while (true) {
     try {
       writer_.acquire_lease(config_.holder);
+      note_lease_success();
       return;
     } catch (const CatalogError& exc) {
       if (!is_lease_refusal(exc) || config_.start_lease_wait_ns == 0) throw;
@@ -673,6 +778,32 @@ void CaptureStorageService::acquire_lease_at_start() {
       }
       std::this_thread::sleep_for(
           std::chrono::nanoseconds(std::min(poll, deadline - now)));
+    } catch (const ClickHouseError& exc) {
+      // A claim that timed out -- a cold catalog's first reads can outlast
+      // the claim bound -- is retried within the same wait. One that wrote
+      // nothing (its head read timed out) goes again at once; one whose
+      // INSERT may have landed quarantined the writer for a TTL, which is
+      // waited out when it ends inside the wait. Any other error fails
+      // start() as before.
+      record_error(std::string("publisher lease claim at start failed: ") +
+                   exc.what());
+      note_lease_failure(exc);
+      if (!exc.timed_out() || config_.start_lease_wait_ns == 0) throw;
+      uint64_t resume = steady_ns();
+      uint64_t until = 0;
+      if (writer_.quarantined(&until)) resume = std::max(resume, until);
+      if (resume >= deadline) {
+        throw ClickHouseError(
+            "storage service: the publisher lease claim timed out, and "
+            "start_lease_wait_ns (" +
+                std::to_string(config_.start_lease_wait_ns / 1'000'000) +
+                " ms) leaves no time to try again: " + exc.what(),
+            true, exc.sent());
+      }
+      const uint64_t now = steady_ns();
+      if (resume > now) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(resume - now));
+      }
     }
   }
 }
@@ -706,12 +837,21 @@ bool CaptureStorageService::ensure_publisher_lease() {
     publish_lease_state();
     return false;
   } catch (const std::exception& exc) {
-    // Unknown outcome again: the writer quarantined itself for a TTL.
+    // An unknown outcome if the claim INSERT may have reached the server:
+    // the writer quarantined itself for a TTL. A claim that wrote nothing
+    // (its head read timed out or could not connect) is not quarantined,
+    // and goes again a tick from now, so that flush()'s fast cycles do not
+    // hammer a catalog that cannot answer.
     record_error(std::string("publisher lease acquisition failed: ") +
                  exc.what());
+    note_lease_failure(exc);
+    if (!writer_.quarantined()) {
+      next_claim_ns_ = steady_ns() + lease_tick_ns(config_.writer.lease_ttl_ns);
+    }
     publish_lease_state();
     return false;
   }
+  note_lease_success();
   held_elsewhere_since_ns_ = 0;
   next_claim_ns_ = 0;
   {
