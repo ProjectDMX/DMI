@@ -37,26 +37,27 @@ over all timings, which is strictly more than a two-host experiment can show.
 
 Second obligation: the default START WAIT.  #150's commit 204a8d2 ("Count
 clock skew in the default start wait") changed the default in
-src/dmi/storage/native_capture.py:370-374 from
+src/dmi/storage/native_capture.py:374-378 from
 
     lease_ttl_s + publish_timeout_s
 to
     lease_ttl_s + publish_timeout_s + clock_skew_s
 
-and the config comment at :270-276 records a caveat by hand:
+and the config comment at :270-280 states when that wait suffices:
 
-    "None waits lease_ttl_s + publish_timeout_s + clock_skew_s, enough to
-     outlast a crashed predecessor that ran with the same knobs; 0 fails at
-     once.  A predecessor with a longer TTL (the native default is 30 s, which
-     processes predating these knobs used) can outlast it"
+    "None waits lease_ttl_s + publish_timeout_s + clock_skew_s; 0 fails at
+     once. That is guaranteed to outlast a crashed predecessor only when its
+     TTL is at most lease_ttl_s + publish_timeout_s: clock_skew_s cancels,
+     since the wait adds it and a lagging replica sees the row live that
+     much longer"
 
-start_wait_constraints() below encodes that claim and its caveat against the
-code that decides it: the successor gives up at start + start_lease_wait_ns
-(native/csrc/catalog/storage_service.cpp:646-674, a steady-clock deadline),
+start_wait_constraints() below encodes that claim against the code that
+decides it: the successor gives up at start + start_lease_wait_ns
+(native/csrc/catalog/storage_service.cpp:662-690, a steady-clock deadline),
 and a claim is refused while the predecessor's row still reads live under
 LeaseCoordinator::reject_live -- head.live_until_ns > head.now_ns, with BOTH
 sides of that comparison stamped by the ClickHouse replica serving the read
-(native/csrc/catalog/lease_coordinator.cpp:138-153, :222).  The skew that
+(native/csrc/catalog/lease_coordinator.cpp:148-163, :232).  The skew that
 matters here is therefore between REPLICAS, not between DMI hosts: the
 predecessor's expires_at_ns was stamped on the replica that took its INSERT,
 and the successor's now64() comes from whichever replica answers head().
@@ -114,7 +115,7 @@ def start_wait_constraints(s, extra):
     t reads now_ns = t + rb and is refused while expires_at_ns > now_ns, i.e.
     while t < t_ins + Tp + d.  The successor polls until t_start + W, with
 
-        W = Ts + p + S          (native_capture.py:372-374)
+        W = Ts + p + S          (native_capture.py:376-378)
 
     THE FAILURE STATE: the whole window is refused, so start() raises kHeld on
     a predecessor that is already dead --
@@ -123,7 +124,7 @@ def start_wait_constraints(s, extra):
     """
     Tp, Ts, p, S, d, t_ins, t_start = Reals("Tp Ts p S d t_ins t_start")
 
-    # Non-degenerate knobs (native_capture.py:351-354 rejects the rest).
+    # Non-degenerate knobs (native_capture.py:355-358 rejects the rest).
     s.add(Tp > 0, Ts > 0, p > 0, S >= 0)
 
     # Real replica skew within the declared bound, either direction.
@@ -186,8 +187,8 @@ def main():
         #     any real skew within it.
         check_start_wait("start wait, predecessor TTL == successor TTL",
                          lambda Tp, Ts, p, S: Tp == Ts, unsat),
-        # (b) The hand-written caveat: a predecessor on the native 30 s
-        #     default against a successor on 10 s / 10 s / 2 s.
+        # (b) The config comment's 30 s case: a predecessor on the native
+        #     30 s default against a successor on 10 s / 10 s / 2 s.
         check_start_wait("start wait, predecessor 30s vs successor 10s",
                          lambda Tp, Ts, p, S: And(Tp == 30, Ts == 10,
                                                   p == 10, S == 2), sat),

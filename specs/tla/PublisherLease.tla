@@ -6,20 +6,20 @@
 (* code and the prose disagree the comment says so):                       *)
 (*                                                                         *)
 (*   native/csrc/catalog/lease_coordinator.cpp                             *)
-(*     :102-132  claim_with_rival  -- head read, reject_live, insert,      *)
+(*     :102-142  claim_with_rival  -- head read, reject_live, insert,      *)
 (*               singleton read-back.  THREE round trips, so a rival row   *)
 (*               can land in either gap.  Modelled as three actions:       *)
 (*               ClaimHead / ClaimInsert / ClaimRead.                      *)
 (*     :83       release_statement -- the TOMBSTONE: an already-expired    *)
 (*               row at the holder's OWN term.  Modelled in Release.       *)
-(*     :134-155  head()            -- one deciding read, GROUP BY          *)
+(*     :144-165  head()            -- one deciding read, GROUP BY          *)
 (*               (term,lid) at max(term), min(expires_at_ns) per lease,    *)
 (*               ORDER BY lease_id DESC, live_until = max over claimants.  *)
-(*     :157-170  fence()           -- resolves ONE lease at the head term  *)
+(*     :167-180  fence()           -- resolves ONE lease at the head term  *)
 (*               (LIMIT 1 after lease_id DESC) and asks: is it mine, and   *)
 (*               does it have more than publish_timeout + clock_skew left. *)
-(*     :172-185  fence_eval        -- a DECIDING read (comment says why).  *)
-(*     :220-247  reject_live       -- admits iff the head is wholly dead   *)
+(*     :182-195  fence_eval        -- a DECIDING read (comment says why).  *)
+(*     :230-257  reject_live       -- admits iff the head is wholly dead   *)
 (*               OR (claimants == 1 AND the single head lease is mine).    *)
 (*               The claimants>1 branch is the contested-head quarantine.  *)
 (*                                                                         *)
@@ -115,7 +115,7 @@ WriterOf(p) == IF SelfRace THEN "shared" ELSE p
 Views == IF Linearizable THEN {rows}
                          ELSE {V \in SUBSET rows : settled \subseteq V}
 
-(* head() -- lease_coordinator.cpp:134-155 *)
+(* head() -- lease_coordinator.cpp:144-165 *)
 HTerm(V)     == SetMax({r.term : r \in V})
 HeadSet(V)   == {r \in V : r.term = HTerm(V)}
 HLids(V)     == {r.lid : r \in HeadSet(V)}
@@ -128,7 +128,7 @@ TopLid(V)    == SetMax(HLids(V))
 LiveUntil(V) == SetMax({MinExpOf(V, l) : l \in HLids(V)})
 NClaim(V)    == Cardinality(HLids(V))
 
-(* reject_live -- lease_coordinator.cpp:220-247.  Returns (admits) iff the
+(* reject_live -- lease_coordinator.cpp:230-257.  Returns (admits) iff the
    whole head term is dead, or there is exactly ONE claimant at the head and
    it is me.  claimants > 1 quarantines the term until every claim at it
    expires (doc :508 "Lease acquisition is not the window it looks like"). *)
@@ -136,7 +136,7 @@ RejectLivePasses(V, l) ==
   \/ LiveUntil(V) <= now
   \/ (NClaim(V) = 1 /\ TopLid(V) = l)
 
-(* fence() -- lease_coordinator.cpp:157-170, doc :350-360.
+(* fence() -- lease_coordinator.cpp:167-180, doc :350-360.
    ONE subquery reading ONE row (doc :378 explains why the two-subquery form
    is unsound).  The margin is publish cap PLUS host clock skew bound
    (clickhouse_lease.py:198-210, the S - (b - a) >= 0 derivation). *)
@@ -201,7 +201,7 @@ StartPublish(p) ==
   /\ UNCHANGED <<rows, settled, now, lease, ctm, ver,
                  manifest, wm, inflight, maxLanded, wmOutOfOrder>>
 
-(* ---- claim: lease_coordinator.cpp:102-132, three round trips ---- *)
+(* ---- claim: lease_coordinator.cpp:102-142, three round trips ---- *)
 
 (* Round trip 1: head() + reject_live.  These are one query plus pure local
    computation on its result, so nothing can interleave INSIDE them.
@@ -224,7 +224,7 @@ ClaimHead(p) ==
   /\ UNCHANGED <<rows, settled, now, ret, chunk, ver, att, used,
                  manifest, wm, inflight, maxLanded, wmOutOfOrder>>
 
-(* Round trip 2: the claim INSERT (:204-218).  Append only. *)
+(* Round trip 2: the claim INSERT (:214-228).  Append only. *)
 ClaimInsert(p) ==
   /\ pc[p] = "claim_insert"
   /\ LET r == [term |-> ctm[p], lid |-> clid[p], exp |-> now + TTL] IN
@@ -234,7 +234,7 @@ ClaimInsert(p) ==
   /\ UNCHANGED <<now, lease, ret, ctm, clid, chunk, ver, att,
                  manifest, wm, inflight, maxLanded, wmOutOfOrder, used>>
 
-(* Round trip 3: the singleton read-back (:115-127).  THIS is where the
+(* Round trip 3: the singleton read-back (:115-137).  THIS is where the
    safety comes from, per doc :296-303 -- not from the fence. *)
 ClaimRead(p) ==
   LET w == WriterOf(p) IN
@@ -247,7 +247,7 @@ ClaimRead(p) ==
                [term |-> ctm[p], lid |-> clid[p],
                 exp  |-> SetMin({q.exp : q \in mine})]]
           /\ pc' = [pc EXCEPT ![p] = ret[p]]
-       \/ /\ owners # {clid[p]}                 \* :128-131, claim refused
+       \/ /\ owners # {clid[p]}                 \* :138-141, claim refused
           /\ lease' = [lease EXCEPT ![w] = NoLease]
           /\ pc' = [pc EXCEPT ![p] = "failed"]
   /\ UNCHANGED <<rows, settled, now, ret, ctm, clid, chunk, ver, att,
@@ -489,7 +489,7 @@ TwoHoldersIsSafe ==
      /\ Cardinality(LandableWmStmts) <= 1
 
 (*  The safety half: at most one believer can ever pass the fence, because
-    the fence resolves ONE lease at the head term (lease_coordinator.cpp:164
+    the fence resolves ONE lease at the head term (lease_coordinator.cpp:174
     ORDER BY lease_id DESC LIMIT 1).  EXPECTED: HOLDS.                      *)
 AtMostOneFenceable ==
   Cardinality({w \in Writers :
