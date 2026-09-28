@@ -1741,7 +1741,7 @@ def test_the_lease_statements_carry_a_server_side_cap(fake_s3, tmp_path):
     land its claim row later -- after the quarantine that was meant to
     outlive it had ended. The cap makes the server abandon the INSERT no
     later than the client does: the time left before the request's
-    deadline, rounded down, and lock_acquire_timeout the same."""
+    deadline, to the millisecond, and lock_acquire_timeout the same."""
     with _catalog() as (client, catalog):
         # The production knobs: a 15 s TTL.
         config = _storage_config(fake_s3, catalog.table_prefix,
@@ -1769,11 +1769,11 @@ def test_the_lease_statements_carry_a_server_side_cap(fake_s3, tmp_path):
             if "now_ns + toUInt64" in query:
                 # A claim with no lease held: min(clickhouse_request_timeout_s,
                 # lease_ttl_s / 3) = 5 s, less the microseconds since.
-                assert cap == "4", (query, cap)
+                assert 4.9 < float(cap) <= 5.0, (query, cap)
             else:
                 # A tombstone, under the lease: what is left of 15 s less
                 # the 0.1 s margin since the claim was sent.
-                assert cap in ("13", "14"), (query, cap)
+                assert 12.0 < float(cap) < 14.9, (query, cap)
             assert lock == cap, (query, lock)
             # The log lists only settings that differ from the default, and
             # throw is the default; break would insert what had been read.

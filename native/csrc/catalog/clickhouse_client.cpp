@@ -462,7 +462,8 @@ ClickHouseClient::~ClickHouseClient() = default;
 
 std::vector<Row> ClickHouseClient::execute(
     const std::string& query, const Params& params,
-    const std::map<std::string, std::string>& settings, int* attempts) const {
+    const std::map<std::string, std::string>& settings, int* attempts,
+    const AttemptSettings& per_attempt) const {
   // First, so that what it does -- a lease renewal -- moves the deadline
   // before this request reads it.
   RequestDeadline::before_request();
@@ -471,15 +472,22 @@ std::vector<Row> ClickHouseClient::execute(
 
   // Settings ride as URL parameters; the statement is the POST body
   // (GET-with-query is evaluated as readonly — writes are refused). A
-  // caller's own wait_end_of_query wins over the default added here.
-  std::map<std::string, std::string> url_settings = settings;
-  if (read) url_settings.emplace("wait_end_of_query", "1");
-  std::string url = connection_.scheme + "://" + connection_.host + ":" +
-                    std::to_string(connection_.port) + "/?";
-  for (const auto& [key, value] : url_settings) {
-    url += url_encode(key) + "=" + url_encode(value) + "&";
-  }
-  url.pop_back();
+  // caller's own wait_end_of_query wins over the default added here. Built
+  // per attempt: per_attempt's settings depend on the time each one has.
+  const auto url_for = [&](long request_ms) {
+    std::map<std::string, std::string> url_settings = settings;
+    if (per_attempt) {
+      per_attempt(static_cast<uint64_t>(request_ms), &url_settings);
+    }
+    if (read) url_settings.emplace("wait_end_of_query", "1");
+    std::string url = connection_.scheme + "://" + connection_.host + ":" +
+                      std::to_string(connection_.port) + "/?";
+    for (const auto& [key, value] : url_settings) {
+      url += url_encode(key) + "=" + url_encode(value) + "&";
+    }
+    url.pop_back();
+    return url;
+  };
 
   // Credentials as headers: ClickHouse reads X-ClickHouse-User/-Key, and
   // unlike URL parameters or userinfo they do not end up in access logs or
@@ -497,7 +505,8 @@ std::vector<Row> ClickHouseClient::execute(
     }
   }
 
-  const auto perform = [&](long connect_ms, long request_ms) {
+  const auto perform = [&](const std::string& url, long connect_ms,
+                           long request_ms) {
     Attempt attempt;
     CURL* curl = curl_easy_init();
     if (curl == nullptr) throw ClickHouseError("libcurl init failed");
@@ -576,7 +585,8 @@ std::vector<Row> ClickHouseClient::execute(
       connect_ms = std::min(connect_ms, request_ms);
     }
 
-    const Attempt attempt = perform(connect_ms, request_ms);
+    const Attempt attempt =
+        perform(url_for(request_ms), connect_ms, request_ms);
     if (attempt.code == CURLE_OK && attempt.status == 200) {
       if (attempts != nullptr) *attempts = number;
       return parse_tsv(attempt.body);

@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -68,6 +69,11 @@ class _FakeClickHouse:
         # (statement prefix, seconds): answer every such statement that late,
         # with a 503 -- a failure the client retries for a read.
         self.unavailable: tuple[str, float] | None = None
+        # Called before the head read is answered, from the thread serving
+        # it.
+        self.before_head_answer = None
+        # When each statement arrived, by prefix of its body.
+        self.arrivals: list[tuple[float, str]] = []
         self._released = threading.Event()
         self._claimed = ""
         fake = self
@@ -79,6 +85,7 @@ class _FakeClickHouse:
                 settings = {key: values[-1] for key, values in
                             parse_qs(urlsplit(self.path).query).items()}
                 fake.requests.append((settings, body))
+                fake.arrivals.append((time.monotonic(), body))
                 if fake.stall is not None and body.startswith(fake.stall):
                     fake._released.wait(30)
                     return
@@ -99,6 +106,8 @@ class _FakeClickHouse:
                     answer = ""
                 elif body.startswith(HEAD):
                     answer = fake.head_rows
+                    if fake.before_head_answer is not None:
+                        fake.before_head_answer()
                 elif body.startswith(READ_BACK):
                     answer = f"{fake._claimed}\t1\t2\n"
                 else:
@@ -181,7 +190,8 @@ def test_the_lease_inserts_carry_the_time_left_as_a_server_cap(
     longer (lock_acquire_timeout), never later than the client's own
     deadline. A claim with no lease held has min(request timeout, TTL / 3);
     the tombstone, sent under the lease, what is left of the TTL less the
-    0.1 s margin. Whole seconds rounded down, a fraction only under one."""
+    0.1 s margin. To the millisecond, rounded down: whole seconds cut up to
+    a second off a healthy INSERT the client would still have waited for."""
     assert driver.open(lease_ttl_ns=ttl_ns, publish_timeout_ns=publish_ns)["ok"]
     claimed = driver.call(op="claim", holder="h", lease_id=str(uuid.uuid4()))
     assert claimed["ok"], claimed
@@ -192,9 +202,7 @@ def test_the_lease_inserts_carry_the_time_left_as_a_server_cap(
     lease_left = ttl_ns / 1e9 - 0.1
     for settings, bound in ((claim, claim_bound), (tombstone, lease_left)):
         cap = float(settings["max_execution_time"])
-        assert 0 < cap < bound, settings
-        # Rounded down to whole seconds from one up: 9.99 s left sends "9".
-        assert cap >= bound - 1 if bound > 1 else cap > bound - 0.05, settings
+        assert bound - 0.05 < cap <= bound, settings
         assert settings["lock_acquire_timeout"] == \
             settings["max_execution_time"], settings
         # break would insert whatever had been read by then.
@@ -217,8 +225,8 @@ def test_a_quorum_lease_insert_waits_no_longer_than_its_deadline(
 
     claim, tombstone = fake.inserts()
     # No lease yet: TTL / 3 = 4 s left, less than the 5 s publish timeout.
-    assert 3900 < int(claim["insert_quorum_timeout"]) < 4000, claim
-    assert claim["max_execution_time"] == "3", claim
+    assert 3900 < int(claim["insert_quorum_timeout"]) <= 4000, claim
+    assert 3.9 < float(claim["max_execution_time"]) <= 4.0, claim
     assert claim["insert_quorum"] == "2", claim
     # Under the lease, nearly 12 s are left: publish_timeout caps it.
     assert tombstone["insert_quorum_timeout"] == "5000", tombstone
@@ -386,6 +394,146 @@ def test_a_refusal_by_the_writers_own_claim_row_is_attributed_to_it(
         assert refused["own_claims"] is False, refused
     finally:
         other.close()
+
+
+class _Gate:
+    """A TCP forwarder in front of the fake that can stop listening for a
+    while, so that connections are refused -- a restarting catalog, or a
+    load balancer whose backend went away -- and then listen again on the
+    same port. One request is one connection for the native client."""
+
+    def __init__(self, target_port: int):
+        self._target = target_port
+        self.port = 0
+        self._listener: socket.socket | None = None
+        self._lock = threading.Lock()
+        self._open()
+
+    def _open(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", self.port))
+        listener.listen(64)
+        self.port = listener.getsockname()[1]
+        with self._lock:
+            self._listener = listener
+        threading.Thread(target=self._accept, args=(listener,),
+                         daemon=True).start()
+
+    def _accept(self, listener):
+        while True:
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                return
+            upstream = socket.create_connection(("127.0.0.1", self._target))
+            for source, sink in ((client, upstream), (upstream, client)):
+                threading.Thread(target=self._pump, args=(source, sink),
+                                 daemon=True).start()
+
+    @staticmethod
+    def _pump(source, sink):
+        try:
+            while True:
+                data = source.recv(65536)
+                if not data:
+                    break
+                sink.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for end in (source, sink):
+                try:
+                    end.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def _stop(self):
+        with self._lock:
+            listener, self._listener = self._listener, None
+        if listener is not None:
+            # shutdown() first: a close() alone leaves the socket listening
+            # while the accept thread still blocks on it.
+            try:
+                listener.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            listener.close()
+
+    def refuse_for(self, seconds: float):
+        """Stop listening now, and listen again `seconds` later."""
+        self._stop()
+        timer = threading.Timer(seconds, self._open)
+        timer.daemon = True
+        timer.start()
+
+    def close(self):
+        self._stop()
+
+
+@pytest.fixture
+def gate(fake):
+    forwarder = _Gate(fake.port)
+    yield forwarder
+    forwarder.close()
+
+
+@pytest.fixture
+def gated_driver(gate):
+    process = _Driver(gate.port)
+    yield process
+    process.close()
+
+
+def test_a_lease_insert_retried_after_refused_connections_carries_the_time_then_left(
+        fake, gate, gated_driver):
+    """A lease INSERT whose connection is refused is retried, since nothing
+    reached the server. The caps rode in the URL built once, before the
+    first attempt, so the attempt that got through told the server it had
+    the time left before the first: the server could run the claim past
+    the client's deadline by the refused attempts and their backoff. Each
+    attempt now carries the time left when it goes out."""
+    assert gated_driver.open(lease_ttl_ns=3_000_000_000,
+                             publish_timeout_ns=1_000_000_000)["ok"]
+    answered = []
+
+    def _refuse():
+        answered.append(time.monotonic())
+        gate.refuse_for(0.25)
+
+    fake.before_head_answer = _refuse
+    claimed = gated_driver.call(op="claim", holder="h",
+                                lease_id=str(uuid.uuid4()))
+    assert claimed["ok"], claimed
+    arrived, _ = next(arrival for arrival in fake.arrivals
+                      if arrival[1].startswith("INSERT"))
+    (settings,) = fake.inserts()
+    # Refused at once, then 0.1 s and 0.2 s of backoff: the third attempt.
+    assert arrived - answered[0] > 0.25, (arrived, answered)
+    cap = float(settings["max_execution_time"])
+    assert settings["lock_acquire_timeout"] == settings["max_execution_time"]
+    # The claim bound, 1 s at a 3 s TTL, counts from the INSERT's first
+    # attempt, just after the head read was answered.
+    assert arrived + cap <= answered[0] + 1.0 + 0.02, (arrived, cap, answered)
+
+
+def test_a_lease_insert_that_never_connected_wrote_nothing(
+        fake, gate, gated_driver):
+    """A claim INSERT whose every attempt was refused its connection cannot
+    have reached the server: its outcome is known, so the writer is not
+    quarantined and may claim again at once."""
+    assert gated_driver.open(lease_ttl_ns=3_000_000_000,
+                             publish_timeout_ns=1_000_000_000)["ok"]
+    fake.before_head_answer = lambda: gate.refuse_for(1.5)
+    refused = gated_driver.call(op="acquire", holder="h")
+    assert not refused["ok"], refused
+    assert refused["error"] == "ClickHouseError", refused
+    assert "connect" in refused["message"].lower(), refused
+    assert not fake.inserts(), fake.requests
+    fake.before_head_answer = None
+    time.sleep(1.6)
+    assert gated_driver.call(op="quarantined")["quarantined"] is False
+    assert gated_driver.call(op="acquire", holder="h")["ok"]
 
 
 # --- the storage service's configuration --------------------------------------

@@ -162,6 +162,13 @@ struct ClickHouseConnection {
 // contain the password.
 void validate(const ClickHouseConnection& connection);
 
+// Settings computed for each attempt of a statement from the time that
+// attempt is given -- the client's request timeout, cut to the
+// RequestDeadline in force -- in whole milliseconds. See execute().
+using AttemptSettings =
+    std::function<void(uint64_t attempt_ms,
+                       std::map<std::string, std::string>* settings)>;
+
 // Whether a statement only reads, judged by its first keyword: SELECT,
 // SHOW, DESCRIBE/DESC, EXISTS, CHECK, or WITH when the word INSERT appears
 // nowhere in the statement (ClickHouse reads `WITH ... INSERT INTO ...` as
@@ -222,10 +229,15 @@ class ClickHouseClient {
   //
   // `attempts`, when given, receives the number of requests the statement
   // took (1 without a retry); it is set only when execute() returns.
+  //
+  // `per_attempt`, when given, adds settings to each attempt from the time
+  // that attempt has, so that a server-side cap sent with a retry reflects
+  // the time left then, not before the first attempt (the lease INSERTs'
+  // max_execution_time, lease_coordinator.cpp).
   std::vector<Row> execute(
       const std::string& query, const Params& params = {},
       const std::map<std::string, std::string>& settings = {},
-      int* attempts = nullptr) const;
+      int* attempts = nullptr, const AttemptSettings& per_attempt = {}) const;
 
  private:
   ClickHouseConnection connection_;

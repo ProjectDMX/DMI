@@ -54,9 +54,11 @@ namespace dmi_catalog {
 // fails well inside a TTL. So is a request made under a lease whose deadline
 // has already passed (run() says why it is still sent).
 //
-// The lease INSERTs carry the time left before their deadline to the server
-// as max_execution_time and lock_acquire_timeout, and cap a quorum wait by
-// it, so the server abandons a claim no later than the client does.
+// Each attempt of a lease INSERT carries the time the client gives it -- the
+// time left before its deadline, recomputed for a retry -- to the server as
+// max_execution_time and lock_acquire_timeout, to the millisecond, and caps
+// a quorum wait by it, so the server abandons a claim when the client does
+// (up to the time the request took to reach the server).
 constexpr uint64_t kLeaseDeadlineMarginNs = 100'000'000ull;
 
 // The deadline of a lease whose claim INSERT was sent at `sent_ns` (steady
@@ -196,7 +198,9 @@ class LeaseCoordinator {
   std::vector<Row> run(const std::string& query, const Params& params,
                        std::map<std::string, std::string> settings,
                        bool write) const;
-  void add_write_caps(std::map<std::string, std::string>* settings) const;
+  // The server-side caps on a lease INSERT attempt given attempt_ms.
+  void add_write_caps(uint64_t attempt_ms,
+                      std::map<std::string, std::string>* settings) const;
 
   std::shared_ptr<const ClickHouseClient> client_;
   LeaseConfig config_;

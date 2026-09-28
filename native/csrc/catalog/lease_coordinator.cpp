@@ -12,20 +12,22 @@ namespace {
 // How many recent claim lease_ids to remember (see claimed_ids_).
 constexpr size_t kClaimHistory = 16;
 
-// A Seconds setting from whole milliseconds. Whole seconds wherever the
-// value allows -- what every server parses, and what publish_timeout_ns
-// already requires -- rounded DOWN, so the server's cap never exceeds the
-// client's deadline. Only a time under a second goes out as a fraction,
-// which current servers parse, for max_execution_time and
-// lock_acquire_timeout alike (checked on 25.12). Never "0": ClickHouse reads
-// a zero max_execution_time as no limit at all.
+// A Seconds setting from whole milliseconds, to the millisecond ("1.999",
+// "0.25", "4"): fractional seconds, which the server parses for
+// max_execution_time and lock_acquire_timeout alike (checked on 25.12).
+// Rounding down to whole seconds cut up to a second off an INSERT the
+// client was still waiting for, so the server aborted healthy claims.
+// Never "0": ClickHouse reads a zero max_execution_time as no limit at all.
 std::string seconds_setting(uint64_t ms) {
-  if (ms >= 1000) return std::to_string(ms / 1000);
   ms = std::max<uint64_t>(ms, 1);
-  char out[8];
-  std::snprintf(out, sizeof(out), "0.%03u", static_cast<unsigned>(ms));
-  std::string text(out);
-  while (text.back() == '0') text.pop_back();
+  std::string text = std::to_string(ms / 1000);
+  if (ms % 1000 != 0) {
+    char fraction[8];
+    std::snprintf(fraction, sizeof(fraction), ".%03u",
+                  static_cast<unsigned>(ms % 1000));
+    text += fraction;
+    while (text.back() == '0') text.pop_back();
+  }
   return text;
 }
 
@@ -99,22 +101,27 @@ std::vector<Row> LeaseCoordinator::run(
   const RequestDeadline deadline(
       live ? lease_->deadline_ns : now + claim_bound_ns_,
       live ? std::string(kLeaseDeadlineBound) : claim_bound_text_);
-  if (write) add_write_caps(&settings);
-  return client_->execute(query, params, settings);
+  if (!write) return client_->execute(query, params, settings);
+  return client_->execute(
+      query, params, settings, nullptr,
+      [this](uint64_t attempt_ms, std::map<std::string, std::string>* caps) {
+        add_write_caps(attempt_ms, caps);
+      });
 }
 
 void LeaseCoordinator::add_write_caps(
-    std::map<std::string, std::string>* settings) const {
+    uint64_t attempt_ms, std::map<std::string, std::string>* settings) const {
   // A lease INSERT the client gave up on (a timeout, so an unknown outcome)
   // must not land afterwards: a claim row stamped then outlives the
-  // quarantine meant to cover it. So the server gets the time left before
-  // the request's deadline -- the tightest in force, as the client computes
-  // it -- and abandons the statement then: max_execution_time for running
-  // it, lock_acquire_timeout for waiting on the table lock before it starts,
-  // and throw, not break, since break would insert what had been read so
-  // far. The quorum wait is bounded by insert_quorum_timeout alone, so that
-  // is capped too, as well as by publish_timeout as before: past the
-  // deadline nobody is listening.
+  // quarantine meant to cover it. So the server gets the time the client
+  // gives the attempt -- its request timeout cut to the tightest deadline in
+  // force, computed afresh for every attempt, so a retry after a refused
+  // connection carries the time left then -- and abandons the statement
+  // then: max_execution_time for running it, lock_acquire_timeout for
+  // waiting on the table lock before it starts, and throw, not break, since
+  // break would insert what had been read so far. The quorum wait is bounded
+  // by insert_quorum_timeout alone, so that is capped too, as well as by
+  // publish_timeout as before: past the deadline nobody is listening.
   //
   // What the caps do not cover: ClickHouse checks max_execution_time only at
   // designated points while the pipeline runs, so the part commit can
@@ -123,19 +130,15 @@ void LeaseCoordinator::add_write_caps(
   // up to that delay after the client gave up. The storage service
   // therefore does not count a refusal by its own claim rows towards its
   // 2 x TTL latch (refused_by_own_claims()).
-  const uint64_t deadline = RequestDeadline::current();  // run() set one
-  const uint64_t now = steady_now_ns();
-  // 0 when the deadline has passed; execute() then sends nothing.
-  const uint64_t left_ms = deadline > now ? (deadline - now) / 1'000'000 : 0;
   if (config_.insert_quorum.has_value()) {
     (*settings)["insert_quorum"] = std::to_string(*config_.insert_quorum);
     (*settings)["insert_quorum_parallel"] = "0";
     (*settings)["insert_quorum_timeout"] = std::to_string(std::max<uint64_t>(
-        std::min<uint64_t>(config_.publish_timeout_ns / 1'000'000, left_ms),
+        std::min<uint64_t>(config_.publish_timeout_ns / 1'000'000, attempt_ms),
         1));
   }
-  (*settings)["max_execution_time"] = seconds_setting(left_ms);
-  (*settings)["lock_acquire_timeout"] = seconds_setting(left_ms);
+  (*settings)["max_execution_time"] = seconds_setting(attempt_ms);
+  (*settings)["lock_acquire_timeout"] = seconds_setting(attempt_ms);
   (*settings)["timeout_overflow_mode"] = "throw";
 }
 
