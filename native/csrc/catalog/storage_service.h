@@ -229,7 +229,13 @@ class CaptureStorageService {
   // (keep_lease_in_pass). A lease whose deadline has passed is abandoned on
   // the way in and on the way out, so it is neither used nor reported held;
   // the lease state is published on the way out. Every use of writer_'s
-  // lease goes through one.
+  // lease goes through one but the schema install's at start(), before
+  // anything else can use the coordinator: CatalogSchema::ensure() claims,
+  // renews and releases its install lease there directly, its DDL bounded
+  // by the client's timeouts rather than by that lease's deadline, and an
+  // install claim that timed out is retried, not quarantined -- a row of it
+  // that lands late refuses start()'s own claim until it expires, which
+  // start() waits out like any holder's.
   class LeaseScope;
 
   void loop();
@@ -285,9 +291,10 @@ class CaptureStorageService {
   // is not thread-safe. Timed, so flush() can give up at its deadline while
   // a cycle is still in flight.
   std::timed_mutex cycle_mutex_;
-  // Serialises every use of writer_'s lease: the lease thread renews it
-  // while cycles publish. Taken inside cycle_mutex_, never the other way,
-  // and only through a LeaseScope.
+  // Serialises every use of writer_'s lease (but the schema install's at
+  // start(), see LeaseScope): the lease thread renews it while cycles
+  // publish. Taken inside cycle_mutex_, never the other way, and only
+  // through a LeaseScope.
   std::mutex lease_mutex_;
   // Lease claims and renewals timed out since the last that succeeded.
   // Guarded by lease_mutex_.

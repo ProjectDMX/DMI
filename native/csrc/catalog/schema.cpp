@@ -604,10 +604,22 @@ bool CatalogSchema::take_the_install_lease(LeaseCoordinator* leases,
       static_cast<double>(leases->ttl_ns()) / 1e9 + kInstallLeaseMarginS;
   const int attempts =
       std::max(1, static_cast<int>(std::ceil(budget_s / kInstallLeaseRetryS)));
-  for (int attempt = 0; attempt < attempts; ++attempt) {
+  const uint64_t give_up_ns =
+      steady_now_ns() + static_cast<uint64_t>(budget_s * 1e9);
+  for (int attempt = 0; attempt < attempts;) {
     try {
       leases->acquire("ensure_schema");
       return true;
+    } catch (const ClickHouseError& e) {
+      // A claim that timed out: each of its requests has min(request
+      // timeout, TTL / 3), and a fresh catalog's first start -- when the
+      // server is likeliest to be cold -- can outlast that. Retried within
+      // the same budget, in time rather than attempts, since one attempt
+      // can take a TTL. One whose INSERT may have landed can be refused by
+      // that row when it does: the refusal branch below waits it out.
+      if (!e.timed_out() || steady_now_ns() >= give_up_ns) throw;
+      std::this_thread::sleep_for(std::chrono::nanoseconds(retry_sleep_ns));
+      continue;
     } catch (const CatalogError& e) {
       if (e.kind() != CatalogError::Kind::kHeld) throw;
       if (verify_compatibility() == "complete") {
@@ -617,7 +629,7 @@ bool CatalogSchema::take_the_install_lease(LeaseCoordinator* leases,
         stamp();
         return false;
       }
-      if (attempt + 1 == attempts) throw;
+      if (++attempt == attempts) throw;
       std::this_thread::sleep_for(
           std::chrono::nanoseconds(retry_sleep_ns));
     }

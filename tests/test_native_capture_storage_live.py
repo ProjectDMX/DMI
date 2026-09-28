@@ -1387,24 +1387,30 @@ def _lease_head_read(request: bytes) -> bool:
     return b"SELECT term, toString(lease_id)" in request
 
 
+@pytest.mark.parametrize("schema", ["installed", "fresh"])
 def test_start_survives_a_first_lease_read_slower_than_its_bound(
-        fake_s3, tmp_path):
+        fake_s3, tmp_path, schema):
     """A claim made without a lease has min(clickhouse_request_timeout_s,
     lease_ttl_s / 3) per request, and a cold server's first read can take
     longer. start() failed outright when its claim timed out; it now retries
     one that did, as it retries one another holder refused, until
     start_lease_wait_s runs out. A head read that timed out wrote nothing,
-    so it does not quarantine the writer and the retry need not wait."""
+    so it does not quarantine the writer and the retry need not wait. On a
+    fresh catalog the first lease read is the schema install's claim, and
+    that is the first start against a new catalog -- when the server is
+    likeliest to be cold -- so it is retried the same way, within the
+    install lease's own wait."""
     switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
     with _catalog() as (_client, catalog):
         knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
                      publish_timeout_s=1)
-        # The schema first, directly: then the service's own claim is the
-        # first lease read through the switch.
-        warm = _service(_storage_config(fake_s3, catalog.table_prefix,
-                                        **knobs), tmp_path / "warm")
-        warm.start()
-        warm.stop()
+        if schema == "installed":
+            # The schema first, directly: then the service's own claim is
+            # the first lease read through the switch.
+            warm = _service(_storage_config(fake_s3, catalog.table_prefix,
+                                            **knobs), tmp_path / "warm")
+            warm.start()
+            warm.stop()
 
         switch.slow_once(_lease_head_read, 1.5)  # past the 1 s claim bound
         service = _service(_storage_config(
@@ -1416,9 +1422,12 @@ def test_start_survives_a_first_lease_read_slower_than_its_bound(
             elapsed = time.monotonic() - started
             snapshot = service.snapshot()
             assert snapshot["lease_state"] == "held", snapshot
-            # Retried at once, without waiting out a 3 s quarantine.
-            assert 1.0 <= elapsed < 2.5, elapsed
-            assert "Timeout" in snapshot["last_error"], snapshot
+            # Retried at once (the install claim after its 0.5 s retry
+            # sleep), without waiting out a 3 s quarantine.
+            assert 1.0 <= elapsed < 3.0, elapsed
+            if schema == "installed":
+                # The schema install records no error of its own.
+                assert "Timeout" in snapshot["last_error"], snapshot
         finally:
             service.stop()
             switch.close()
