@@ -163,12 +163,12 @@ class MonitoringConfig:
     # the sink stages to the object store and indexes it into the ClickHouse
     # catalog, and ``flush_and_wait`` returns only once they are queryable
     # (raising TimeoutError when they are not by its timeout). ``close()``
-    # drains it too, best effort, within the config's
-    # ``close_flush_timeout_s``. Unset, packs stay in the spool for
-    # something else to drain; the sink's open pack reaches the spool when
-    # the ring releases the sink at close. Needs
-    # ``storage_backend="persistent"`` and ``capture_sink_config``, whose
-    # spool it drains.
+    # drains it too, best effort, for the config's ``close_flush_timeout_s``
+    # -- whose comment says by how much the drain can outlast it. Unset,
+    # packs stay in the spool for something else to drain; the sink's open
+    # pack reaches the spool when the ring releases the sink at close.
+    # Needs ``storage_backend="persistent"`` and ``capture_sink_config``,
+    # whose spool it drains.
     capture_storage_config: Optional["NativeCaptureStorageConfig"] = None
 
     storage_backend: StorageBackend = "auto"

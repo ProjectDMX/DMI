@@ -278,13 +278,14 @@ class NativeCaptureStorageConfig:
     # statements are never cut, each bounded by that timeout (under the
     # publisher lease, by the lease's deadline when that is sooner).
     # Stopping the service then releases the lease: one more catalog
-    # request, bounded the same way. So against a catalog or an object
-    # store that stopped answering, close() outlasts the budget by up to
-    # about two request timeouts; against a slow catalog that still
-    # answers, by one batch of statements and the release. When the sink
-    # itself is stuck, the flush its release from the ring makes adds up
-    # to 30 s. close() logs what did not drain; flush_and_wait is what
-    # raises.
+    # request, bounded the same way -- or, when a lease renewal is in
+    # flight, that renewal, which it waits for (a lease the renewal loses
+    # needs no release). So against a catalog or an object store that
+    # stopped answering, close() outlasts the budget by up to about two
+    # request timeouts; against a slow catalog that still answers, by one
+    # batch of statements and the release. When the sink itself is stuck,
+    # the flush its release from the ring makes adds up to 30 s. close()
+    # logs what did not drain; flush_and_wait is what raises.
     close_flush_timeout_s: float = 60.0
     # Bytes of packs the uploader holds in flight at once. A staged pack
     # larger than this is never uploaded, so the sink's max_pack_bytes must
