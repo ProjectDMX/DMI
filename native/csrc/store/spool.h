@@ -182,9 +182,11 @@ bool SpoolOwnedByThisProcess(const std::string& dir);
 // released with the object (or Release()), and by the kernel when the
 // process dies. flock binds to an open file description, which a child
 // shares after fork(): the descriptor is close-on-exec, and a child forked
-// WITHOUT exec (a fork-started worker) closes its copy of every held lock
-// at once (pthread_atfork), so the lock never outlives its owner in a child
-// -- the owner's own hold is untouched, and the child's objects read as not
+// WITHOUT exec (a fork-started worker) closes its copy of every lock
+// descriptor at once (pthread_atfork) -- held, or opened and not yet locked
+// or not yet closed, since a fork from another thread can land anywhere in
+// a take or a release -- so the lock never outlives its owner in a child.
+// The owner's own hold is untouched, and the child's objects read as not
 // held. A child the owner spawns through posix_spawn or vfork runs no
 // atfork handler, and loses the descriptor at exec.
 class SpoolOwnerLock {
@@ -215,7 +217,7 @@ class SpoolOwnerLock {
   static SpoolStatus TryAdopt(const std::string& dir, SpoolOwnerLock* out,
                               std::string* error);
 
-  bool held() const { return fd_ >= 0; }
+  bool held() const;
   // The canonical path of the directory, while held.
   const std::string& directory() const { return dir_; }
 
@@ -228,17 +230,16 @@ class SpoolOwnerLock {
   bool ReleaseAndRemoveIfEmpty(std::string* error);
 
  private:
-  // Sets fd_ and dir_, and registers the lock for the fork handler.
+  // Takes over `fd`, which the fork handler has tracked since its open().
   void Hold(int fd, std::string dir);
-  // The registry of held locks in this binary, and its fork handlers.
-  static void Track(SpoolOwnerLock* lock);
-  static void Untrack(SpoolOwnerLock* lock);
-  static void BeforeFork();
-  static void AfterForkInParent();
-  static void AfterForkInChild();
 
   int fd_ = -1;
   std::string dir_;
+  // The fork generation the lock was taken in (spool.cpp): in a forked
+  // child, whose copies of the descriptors the fork handler closed, the
+  // object reads as not held, and never closes a descriptor number the
+  // child may have reused since.
+  uint64_t generation_ = 0;
 };
 
 // Where a spool's packs go: the catalog -- its ClickHouse server, database

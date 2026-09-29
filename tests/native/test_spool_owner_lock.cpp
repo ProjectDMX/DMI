@@ -328,6 +328,67 @@ void TestAForkedChildDoesNotKeepTheLockPastItsParent() {
   ::kill(worker, SIGKILL);
 }
 
+// (3c) A fork from another thread while a lock is being TAKEN: the child
+// gets a copy of the lock file's descriptor between its open() and the
+// flock -- the flock then locks the description both share. Registered
+// with the fork handler only once the lock was held, that copy was never
+// closed in the child, which kept the directory looking live after its
+// owner died. Here the fork runs in that window, through the lock-open
+// test seam.
+void TestAForkWhileALockIsTakenLeavesTheChildNothing() {
+  const std::string root = FreshRoot("fork-window") + "/spool";
+  fs::create_directories(root);
+  int ready[2];
+  CHECK(::pipe(ready) == 0);
+  const pid_t owner = ::fork();
+  if (owner == 0) {
+    ::close(ready[0]);
+    pid_t worker = -1;
+    dmi_store::SetLockOpenHookForTesting([&](const std::string&) {
+      if (worker >= 0) return;
+      worker = ::fork();  // no exec
+      if (worker == 0) {
+        ::pause();  // outlives its parent until killed
+        ::_exit(0);
+      }
+    });
+    SpoolOwnerLock lock;
+    std::string error;
+    const bool ok =
+        SpoolOwnerLock::TryAdopt(root, &lock, &error) == SpoolStatus::kOk;
+    dmi_store::SetLockOpenHookForTesting(nullptr);
+    char text[32];
+    const int n = std::snprintf(text, sizeof(text), "%c%d\n", ok ? 'k' : 'x',
+                                static_cast<int>(worker));
+    if (::write(ready[1], text, n) != n) ::_exit(3);
+    ::pause();  // until killed
+    ::_exit(0);
+  }
+  ::close(ready[1]);
+  std::string seen;
+  char byte = 0;
+  while (seen.find('\n') == std::string::npos &&
+         ::read(ready[0], &byte, 1) == 1) {
+    seen.push_back(byte);
+  }
+  ::close(ready[0]);
+  CHECK(!seen.empty() && seen[0] == 'k');
+  const pid_t worker =
+      static_cast<pid_t>(std::atoi(seen.empty() ? "" : seen.c_str() + 1));
+  CHECK(worker > 0);
+  dmi_store::SpoolOwner record;
+  CHECK(dmi_store::ReadSpoolOwner(root, &record));
+  CHECK(record.pid == owner);
+
+  ::kill(owner, SIGKILL);
+  int status = 0;
+  ::waitpid(owner, &status, 0);
+  CHECK(worker > 0 && ::kill(worker, 0) == 0);  // the worker lives on
+  // And the lock went with its owner.
+  CHECK(!dmi_store::ReadSpoolOwner(root, nullptr));
+  if (worker > 0) ::kill(worker, SIGKILL);
+}
+
 // (4) Nesting, both ways.
 void TestNestedDirectoriesAreRefused() {
   const std::string base = FreshRoot("nested");
@@ -809,6 +870,7 @@ int main() {
   TestTheLockGoesWithItsSpool();
   TestASecondProcessIsRefusedUntilTheHolderDies();
   TestAForkedChildDoesNotKeepTheLockPastItsParent();
+  TestAForkWhileALockIsTakenLeavesTheChildNothing();
   TestNestedDirectoriesAreRefused();
   TestAnOuterAndANestedTakeRacingNeverBothWin();
   TestAStaleLockFileAboveDoesNotRefuseANestedDirectory();

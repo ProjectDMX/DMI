@@ -633,6 +633,61 @@ bool SpoolOwnedByThisProcess(const std::string& dir) {
 
 namespace {
 
+// Every descriptor this binary has open on a spool owner lock file: held,
+// or between its open() and its flock, or on its way to close(). The fork
+// handlers close the child's copies of all of them. Tracking starts at the
+// open() and ends at the close(), each under the mutex that BeforeFork
+// takes, so no fork -- from any thread, at any point of a take or a
+// release -- hands a child a copy the handler does not know of: a copy
+// made before the flock shares the description the flock then locks.
+// Leaked on purpose, so no static destructor runs while one is open. Each
+// binary that compiles spool.cpp (the store and sink extensions, the
+// drivers) keeps its own set and its own handlers, for its own descriptors.
+std::mutex& LockDescriptorsMutex() {
+  static std::mutex* mutex = new std::mutex;
+  return *mutex;
+}
+std::unordered_set<int>& LockDescriptors() {
+  static auto* descriptors = new std::unordered_set<int>;
+  return *descriptors;
+}
+// Bumped in each forked child, where every SpoolOwnerLock taken before the
+// fork then reads as released (SpoolOwnerLock::held).
+std::atomic<uint64_t> g_fork_generation{0};
+
+void BeforeForkLockDescriptors() { LockDescriptorsMutex().lock(); }
+void AfterForkLockDescriptorsInParent() { LockDescriptorsMutex().unlock(); }
+void AfterForkLockDescriptorsInChild() {
+  // Close, never LOCK_UN: an unlock on the shared description would drop
+  // the parent's hold too, and closing one of its descriptors does not.
+  for (const int fd : LockDescriptors()) ::close(fd);
+  LockDescriptors().clear();
+  g_fork_generation.fetch_add(1, std::memory_order_relaxed);
+  LockDescriptorsMutex().unlock();
+}
+
+int OpenLockDescriptor(const char* path, int flags, mode_t mode) {
+  static std::once_flag handlers;
+  std::call_once(handlers, [] {
+    ::pthread_atfork(&BeforeForkLockDescriptors,
+                     &AfterForkLockDescriptorsInParent,
+                     &AfterForkLockDescriptorsInChild);
+  });
+  std::lock_guard<std::mutex> guard(LockDescriptorsMutex());
+  const int fd = ::open(path, flags, mode);
+  const int failure = errno;
+  if (fd >= 0) LockDescriptors().insert(fd);
+  errno = failure;
+  return fd;
+}
+
+void CloseLockDescriptor(int fd) {
+  if (fd < 0) return;
+  std::lock_guard<std::mutex> guard(LockDescriptorsMutex());
+  LockDescriptors().erase(fd);
+  ::close(fd);  // closing the last descriptor unlocks
+}
+
 // Locks the lock file of an existing directory, creating the file if it has
 // none. Retries a lock lost to a remover's unlink, and a refusal as brief as
 // another process's ReadSpoolOwner probe.
@@ -640,7 +695,8 @@ SpoolStatus LockInPlace(const std::string& dir, int* fd_out,
                         std::string* error) {
   const std::string file = dir + "/" + kOwnerLockFile;
   for (int attempt = 0; attempt < 8; ++attempt) {
-    const int fd = ::open(file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    const int fd =
+        OpenLockDescriptor(file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) {
       if (error) *error = "cannot open " + file + ": " + Errno(errno);
       return SpoolStatus::kIo;
@@ -650,7 +706,7 @@ SpoolStatus LockInPlace(const std::string& dir, int* fd_out,
       const int failure = errno;
       SpoolOwner owner;
       ReadOwnerRecord(fd, &owner);
-      ::close(fd);
+      CloseLockDescriptor(fd);
       if (failure != EWOULDBLOCK) {
         if (error) *error = "cannot lock " + file + ": " + Errno(failure);
         return SpoolStatus::kIo;
@@ -663,7 +719,7 @@ SpoolStatus LockInPlace(const std::string& dir, int* fd_out,
       return SpoolStatus::kOwned;
     }
     if (!IsFileAt(fd, file)) {
-      ::close(fd);
+      CloseLockDescriptor(fd);
       if (!fs::is_directory(dir)) {
         if (error) *error = "spool directory " + dir + " was removed while "
                             "it was being locked";
@@ -703,11 +759,11 @@ SpoolStatus CreateLocked(const std::string& dir, int* fd_out,
       return SpoolStatus::kIo;
     }
     const std::string file = staging + "/" + kOwnerLockFile;
-    const int fd =
-        ::open(file.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    const int fd = OpenLockDescriptor(
+        file.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
     if (fd < 0 || ::flock(fd, LOCK_EX | LOCK_NB) != 0) {
       const int failure = errno;
-      if (fd >= 0) ::close(fd);
+      CloseLockDescriptor(fd);
       ::unlink(file.c_str());
       ::rmdir(staging.c_str());
       if (error) *error = "cannot lock " + file + ": " + Errno(failure);
@@ -737,7 +793,7 @@ SpoolStatus CreateLocked(const std::string& dir, int* fd_out,
 #endif
     if (renamed != 0) {
       const int failure = errno;
-      ::close(fd);
+      CloseLockDescriptor(fd);
       ::unlink(file.c_str());
       ::rmdir(staging.c_str());
       if (failure == EEXIST || failure == ENOTEMPTY) {
@@ -759,91 +815,48 @@ SpoolStatus CreateLocked(const std::string& dir, int* fd_out,
 
 }  // namespace
 
-namespace {
-// Every held SpoolOwnerLock in this binary. Leaked on purpose, so no
-// static destructor runs while a lock is still registered. Each binary
-// that compiles spool.cpp (the store and sink extensions, the drivers)
-// keeps its own registry and its own fork handlers, for its own locks.
-std::mutex& LockRegistryMutex() {
-  static std::mutex* mutex = new std::mutex;
-  return *mutex;
-}
-std::unordered_set<SpoolOwnerLock*>& LockRegistry() {
-  static auto* registry = new std::unordered_set<SpoolOwnerLock*>;
-  return *registry;
-}
-}  // namespace
-
-void SpoolOwnerLock::BeforeFork() { LockRegistryMutex().lock(); }
-void SpoolOwnerLock::AfterForkInParent() { LockRegistryMutex().unlock(); }
-
-void SpoolOwnerLock::AfterForkInChild() {
-  // Close, never LOCK_UN: an unlock on the shared description would drop
-  // the parent's hold too, and closing one of its descriptors does not.
-  for (SpoolOwnerLock* lock : LockRegistry()) {
-    ::close(lock->fd_);
-    lock->fd_ = -1;
-    lock->dir_.clear();
-  }
-  LockRegistry().clear();
-  LockRegistryMutex().unlock();
-}
-
-void SpoolOwnerLock::Track(SpoolOwnerLock* lock) {
-  static std::once_flag handlers;
-  std::call_once(handlers, [] {
-    ::pthread_atfork(&SpoolOwnerLock::BeforeFork,
-                     &SpoolOwnerLock::AfterForkInParent,
-                     &SpoolOwnerLock::AfterForkInChild);
-  });
-  std::lock_guard<std::mutex> guard(LockRegistryMutex());
-  LockRegistry().insert(lock);
-}
-
-void SpoolOwnerLock::Untrack(SpoolOwnerLock* lock) {
-  std::lock_guard<std::mutex> guard(LockRegistryMutex());
-  LockRegistry().erase(lock);
-}
-
 void SpoolOwnerLock::Hold(int fd, std::string dir) {
   fd_ = fd;
   dir_ = std::move(dir);
-  Track(this);
+  generation_ = g_fork_generation.load(std::memory_order_relaxed);
+}
+
+bool SpoolOwnerLock::held() const {
+  return fd_ >= 0 &&
+         generation_ == g_fork_generation.load(std::memory_order_relaxed);
 }
 
 SpoolOwnerLock::~SpoolOwnerLock() { Release(); }
 
 SpoolOwnerLock::SpoolOwnerLock(SpoolOwnerLock&& other) noexcept {
   if (other.held()) {
-    const int fd = other.fd_;
-    std::string dir = std::move(other.dir_);
-    Untrack(&other);
-    other.fd_ = -1;
-    other.dir_.clear();
-    Hold(fd, std::move(dir));
+    fd_ = other.fd_;
+    dir_ = std::move(other.dir_);
+    generation_ = other.generation_;
   }
+  other.fd_ = -1;
+  other.dir_.clear();
 }
 
 SpoolOwnerLock& SpoolOwnerLock::operator=(SpoolOwnerLock&& other) noexcept {
   if (this != &other) {
     Release();
     if (other.held()) {
-      const int fd = other.fd_;
-      std::string dir = std::move(other.dir_);
-      Untrack(&other);
-      other.fd_ = -1;
-      other.dir_.clear();
-      Hold(fd, std::move(dir));
+      fd_ = other.fd_;
+      dir_ = std::move(other.dir_);
+      generation_ = other.generation_;
     }
+    other.fd_ = -1;
+    other.dir_.clear();
   }
   return *this;
 }
 
 void SpoolOwnerLock::Release() {
-  if (fd_ >= 0) {
-    Untrack(this);
-    ::close(fd_);  // closing the last descriptor unlocks
-  }
+  // Untracked and closed in one step (CloseLockDescriptor). In a forked
+  // child the fork handler closed the descriptor already, and its number
+  // may be another file's by now: nothing to close.
+  if (held()) CloseLockDescriptor(fd_);
   fd_ = -1;
   dir_.clear();
 }
