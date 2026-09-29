@@ -6,8 +6,8 @@
 //
 // One background thread runs a cycle: upload what is pending and index it, a
 // chunk at a time, keep the publisher lease alive, and periodically reconcile
-// the bucket against the catalog. The conformance drivers exercise each of these
-// pieces; this is what composes them outside a test.
+// the bucket against the catalog. The conformance drivers exercise each of
+// these pieces; this is what composes them outside a test.
 //
 // SpoolUploader removes a pack from the spool the moment its upload is
 // verified, before anything indexes it, so the spool alone cannot say what is
@@ -160,8 +160,8 @@ struct StorageServiceConfig {
   // the uploads in flight do not stop when the lease is lost: a holder that
   // is quarantined, or refused a renewal or publish, while a chunk is in
   // flight finishes that chunk (which can outlast the TTL), and uploads
-  // nothing more while it holds no lease. One whose catalog
-  // requests stall gives the lease up at its deadline, before its row
+  // nothing more while it holds no lease. One whose catalog requests
+  // stall gives the lease up at its deadline, before its row
   // lapses: requests made under the lease are cut off there, and a cycle's
   // check abandons a lease past it (LeaseScope), so no chunk starts after
   // that. Only a holder whose whole process stalls keeps the lease locally
