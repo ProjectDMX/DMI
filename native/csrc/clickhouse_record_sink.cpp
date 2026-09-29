@@ -214,7 +214,10 @@ void ClickHouseRecordSink::submit(ring::RecordEnvelope envelope) {
             }
         }
 
-        submit_row_(std::move(row), accounted_bytes);
+        // Empty tensors still publish a row (for example an empty weight shard).
+        // The host batching queue requires a positive accounting size; charging
+        // one byte does not add bytes to the actual tensor payload.
+        submit_row_(std::move(row), accounted_bytes == 0 ? 1 : accounted_bytes);
     }
 }
 

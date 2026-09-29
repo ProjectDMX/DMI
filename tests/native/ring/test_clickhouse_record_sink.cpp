@@ -179,12 +179,35 @@ static void test_zero_dimensional_tensor_materialization() {
     EXPECT(sizes == std::vector<std::uint64_t>({sizeof(float)}));
 }
 
+static void test_empty_tensor_has_nonzero_queue_charge() {
+    std::vector<dmx_host::GenericRecordRow> rows;
+    std::vector<std::uint64_t> sizes;
+    dmx_host::ClickHouseRecordSink sink(
+        [&](dmx_host::GenericRecordRow row, std::uint64_t size) {
+            rows.push_back(std::move(row));
+            sizes.push_back(size);
+        },
+        [](ring::RecordSink::Duration) { return true; }, [] {});
+    ring::RecordDescriptor descriptor;
+    descriptor.layout = "empty_tensor";
+    descriptor.rows = {{std::vector<ring::EncodedRecordCell>{
+        tensor_slice(0, 0, {0, 3})}}};
+    sink.submit(ring::RecordEnvelope{
+        std::move(descriptor), at::empty({0}, at::TensorOptions().dtype(at::kByte))});
+    EXPECT(rows.size() == 1);
+    const auto tensor = std::get<at::Tensor>(rows[0].cells[0]);
+    EXPECT(tensor.sizes().vec() == std::vector<std::int64_t>({0, 3}));
+    EXPECT(tensor.numel() == 0);
+    EXPECT(sizes == std::vector<std::uint64_t>({1}));
+}
+
 int main() {
     setbuf(stdout, nullptr);
     std::printf("test_clickhouse_record_sink\n");
     test_materializes_only_inside_clickhouse_adapter();
     test_scalar_materialization_and_failure_delegation();
     test_zero_dimensional_tensor_materialization();
+    test_empty_tensor_has_nonzero_queue_charge();
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
