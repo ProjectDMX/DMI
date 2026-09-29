@@ -583,6 +583,29 @@ void TestAdoptionLocksOnlyWhatExistsAndIsDead() {
   CHECK(fs::exists(base + "/kept/.owner.lock"));
 }
 
+// (6b) A lock taken on a file a remover unlinked meanwhile guards nothing
+// (ReleaseAndRemoveIfEmpty unlinks the lock file, then removes the
+// directory), so it is let go and the file at the path is locked instead.
+void TestALockOnAnUnlinkedFileIsTakenAgain() {
+  const std::string dir = FreshRoot("unlinked") + "/spool";
+  fs::create_directories(dir);
+  std::ofstream(dir + "/.owner.lock") << "";
+  int calls = 0;
+  dmi_store::SetLockOpenHookForTesting([&calls](const std::string& file) {
+    if (calls++ == 0) ::unlink(file.c_str());  // the remover's unlink
+  });
+  SpoolOwnerLock lock;
+  std::string error;
+  CHECK(SpoolOwnerLock::TryAdopt(dir, &lock, &error) == SpoolStatus::kOk);
+  dmi_store::SetLockOpenHookForTesting(nullptr);
+  CHECK(calls == 2);
+  CHECK(lock.held());
+  // What is held is the lock file at the path, which anyone else meets.
+  CHECK(dmi_store::ReadSpoolOwner(dir, nullptr));
+  SpoolOwnerLock rival;
+  CHECK(SpoolOwnerLock::TryAdopt(dir, &rival, &error) == SpoolStatus::kOwned);
+}
+
 void TestANewDirectoryAppearsWithItsLockHeld() {
   // Created beside its lock file and renamed into place, so no scan of the
   // parent can meet the directory before its owner holds it.
@@ -678,6 +701,7 @@ int main() {
   TestAnUnheldClaimStagingDirectoryRefusesNothing();
   TestSharedFilesystemsAreRefusedUnlessAllowed();
   TestAdoptionLocksOnlyWhatExistsAndIsDead();
+  TestALockOnAnUnlinkedFileIsTakenAgain();
   TestANewDirectoryAppearsWithItsLockHeld();
   TestTheDirectoryLayout();
   if (g_failures != 0) {

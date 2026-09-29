@@ -134,6 +134,11 @@ SpoolStatus CheckNodeLocal(const std::string& dir,
 // calling statfs(2). A negative value restores statfs.
 void SetFilesystemTypeForTesting(int64_t f_type);
 
+// Test seam: taking an existing directory's lock calls `hook` with the lock
+// file's path after opening the file and before locking it -- the window in
+// which a remover can unlink it. An empty function removes the hook.
+void SetLockOpenHookForTesting(std::function<void(const std::string&)> hook);
+
 // The holder recorded in a directory's owner lock file.
 struct SpoolOwner {
   std::string host;

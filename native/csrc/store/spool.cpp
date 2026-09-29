@@ -52,6 +52,10 @@ constexpr uint32_t kSmb2SuperMagic = 0xFE534D42;
 constexpr uint32_t kFuseSuperMagic = 0x65735546;
 
 std::atomic<int64_t> g_filesystem_type_for_testing{-1};
+std::function<void(const std::string&)>& LockOpenHookForTesting() {
+  static auto* hook = new std::function<void(const std::string&)>;
+  return *hook;
+}
 
 // Whether a recursive walk of a spool root is at <root>/_refs, which no scan
 // enters.
@@ -460,6 +464,10 @@ void SetFilesystemTypeForTesting(int64_t f_type) {
   g_filesystem_type_for_testing.store(f_type);
 }
 
+void SetLockOpenHookForTesting(std::function<void(const std::string&)> hook) {
+  LockOpenHookForTesting() = std::move(hook);
+}
+
 SpoolStatus CheckNodeLocal(const std::string& dir,
                            bool allow_shared_filesystem, std::string* error) {
   int64_t f_type = g_filesystem_type_for_testing.load();
@@ -584,6 +592,7 @@ SpoolStatus LockInPlace(const std::string& dir, int* fd_out,
       if (error) *error = "cannot open " + file + ": " + Errno(errno);
       return SpoolStatus::kIo;
     }
+    if (LockOpenHookForTesting()) LockOpenHookForTesting()(file);
     if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
       const int failure = errno;
       SpoolOwner owner;

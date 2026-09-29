@@ -285,6 +285,34 @@ def test_a_dropped_spool_claim_keeps_its_directory_owned(tmp_path):
     assert _store().spool_owner(directory) is None
 
 
+def test_releasing_a_claim_removes_its_directory_once_drained(tmp_path):
+    """SpoolClaim.release() is how the engine lets go of its directory: a
+    drained one is removed with its lock file, one still holding a pack
+    stays for the next process on the node to adopt."""
+    from dmi.storage import native_capture
+    from dmi.storage.native_capture import (
+        NativeSinkConfig, claim_spool_directory,
+    )
+
+    sink = NativeSinkConfig(spool_root=str(tmp_path / "root"))
+    claim = claim_spool_directory(sink, _config())
+    drained = Path(claim.directory)
+    (drained / "v1" / "tenant=t").mkdir(parents=True)
+    assert claim.release() is True
+    assert not drained.exists()
+    assert not claim.held
+    assert claim not in native_capture._HELD_SPOOL_CLAIMS
+
+    claim = claim_spool_directory(sink, _config())
+    kept = Path(claim.directory)
+    (kept / "v1").mkdir()
+    (kept / "v1" / "left.dmi-pack.ready").write_bytes(b"pack")
+    assert claim.release() is False
+    assert (kept / "v1" / "left.dmi-pack.ready").exists()
+    assert _store().spool_owner(str(kept)) is None
+    assert claim not in native_capture._HELD_SPOOL_CLAIMS
+
+
 @pytest.mark.parametrize("f_type, name", [
     (0x6969, "NFS"), (0x0BD00BD0, "Lustre"), (0x19830326, "BeeGFS"),
     (0xFF534D42, "CIFS"), (0xFE534D42, "SMB2"), (0x65735546, "FUSE")])
@@ -402,9 +430,35 @@ def test_an_unknown_owner_lock_mode_is_refused(tmp_path):
 
 
 def test_held_by_caller_with_nothing_held_is_refused(tmp_path):
-    with pytest.raises(RuntimeError, match="held_by_caller"):
-        _service(_config(), tmp_path / "spool",
-                 spool_owner_lock="held_by_caller")
+    """The directory exists -- so this is the check that nothing holds its
+    lock, not a failure to resolve a path -- first with no lock file, then
+    with one nobody holds."""
+    directory = tmp_path / "spool"
+    directory.mkdir()
+    with pytest.raises(RuntimeError, match="held_by_caller, but nothing holds"):
+        _service(_config(), directory, spool_owner_lock="held_by_caller")
+    _store().SpoolOwnerLock(str(directory)).release()
+    assert (directory / ".owner.lock").exists()
+    with pytest.raises(RuntimeError, match="held_by_caller, but nothing holds"):
+        _service(_config(), directory, spool_owner_lock="held_by_caller")
+
+
+def test_held_by_caller_still_refuses_a_shared_filesystem(tmp_path):
+    """The node-local check applies to a Spool opened held_by_caller too:
+    the caller's lock was taken on a local disk, but what the Spool opens
+    is judged again."""
+    store = _store()
+    directory = tmp_path / "spool"
+    with store.SpoolOwnerLock(str(directory)):
+        store._set_spool_filesystem_type_for_testing(NFS_SUPER_MAGIC)
+        try:
+            with pytest.raises(RuntimeError, match="is on NFS .*node-local"):
+                _service(_config(), directory,
+                         spool_owner_lock="held_by_caller")
+            _service(_config(), directory, spool_owner_lock="held_by_caller",
+                     spool_allow_shared_filesystem=True)
+        finally:
+            store._set_spool_filesystem_type_for_testing(None)
 
 
 class _OtherProcessHolder:
