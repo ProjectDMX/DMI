@@ -23,6 +23,7 @@
 //
 // Built and run by tests/test_native_spool_owner_lock_unit.py.
 
+#include <fcntl.h>
 #include <openssl/sha.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -897,6 +898,79 @@ void TestANewDirectoryAppearsWithItsLockHeld() {
   CHECK(names == std::set<std::string>{"r0-0a1b2c3d"});
   CHECK(lock.directory() == base + "/r0-0a1b2c3d");
   CHECK(fs::exists(base + "/r0-0a1b2c3d/.owner.lock"));
+
+  // The window itself: a watcher -- an adopter's scan, in effect -- lists
+  // the parent over and over and probes each rank directory it has not yet
+  // seen held, while this process creates many and keeps holding every
+  // one, so their creation is the only moment one could read as unheld.
+  // Each take is slowed where it has opened a lock file and not locked it
+  // (the lock-open seam), so a directory there to be seen before its lock
+  // would be seen. One made first and locked after gives such a scan a
+  // dead-looking sibling, which an adopter would take, and remove from
+  // under its claimer.
+  const std::string parent = base + "/race";
+  fs::create_directories(parent);
+  int report[2], stop[2];
+  CHECK(::pipe(report) == 0 && ::pipe(stop) == 0);
+  const pid_t watcher = ::fork();
+  if (watcher == 0) {
+    ::close(report[0]);
+    ::close(stop[1]);
+    ::fcntl(stop[0], F_SETFL, O_NONBLOCK);
+    std::set<std::string> held, unheld;
+    char byte = 0;
+    while (::read(stop[0], &byte, 1) < 0 && errno == EAGAIN) {
+      std::error_code ec;
+      for (fs::directory_iterator it(parent, ec), end; !ec && it != end;
+           it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        uint64_t rank = 0;
+        std::string incarnation;
+        if (held.count(name) != 0 ||
+            !dmi_store::ParseSpoolRankDirectoryName(name, &rank,
+                                                    &incarnation)) {
+          continue;
+        }
+        if (dmi_store::ReadSpoolOwner(it->path().string(), nullptr)) {
+          held.insert(name);
+        } else {
+          unheld.insert(name);
+        }
+      }
+    }
+    const int count = static_cast<int>(unheld.size());
+    if (::write(report[1], &count, sizeof(count)) != sizeof(count)) {
+      ::_exit(3);
+    }
+    ::_exit(0);
+  }
+  ::close(report[1]);
+  ::close(stop[0]);
+  dmi_store::SetLockOpenHookForTesting([](const std::string&) {
+    ::usleep(1000);
+  });
+  std::vector<SpoolOwnerLock> claims(100);
+  int taken = 0;
+  for (size_t i = 0; i < claims.size(); ++i) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "/r0-%08zx", i);
+    if (SpoolOwnerLock::Acquire(parent + name, false, &claims[i], &error) ==
+        SpoolStatus::kOk) {
+      ++taken;
+    }
+  }
+  dmi_store::SetLockOpenHookForTesting(nullptr);
+  ::close(stop[1]);  // the watcher stops at EOF
+  int unheld = -1;
+  CHECK(::read(report[0], &unheld, sizeof(unheld)) == sizeof(unheld));
+  ::close(report[0]);
+  int status = 0;
+  ::waitpid(watcher, &status, 0);
+  CHECK(taken == 100);
+  if (unheld != 0) {
+    std::cerr << "a scan met " << unheld << " unheld new directories\n";
+  }
+  CHECK(unheld == 0);
 }
 
 // (8) The budget across incarnations. Every process start gets a fresh
