@@ -19,7 +19,13 @@
 #include <pthread.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#if defined(__linux__)
 #include <sys/vfs.h>
+#else
+// statfs(2) with f_fstypename: macOS and the BSDs.
+#include <sys/mount.h>
+#include <sys/param.h>
+#endif
 #include <unistd.h>
 
 namespace dmi_store {
@@ -59,6 +65,26 @@ constexpr uint32_t kAfsFsMagic = 0x6B414653;
 constexpr uint32_t kOrangeFsSuperMagic = 0x20030528;
 
 std::atomic<int64_t> g_filesystem_type_for_testing{-1};
+
+#if !defined(__linux__)
+// Where statfs names the filesystem rather than giving Linux's magic: the
+// same refusal, by f_fstypename (FreeBSD spells a FUSE mount
+// "fusefs.<name>").
+const char* SharedFilesystemTypeName(const char* name) {
+  static const char* const kShared[][2] = {
+      {"nfs", "NFS"},         {"smbfs", "SMB"},       {"afpfs", "AFP"},
+      {"webdav", "WebDAV"},   {"lustre", "Lustre"},   {"macfuse", "FUSE"},
+      {"osxfuse", "FUSE"},    {"fusefs", "FUSE"},     {"afs", "AFS"}};
+  for (const auto& entry : kShared) {
+    const size_t n = std::strlen(entry[0]);
+    if (std::strncmp(name, entry[0], n) == 0 &&
+        (name[n] == '\0' || name[n] == '.')) {
+      return entry[1];
+    }
+  }
+  return nullptr;
+}
+#endif
 std::function<void(const std::string&)>& LockOpenHookForTesting() {
   static auto* hook = new std::function<void(const std::string&)>;
   return *hook;
@@ -482,23 +508,38 @@ void SetLockOpenHookForTesting(std::function<void(const std::string&)> hook) {
 
 SpoolStatus CheckNodeLocal(const std::string& dir,
                            bool allow_shared_filesystem, std::string* error) {
-  int64_t f_type = g_filesystem_type_for_testing.load();
-  if (f_type < 0) {
+  const int64_t f_type = g_filesystem_type_for_testing.load();
+  const char* shared = nullptr;
+  std::string seen;  // what statfs said, for the refusal
+  const auto magic = [](int64_t value) {
+    char text[48];
+    std::snprintf(text, sizeof(text), "statfs f_type 0x%llx",
+                  static_cast<unsigned long long>(value));
+    return std::string(text);
+  };
+  if (f_type >= 0) {
+    shared = SharedFilesystemName(f_type);
+    seen = magic(f_type);
+  } else {
     struct statfs info{};
     if (::statfs(dir.c_str(), &info) != 0) {
       if (error) *error = "cannot statfs " + dir + ": " + Errno(errno);
       return SpoolStatus::kIo;
     }
-    f_type = static_cast<int64_t>(static_cast<uint32_t>(info.f_type));
+#if defined(__linux__)
+    const int64_t type =
+        static_cast<int64_t>(static_cast<uint32_t>(info.f_type));
+    shared = SharedFilesystemName(type);
+    seen = magic(type);
+#else
+    shared = SharedFilesystemTypeName(info.f_fstypename);
+    seen = std::string("statfs f_fstypename ") + info.f_fstypename;
+#endif
   }
-  const char* shared = SharedFilesystemName(f_type);
   if (shared == nullptr || allow_shared_filesystem) return SpoolStatus::kOk;
   if (error) {
-    char magic[32];
-    std::snprintf(magic, sizeof(magic), "0x%llx",
-                  static_cast<unsigned long long>(f_type));
-    *error = "spool directory " + dir + " is on " + shared +
-             " (statfs f_type " + magic + "): a spool must be node-local, "
+    *error = "spool directory " + dir + " is on " + shared + " (" + seen +
+             "): a spool must be node-local, "
              "since its owner lock (flock) does not keep out a process on "
              "another node there. Use a local disk, or set "
              "allow_shared_filesystem if no process on another node can "
@@ -675,11 +716,24 @@ SpoolStatus CreateLocked(const std::string& dir, int* fd_out,
     WriteOwnerRecord(fd);
     ::fsync(fd);
     FsyncDir(staging, nullptr);
-#ifdef RENAME_NOREPLACE
+    // A rename that refuses an existing target: plain rename() silently
+    // replaces an empty directory.
+#if defined(RENAME_NOREPLACE)
     const int renamed = ::renameat2(AT_FDCWD, staging.c_str(), AT_FDCWD,
                                     dir.c_str(), RENAME_NOREPLACE);
+#elif defined(__APPLE__) && defined(RENAME_EXCL)
+    const int renamed =
+        ::renamex_np(staging.c_str(), dir.c_str(), RENAME_EXCL);
 #else
-    const int renamed = ::rename(staging.c_str(), dir.c_str());
+    // Neither: refuse a target that exists before renaming. The window
+    // left is between the check and the rename, and only another claim of
+    // the same fresh incarnation could fall into it.
+    int renamed = -1;
+    if (::access(dir.c_str(), F_OK) == 0) {
+      errno = EEXIST;
+    } else {
+      renamed = ::rename(staging.c_str(), dir.c_str());
+    }
 #endif
     if (renamed != 0) {
       const int failure = errno;
