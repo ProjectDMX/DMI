@@ -367,7 +367,7 @@ build/conformance_sign: csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp c
 	    -Icsrc/store -Icsrc/common -lcrypto
 
 # A2 store conformance driver + fault-matrix target. Needs libcurl (above).
-build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h csrc/store/spool.h csrc/store/uploader.h csrc/common/json.cpp csrc/common/json.h csrc/common/curl_init.cpp csrc/common/curl_init.h | check-libcurl
+build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h csrc/store/cancel.h csrc/store/spool.h csrc/store/uploader.h csrc/common/json.cpp csrc/common/json.h csrc/common/curl_init.cpp csrc/common/curl_init.h | check-libcurl
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
 	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/common/json.cpp csrc/common/curl_init.cpp \
@@ -375,7 +375,7 @@ build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/st
 
 # B1 catalog conformance driver: lease coordinator + version allocator over
 # ClickHouse's HTTP interface. No torch/pybind; needs libcurl like the store.
-build/conformance_catalog: csrc/catalog/clickhouse_client.cpp csrc/catalog/lease_coordinator.cpp csrc/catalog/version_allocator.cpp csrc/catalog/catalog_writer.cpp csrc/catalog/pack_index.cpp csrc/catalog/indexer.cpp csrc/catalog/schema.cpp csrc/catalog/reader.cpp csrc/catalog/hydration.cpp csrc/catalog/conformance_catalog.cpp csrc/common/json.cpp csrc/pack/pack_builder.cpp csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/catalog/clickhouse_client.h csrc/catalog/lease_coordinator.h csrc/catalog/version_allocator.h csrc/catalog/catalog_writer.h csrc/catalog/sql_escape.h csrc/catalog/pack_index.h csrc/catalog/indexer.h csrc/catalog/schema.h csrc/catalog/reader.h csrc/catalog/hydration.h csrc/common/json.h csrc/store/s3_client.h csrc/common/curl_init.cpp csrc/common/curl_init.h | check-libcurl
+build/conformance_catalog: csrc/catalog/clickhouse_client.cpp csrc/catalog/lease_coordinator.cpp csrc/catalog/version_allocator.cpp csrc/catalog/catalog_writer.cpp csrc/catalog/pack_index.cpp csrc/catalog/indexer.cpp csrc/catalog/schema.cpp csrc/catalog/reader.cpp csrc/catalog/hydration.cpp csrc/catalog/conformance_catalog.cpp csrc/common/json.cpp csrc/pack/pack_builder.cpp csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/catalog/clickhouse_client.h csrc/catalog/lease_coordinator.h csrc/catalog/version_allocator.h csrc/catalog/catalog_writer.h csrc/catalog/sql_escape.h csrc/catalog/pack_index.h csrc/catalog/indexer.h csrc/catalog/schema.h csrc/catalog/reader.h csrc/catalog/hydration.h csrc/common/json.h csrc/store/s3_client.h csrc/store/cancel.h csrc/common/curl_init.cpp csrc/common/curl_init.h | check-libcurl
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
 	    csrc/catalog/clickhouse_client.cpp csrc/catalog/lease_coordinator.cpp \

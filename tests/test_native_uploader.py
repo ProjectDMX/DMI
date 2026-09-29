@@ -16,6 +16,7 @@ import json
 import random
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -303,6 +304,41 @@ def test_corrupt_staged_bytes_are_refused(fake_s3, tmp_path):
         # Nothing reached the store.
         puts = [c for c in STATE.calls if c["method"] == "PUT"]
         assert not puts
+    finally:
+        sink.close()
+        store.close()
+
+
+def test_a_cancel_ends_the_retries_and_keeps_the_pack_staged(fake_s3,
+                                                            tmp_path):
+    """Against a store that answers every request 500, one pack costs four
+    upload attempts of four transport attempts each, about 7 s of backoff.
+    The storage service cancels its uploads when it stops or a flush's
+    deadline passes; the cancel must end the retries and the backoff at
+    once, and leave the pack in the spool -- the durable place for it --
+    rather than count it lost."""
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        staged = _stage(sink, tmp_path / "spool", 5)
+        staged = dict(staged, object_key=(
+            "fault/always-500/" + staged["object_key"].rsplit("/", 1)[1]))
+        fields = _store_base(fake_s3)
+        fields.update(
+            op="upload_one", root=str(tmp_path / "spool"),
+            spool_max_bytes=1 << 40, max_workers=1,
+            max_in_flight_bytes=1 << 30, staged=staged,
+            cancel_after_ms=500,
+        )
+        started = time.monotonic()
+        result = store.call(**fields)
+        elapsed = time.monotonic() - started
+        assert not result["ok"], result
+        assert result.get("cancelled") is True, result
+        assert "cancel" in result["what"], result
+        assert result["upload_attempts"] <= 2, result
+        assert elapsed < 3.0, elapsed
+        assert Path(staged["path"]).exists()
     finally:
         sink.close()
         store.close()

@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include "cancel.h"
+
 namespace dmi_store {
 
 struct S3Config {
@@ -56,6 +58,10 @@ struct S3Response {
   std::map<std::string, std::string> headers;  // lowercased names
   std::string body;
   std::string error;
+  // The client's Cancellation cut the exchange short (ok is false): before
+  // an attempt, during its transfer, or in the backoff before a retry.
+  // Never retried.
+  bool cancelled = false;
 };
 
 // Parsed HEAD metadata the DMI pack layout stores per object.
@@ -81,6 +87,10 @@ struct ListResult {
 // S3's minimum size for every part of a multipart upload but the last.
 inline constexpr uint64_t kMinMultipartPartBytes = 5ull * 1024 * 1024;
 
+// The whole-request bound, connect included, on the AbortMultipartUpload a
+// cancel leads to: one attempt, since whoever cancelled is waiting on it.
+inline constexpr int kAbortAfterCancelTimeoutS = 5;
+
 class S3Client {
  public:
   // An invalid config (see ValidateConfig) does not throw: the client
@@ -96,6 +106,17 @@ class S3Client {
   S3Client& operator=(const S3Client&) = delete;
 
   const S3Config& config() const { return config_; }
+
+  // Every request from now on honours `cancel` (nullptr: none): none is
+  // sent once it is cancelled, a transfer in flight is aborted (libcurl's
+  // progress callback asks at least once a second, connecting included),
+  // and a retry's backoff wakes for it. A cancelled request fails with the
+  // error "request cancelled" and is not retried; a multipart upload it cut
+  // short is aborted with a request of its own, which the cancel does not
+  // cut (bounded by kAbortAfterCancelTimeoutS instead). Set it before the
+  // client is shared, and keep `cancel` alive as long as the client.
+  void set_cancellation(const Cancellation* cancel) { cancel_ = cancel; }
+  bool cancelled() const { return cancel_ != nullptr && cancel_->cancelled(); }
   // Attempts actually made by the last call (1 + retries), for tests.
   int last_attempts() const { return last_attempts_.load(std::memory_order_relaxed); }
 
@@ -140,6 +161,26 @@ class S3Client {
   // Atomic because SpoolUploader shares one client across its worker
   // threads, and every request writes this; a plain int was a data race.
   std::atomic<int> last_attempts_{0};
+  const Cancellation* cancel_ = nullptr;
+
+  // How one exchange departs from the config: whether the Cancellation
+  // applies, and (when positive) its own attempt count and whole-request
+  // timeout in seconds.
+  struct ExchangeOptions {
+    bool cancellable = true;
+    int max_attempts = 0;
+    int timeout_s = 0;
+  };
+  S3Response ExchangeWith(
+      const std::string& method, const std::string& key,
+      const std::vector<std::pair<std::string, std::string>>& query,
+      const std::map<std::string, std::string>& extra_headers,
+      const uint8_t* body, size_t body_len, const std::string& body_hash_hex,
+      const ExchangeOptions& options);
+  // Aborts a multipart upload: as configured, or -- after a cancel -- once,
+  // uncancelled, within kAbortAfterCancelTimeoutS.
+  void AbortMultipart(const std::string& key, const std::string& upload_id,
+                      bool after_cancel);
 
   // Multipart primitives (single PUT when under threshold).
   bool PutSingle(const std::string& key, const uint8_t* data, size_t n,

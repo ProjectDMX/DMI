@@ -12,6 +12,10 @@
 //   2. The upload stream itself is hashed as curl reads it; a source whose
 //      bytes contradict the staged checksum deletes the upload and fails.
 //   3. Post-upload HEAD must show the object, else the upload is refused.
+//
+// Cancellation (set_cancellation): no pack starts once cancelled, and a
+// pack's retries and their backoff end at once. A cancelled pack stays in
+// the spool and is reported as cancelled, not failed.
 
 #ifndef DMI_STORE_UPLOADER_H_
 #define DMI_STORE_UPLOADER_H_
@@ -21,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "cancel.h"
 #include "s3_client.h"
 #include "spool.h"
 
@@ -54,6 +59,9 @@ struct UploadFailure {
   std::string object_key;
   int attempts = 0;
   std::string error;
+  // Cut short by a cancel, before it started or between its attempts; the
+  // pack is still staged. Not counted in failed_packs.
+  bool cancelled = false;
 };
 
 struct UploadSnapshot {
@@ -61,6 +69,7 @@ struct UploadSnapshot {
   uint64_t uploaded_packs = 0;
   uint64_t uploaded_bytes = 0;
   uint64_t failed_packs = 0;
+  uint64_t cancelled_packs = 0;  // left staged by a cancel
   uint64_t retries = 0;
   uint64_t peak_active_uploads = 0;
   uint64_t peak_in_flight_bytes = 0;
@@ -83,6 +92,13 @@ class SpoolUploader {
   SpoolUploader(const SpoolUploader&) = delete;
   SpoolUploader& operator=(const SpoolUploader&) = delete;
 
+  // From now on UploadPending starts no pack once `cancel` is cancelled,
+  // and UploadOne stops retrying (its backoff wakes for it); the pack stays
+  // staged. A transfer in flight is cut only when the S3 client has the
+  // same Cancellation (S3Client::set_cancellation). nullptr: none. Keep
+  // `cancel` alive as long as the uploader.
+  void set_cancellation(const Cancellation* cancel) { cancel_ = cancel; }
+
   // Recover the spool and upload every entry (or the first `limit`, which
   // must be positive when set). A pack over max_in_flight_bytes is recorded
   // as a failure at its own position and the rest of the batch still
@@ -91,14 +107,16 @@ class SpoolUploader {
   // uploads nothing — see the comment at the byte gate in uploader.cpp.
   UploadBatchResult UploadPending(int limit = -1);
 
-  // Upload one staged entry with retry. Public for tests.
+  // Upload one staged entry with retry. Public for tests. *cancelled_out
+  // (when given) says whether a cancel ended it.
   bool UploadOne(const StagedPack& staged, PackRef* ref, int* attempts_out,
-                 std::string* error);
+                 std::string* error, bool* cancelled_out = nullptr);
 
  private:
   Spool* spool_;
   S3Client* client_;
   UploaderConfig config_;
+  const Cancellation* cancel_ = nullptr;
 };
 
 }  // namespace dmi_store
