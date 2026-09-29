@@ -16,6 +16,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
@@ -666,27 +667,91 @@ SpoolStatus CreateLocked(const std::string& dir, int* fd_out,
 
 }  // namespace
 
+namespace {
+// Every held SpoolOwnerLock in this binary. Leaked on purpose, so no
+// static destructor runs while a lock is still registered. Each binary
+// that compiles spool.cpp (the store and sink extensions, the drivers)
+// keeps its own registry and its own fork handlers, for its own locks.
+std::mutex& LockRegistryMutex() {
+  static std::mutex* mutex = new std::mutex;
+  return *mutex;
+}
+std::unordered_set<SpoolOwnerLock*>& LockRegistry() {
+  static auto* registry = new std::unordered_set<SpoolOwnerLock*>;
+  return *registry;
+}
+}  // namespace
+
+void SpoolOwnerLock::BeforeFork() { LockRegistryMutex().lock(); }
+void SpoolOwnerLock::AfterForkInParent() { LockRegistryMutex().unlock(); }
+
+void SpoolOwnerLock::AfterForkInChild() {
+  // Close, never LOCK_UN: an unlock on the shared description would drop
+  // the parent's hold too, and closing one of its descriptors does not.
+  for (SpoolOwnerLock* lock : LockRegistry()) {
+    ::close(lock->fd_);
+    lock->fd_ = -1;
+    lock->dir_.clear();
+  }
+  LockRegistry().clear();
+  LockRegistryMutex().unlock();
+}
+
+void SpoolOwnerLock::Track(SpoolOwnerLock* lock) {
+  static std::once_flag handlers;
+  std::call_once(handlers, [] {
+    ::pthread_atfork(&SpoolOwnerLock::BeforeFork,
+                     &SpoolOwnerLock::AfterForkInParent,
+                     &SpoolOwnerLock::AfterForkInChild);
+  });
+  std::lock_guard<std::mutex> guard(LockRegistryMutex());
+  LockRegistry().insert(lock);
+}
+
+void SpoolOwnerLock::Untrack(SpoolOwnerLock* lock) {
+  std::lock_guard<std::mutex> guard(LockRegistryMutex());
+  LockRegistry().erase(lock);
+}
+
+void SpoolOwnerLock::Hold(int fd, std::string dir) {
+  fd_ = fd;
+  dir_ = std::move(dir);
+  Track(this);
+}
+
 SpoolOwnerLock::~SpoolOwnerLock() { Release(); }
 
-SpoolOwnerLock::SpoolOwnerLock(SpoolOwnerLock&& other) noexcept
-    : fd_(other.fd_), dir_(std::move(other.dir_)) {
-  other.fd_ = -1;
-  other.dir_.clear();
+SpoolOwnerLock::SpoolOwnerLock(SpoolOwnerLock&& other) noexcept {
+  if (other.held()) {
+    const int fd = other.fd_;
+    std::string dir = std::move(other.dir_);
+    Untrack(&other);
+    other.fd_ = -1;
+    other.dir_.clear();
+    Hold(fd, std::move(dir));
+  }
 }
 
 SpoolOwnerLock& SpoolOwnerLock::operator=(SpoolOwnerLock&& other) noexcept {
   if (this != &other) {
     Release();
-    fd_ = other.fd_;
-    dir_ = std::move(other.dir_);
-    other.fd_ = -1;
-    other.dir_.clear();
+    if (other.held()) {
+      const int fd = other.fd_;
+      std::string dir = std::move(other.dir_);
+      Untrack(&other);
+      other.fd_ = -1;
+      other.dir_.clear();
+      Hold(fd, std::move(dir));
+    }
   }
   return *this;
 }
 
 void SpoolOwnerLock::Release() {
-  if (fd_ >= 0) ::close(fd_);  // closing the last descriptor unlocks
+  if (fd_ >= 0) {
+    Untrack(this);
+    ::close(fd_);  // closing the last descriptor unlocks
+  }
   fd_ = -1;
   dir_.clear();
 }
@@ -725,8 +790,7 @@ SpoolStatus SpoolOwnerLock::Acquire(const std::string& dir,
   status = exists ? LockInPlace(canonical, &fd, error)
                   : CreateLocked(canonical, &fd, error);
   if (status != SpoolStatus::kOk) return status;
-  out->fd_ = fd;
-  out->dir_ = canonical;
+  out->Hold(fd, canonical);
   // Only now, with this lock published: see CheckNotNested.
   status = CheckNotNested(canonical, error);
   if (status != SpoolStatus::kOk) {
@@ -757,8 +821,7 @@ SpoolStatus SpoolOwnerLock::TryAdopt(const std::string& dir,
   int fd = -1;
   const SpoolStatus status = LockInPlace(resolved, &fd, error);
   if (status != SpoolStatus::kOk) return status;
-  out->fd_ = fd;
-  out->dir_ = resolved;
+  out->Hold(fd, resolved);
   return SpoolStatus::kOk;
 }
 

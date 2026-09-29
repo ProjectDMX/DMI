@@ -8,7 +8,8 @@
 //      refused beside another process's holder or when nothing holds the
 //      lock.
 //   3. A second process is refused, told the holder's pid and host; the
-//      lock goes with its holder, even one killed with SIGKILL.
+//      lock goes with its holder, even one killed with SIGKILL, and a child
+//      it forked without exec does not keep it.
 //   4. Nesting: a directory under a HELD one, or containing one with a lock
 //      file, is refused -- also when two processes take the pair at once.
 //   5. The node-local check refuses NFS and Lustre by statfs f_type, unless
@@ -250,6 +251,79 @@ void TestASecondProcessIsRefusedUntilTheHolderDies() {
         SpoolStatus::kOk);
   CHECK(dmi_store::ReadSpoolOwner(root, &owner));
   CHECK(owner.pid == ::getpid());
+}
+
+// (3b) flock binds to an open file description, which a child forked
+// without exec shares. Such a child -- a fork-started worker -- used to keep
+// the lock after its parent was SIGKILLed, so the dead parent's directory
+// read as owned (naming the dead pid) and was never adopted. A forked child
+// now lets go of its copies of every held lock at once, and the parent's
+// hold is untouched.
+void TestAForkedChildDoesNotKeepTheLockPastItsParent() {
+  const std::string root = FreshRoot("fork-child") + "/spool";
+  int ready[2];
+  CHECK(::pipe(ready) == 0);
+  const pid_t owner = ::fork();
+  if (owner == 0) {
+    ::close(ready[0]);
+    SpoolOwnerLock lock;
+    std::string error;
+    if (SpoolOwnerLock::Acquire(root, false, &lock, &error) !=
+        SpoolStatus::kOk) {
+      ::_exit(3);
+    }
+    const pid_t worker = ::fork();  // no exec
+    if (worker == 0) {
+      // The child's own view: it holds nothing, and the lock is still held
+      // (by the parent).
+      const char mine = lock.held() ? 'H' : 'h';
+      const char held = dmi_store::ReadSpoolOwner(root, nullptr) ? 'P' : 'p';
+      if (::write(ready[1], &mine, 1) != 1 || ::write(ready[1], &held, 1) != 1) {
+        ::_exit(3);
+      }
+      ::pause();  // outlives its parent until killed
+      ::_exit(0);
+    }
+    char pid_text[32];
+    const int n = std::snprintf(pid_text, sizeof(pid_text), "%d\n", worker);
+    if (::write(ready[1], pid_text, n) != n) ::_exit(3);
+    ::pause();  // until killed
+    ::_exit(0);
+  }
+  ::close(ready[1]);
+  // The worker's two bytes and the owner's "<worker pid>\n", in any order.
+  std::string seen;
+  char byte = 0;
+  int flags = 0;
+  while (seen.find('\n') == std::string::npos || flags < 2) {
+    if (::read(ready[0], &byte, 1) != 1) break;
+    seen.push_back(byte);
+    if (byte == 'h' || byte == 'H' || byte == 'p' || byte == 'P') ++flags;
+  }
+  ::close(ready[0]);
+  std::string digits;
+  for (const char c : seen) {
+    if (c >= '0' && c <= '9') digits.push_back(c);
+  }
+  const pid_t worker = static_cast<pid_t>(std::atoi(digits.c_str()));
+  CHECK(worker > 0);
+  CHECK(seen.find('h') != std::string::npos);  // the child holds nothing
+  CHECK(seen.find('P') != std::string::npos);  // the parent still does
+  dmi_store::SpoolOwner owner_record;
+  CHECK(dmi_store::ReadSpoolOwner(root, &owner_record));
+  CHECK(owner_record.pid == owner);
+
+  ::kill(owner, SIGKILL);
+  int status = 0;
+  ::waitpid(owner, &status, 0);
+  // The worker lives on, and the lock went with its parent.
+  CHECK(::kill(worker, 0) == 0);
+  CHECK(!dmi_store::ReadSpoolOwner(root, &owner_record));
+  SpoolOwnerLock successor;
+  std::string error;
+  CHECK(SpoolOwnerLock::TryAdopt(root, &successor, &error) ==
+        SpoolStatus::kOk);
+  ::kill(worker, SIGKILL);
 }
 
 // (4) Nesting, both ways.
@@ -557,6 +631,7 @@ int main() {
   TestHeldByCallerWithoutAHolderIsRefused();
   TestTheLockGoesWithItsSpool();
   TestASecondProcessIsRefusedUntilTheHolderDies();
+  TestAForkedChildDoesNotKeepTheLockPastItsParent();
   TestNestedDirectoriesAreRefused();
   TestAnOuterAndANestedTakeRacingNeverBothWin();
   TestAStaleLockFileAboveDoesNotRefuseANestedDirectory();

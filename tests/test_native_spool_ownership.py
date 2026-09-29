@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -160,6 +161,45 @@ def test_a_second_process_is_refused_naming_the_holder(tmp_path):
     assert result.returncode == 0, result.stderr
     assert f"owned by pid {os.getpid()} on host {socket.gethostname()}" in (
         result.stdout), result.stdout
+
+
+def test_a_forked_worker_does_not_keep_a_dead_owners_lock(tmp_path):
+    """A child forked without exec -- a fork-started DataLoader or
+    multiprocessing worker -- shares the lock's open file description. It
+    used to keep the lock after its parent was SIGKILLed, so the dead
+    parent's directory read as owned, naming the dead pid, and was never
+    adopted."""
+    directory = tmp_path / "spool"
+    script = (
+        "import os, sys, time; sys.path.insert(0, sys.argv[1]);"
+        "import _dmi_native_store as m\n"
+        "lock = m.SpoolOwnerLock(sys.argv[2])\n"
+        "worker = os.fork()\n"
+        "if worker == 0:\n"
+        "    time.sleep(3600)\n"
+        "    os._exit(0)\n"
+        "print(worker, flush=True)\n"
+        "time.sleep(3600)\n")
+    owner = subprocess.Popen(
+        [sys.executable, "-c", script, str(BUILD), str(directory)],
+        stdout=subprocess.PIPE, text=True)
+    worker = int(owner.stdout.readline())
+    try:
+        assert _store().spool_owner(str(directory))["pid"] == owner.pid
+        os.kill(owner.pid, signal.SIGKILL)
+        owner.wait(timeout=30)
+        os.kill(worker, 0)  # the worker outlives its parent
+        assert _store().spool_owner(str(directory)) is None
+        with _store().SpoolOwnerLock(str(directory)):
+            pass
+    finally:
+        try:
+            os.kill(worker, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=30)
 
 
 def test_spool_owner_names_the_holder_while_it_holds(tmp_path):

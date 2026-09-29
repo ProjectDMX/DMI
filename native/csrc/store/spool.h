@@ -157,8 +157,13 @@ bool SpoolOwnedByThisProcess(const std::string& dir);
 
 // The owner lock of one spool directory: flock(LOCK_EX) on <dir>/.owner.lock,
 // released with the object (or Release()), and by the kernel when the
-// process dies. The descriptor is close-on-exec; a child forked WITHOUT exec
-// shares it, and keeps the lock held for as long as it lives.
+// process dies. flock binds to an open file description, which a child
+// shares after fork(): the descriptor is close-on-exec, and a child forked
+// WITHOUT exec (a fork-started worker) closes its copy of every held lock
+// at once (pthread_atfork), so the lock never outlives its owner in a child
+// -- the owner's own hold is untouched, and the child's objects read as not
+// held. A child the owner spawns through posix_spawn or vfork runs no
+// atfork handler, and loses the descriptor at exec.
 class SpoolOwnerLock {
  public:
   static constexpr const char* kFileName = ".owner.lock";
@@ -200,6 +205,15 @@ class SpoolOwnerLock {
   bool ReleaseAndRemoveIfEmpty(std::string* error);
 
  private:
+  // Sets fd_ and dir_, and registers the lock for the fork handler.
+  void Hold(int fd, std::string dir);
+  // The registry of held locks in this binary, and its fork handlers.
+  static void Track(SpoolOwnerLock* lock);
+  static void Untrack(SpoolOwnerLock* lock);
+  static void BeforeFork();
+  static void AfterForkInParent();
+  static void AfterForkInChild();
+
   int fd_ = -1;
   std::string dir_;
 };
