@@ -143,6 +143,13 @@ struct SpoolOwner {
 // locked but not yet written its record reads as an empty host and pid 0.
 bool ReadSpoolOwner(const std::string& dir, SpoolOwner* owner);
 
+// Whether `name` is the staging copy of a directory SpoolOwnerLock::Acquire
+// is creating, ".<name>.<8 hex>.creating": built beside its target with its
+// lock file held, then renamed into place. One nobody holds was left by a
+// claim killed before its rename; it holds nothing but its lock file, is
+// ignored by the nesting check, and an adopter clears it.
+bool IsSpoolClaimStagingName(const std::string& name);
+
 // Whether one of THIS process's descriptors holds <dir>/.owner.lock, as the
 // kernel reports it in /proc/self/fdinfo (falling back to the recorded host
 // and pid where /proc cannot be read). What kHeldByCaller requires.

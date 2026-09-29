@@ -29,6 +29,9 @@ namespace {
 constexpr const char* kReadySuffix = ".dmi-pack.ready";
 constexpr const char* kOpenSuffix = ".open";
 constexpr const char* kOwnerLockFile = ".owner.lock";
+// SpoolOwnerLock::Acquire builds a new directory as
+// <parent>/.<name>.<8 hex>.creating and renames it into place.
+constexpr const char* kClaimStagingSuffix = ".creating";
 // <root>/_refs/: the upload handoff's ref files (plan section 2.4). Not a
 // legal object-key component (those start with an alphanumeric), so no pack
 // is ever staged under it.
@@ -366,7 +369,11 @@ std::string CanonicalPath(const std::string& path, std::string* error) {
 //     descendant walk, and is refused.
 //   - A descendant refuses when it has a lock file at all, held or not: a
 //     dead directory's packs are its successor's to adopt, not this
-//     spool's to sweep and upload under its own keys.
+//     spool's to sweep and upload under its own keys. Except a claim's
+//     staging copy (IsSpoolClaimStagingName) that nobody holds: a claim
+//     killed before its rename, which holds nothing but its lock file. (One
+//     that is held is a claim in progress, and refuses; one not yet locked
+//     publishes after this walk, so its own ancestor check sees this lock.)
 SpoolStatus CheckNotNested(const std::string& dir, std::string* error) {
   fs::path ancestor(dir);
   while (ancestor.has_parent_path() && ancestor.parent_path() != ancestor) {
@@ -394,6 +401,10 @@ SpoolStatus CheckNotNested(const std::string& dir, std::string* error) {
     if (it->path().filename() != kOwnerLockFile) continue;
     const fs::path owned = it->path().parent_path();
     if (owned == fs::path(dir)) continue;
+    if (IsSpoolClaimStagingName(owned.filename().string()) &&
+        !ReadSpoolOwner(owned.string(), nullptr)) {
+      continue;
+    }
     if (error) {
       *error = "spool directory " + dir + " contains the owned spool "
                "directory " + owned.string() + " (it has " + kOwnerLockFile +
@@ -477,6 +488,20 @@ bool ReadSpoolOwner(const std::string& dir, SpoolOwner* owner) {
   if (held && owner != nullptr) ReadOwnerRecord(fd, owner);
   ::close(fd);
   return held;
+}
+
+bool IsSpoolClaimStagingName(const std::string& name) {
+  // "." + <name> + "." + 8 hex + ".creating", <name> not empty.
+  const size_t suffix = std::strlen(kClaimStagingSuffix);
+  if (name.size() < 1 + 1 + 1 + 8 + suffix || name[0] != '.' ||
+      !HasSuffix(name, kClaimStagingSuffix)) {
+    return false;
+  }
+  const size_t dot = name.size() - suffix - 9;
+  if (name[dot] != '.') return false;
+  return std::all_of(name.begin() + dot + 1, name.end() - suffix, [](char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+  });
 }
 
 bool SpoolOwnedByThisProcess(const std::string& dir) {
@@ -589,8 +614,9 @@ SpoolStatus CreateLocked(const std::string& dir, int* fd_out,
     char suffix[16];
     std::snprintf(suffix, sizeof(suffix), "%08x",
                   static_cast<unsigned>(random()));
+    // IsSpoolClaimStagingName's pattern.
     const std::string staging =
-        parent + "/." + name + "." + suffix + ".creating";
+        parent + "/." + name + "." + suffix + kClaimStagingSuffix;
     if (::mkdir(staging.c_str(), 0755) != 0) {
       if (errno == EEXIST) continue;
       if (error) *error = "cannot create " + staging + ": " + Errno(errno);

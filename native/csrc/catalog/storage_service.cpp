@@ -571,6 +571,7 @@ void CaptureStorageService::adopt_siblings() {
   adoption_owed_ = true;
   const fs::path own(spool_.root());
   std::vector<std::string> siblings;
+  std::vector<fs::path> claim_staging;
   std::error_code ec;
   for (fs::directory_iterator it(own.parent_path(), ec), end;
        !ec && it != end; it.increment(ec)) {
@@ -578,9 +579,15 @@ void CaptureStorageService::adopt_siblings() {
     std::string incarnation;
     std::error_code type_ec;
     if (it->path() == own || it->is_symlink(type_ec) ||
-        !it->is_directory(type_ec) ||
-        !dmi_store::ParseSpoolRankDirectoryName(
-            it->path().filename().string(), &rank, &incarnation)) {
+        !it->is_directory(type_ec)) {
+      continue;
+    }
+    const std::string name = it->path().filename().string();
+    if (dmi_store::IsSpoolClaimStagingName(name)) {
+      claim_staging.push_back(it->path());
+      continue;
+    }
+    if (!dmi_store::ParseSpoolRankDirectoryName(name, &rank, &incarnation)) {
       continue;
     }
     siblings.push_back(it->path().string());
@@ -590,12 +597,37 @@ void CaptureStorageService::adopt_siblings() {
                  ": " + ec.message());
     return;
   }
+  clear_dead_claim_staging(claim_staging);
   std::sort(siblings.begin(), siblings.end());
   bool owed = false;
   for (const std::string& sibling : siblings) {
     if (!adopt_sibling(sibling)) owed = true;
   }
   adoption_owed_ = owed;
+}
+
+void CaptureStorageService::clear_dead_claim_staging(
+    const std::vector<std::filesystem::path>& staging) {
+  namespace fs = std::filesystem;
+  // A claim builds its directory's staging copy and renames it into place
+  // within milliseconds, so one this old whose lock nobody holds belongs
+  // to a claim that died before its rename. Younger ones are left alone: a
+  // claim between its mkdir and its flock holds no lock yet, and clearing
+  // its copy would fail it. Nothing is owed either way.
+  constexpr auto kDeadAfter = std::chrono::seconds(60);
+  for (const fs::path& path : staging) {
+    std::error_code ec;
+    const auto written = fs::last_write_time(path, ec);
+    if (ec || fs::file_time_type::clock::now() - written < kDeadAfter) {
+      continue;
+    }
+    dmi_store::SpoolOwnerLock lock;
+    std::string error;
+    if (dmi_store::SpoolOwnerLock::TryAdopt(path.string(), &lock, &error) ==
+        dmi_store::SpoolStatus::kOk) {
+      lock.ReleaseAndRemoveIfEmpty(&error);
+    }
+  }
 }
 
 bool CaptureStorageService::adopt_sibling(const std::string& directory) {

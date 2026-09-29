@@ -377,6 +377,46 @@ void TestAStaleLockFileAboveDoesNotRefuseANestedDirectory() {
   CHECK(Contains(error, "contains"));
 }
 
+// (4d) A claim killed between creating its directory's staging copy
+// (.<name>.<rand>.creating, lock file inside) and renaming it into place
+// leaves that copy behind. Nobody holds it, it holds no pack, and it must
+// not refuse a take of the directories above it for good. A staging copy
+// whose lock IS held is a claim in progress, and still refuses.
+void TestAnUnheldClaimStagingDirectoryRefusesNothing() {
+  const std::string base = FreshRoot("staging");
+  const std::string key = base + "/root/0123456789ab";
+  const std::string leftover = key + "/.r0-0a1b2c3d.0badf00d.creating";
+  CHECK(dmi_store::IsSpoolClaimStagingName(".r0-0a1b2c3d.0badf00d.creating"));
+  CHECK(!dmi_store::IsSpoolClaimStagingName("r0-0a1b2c3d"));
+  CHECK(!dmi_store::IsSpoolClaimStagingName(".creating"));
+  fs::create_directories(leftover);
+  std::ofstream(leftover + "/.owner.lock") << "host 1\n";
+  std::string error;
+  {
+    SpoolOwnerLock lock;
+    CHECK(SpoolOwnerLock::Acquire(base + "/root", false, &lock, &error) ==
+          SpoolStatus::kOk);
+    CHECK(error.empty());
+  }
+  {
+    SpoolOwnerLock lock;
+    CHECK(SpoolOwnerLock::Acquire(key, false, &lock, &error) ==
+          SpoolStatus::kOk);
+    CHECK(error.empty());
+  }
+  // Held: a claim in the middle of creating its directory.
+  const std::string live = base + "/other/0123456789ab";
+  SpoolOwnerLock claiming;
+  CHECK(SpoolOwnerLock::Acquire(live + "/.r1-0a1b2c3d.00c0ffee.creating",
+                                false, &claiming, &error) ==
+        SpoolStatus::kOk);
+  SpoolOwnerLock outer;
+  error.clear();
+  CHECK(SpoolOwnerLock::Acquire(base + "/other", false, &outer, &error) ==
+        SpoolStatus::kBadArgument);
+  CHECK(Contains(error, "contains"));
+}
+
 // (5) The node-local check, through the test seam.
 void TestSharedFilesystemsAreRefusedUnlessAllowed() {
   const std::string root = FreshRoot("statfs") + "/spool";
@@ -520,6 +560,7 @@ int main() {
   TestNestedDirectoriesAreRefused();
   TestAnOuterAndANestedTakeRacingNeverBothWin();
   TestAStaleLockFileAboveDoesNotRefuseANestedDirectory();
+  TestAnUnheldClaimStagingDirectoryRefusesNothing();
   TestSharedFilesystemsAreRefusedUnlessAllowed();
   TestAdoptionLocksOnlyWhatExistsAndIsDead();
   TestANewDirectoryAppearsWithItsLockHeld();

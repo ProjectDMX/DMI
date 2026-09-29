@@ -173,6 +173,16 @@ def _stale_open_file(directory: Path) -> Path:
     return stale
 
 
+def _claim_staging(parent: Path, name: str, *, age_s: float) -> Path:
+    """The staging copy a claim killed before its rename leaves behind."""
+    staging = parent / f".{name}.0badf00d.creating"
+    staging.mkdir()
+    (staging / ".owner.lock").write_text("host 1\n")
+    then = time.time() - age_s
+    os.utime(staging, (then, then))
+    return staging
+
+
 def _read_all(config) -> dict:
     from dmi.storage.native_capture import NativeCaptureReader
 
@@ -210,6 +220,11 @@ def test_a_sigkilled_process_spool_is_adopted_by_its_successor(
             _sigkill(child)
         stale = _stale_open_file(dead)
         assert _store().spool_owner(str(dead)) is None  # died with it
+        # A claim killed before it renamed its directory into place leaves
+        # the staging copy (lock file inside). An old one is cleared; a
+        # fresh one may be a claim in progress, and is left alone.
+        old_claim = _claim_staging(dead.parent, "r0-0badf00d", age_s=3600)
+        fresh_claim = _claim_staging(dead.parent, "r0-00c0ffee", age_s=0)
 
         # Another process's live spool, bound for the same catalog.
         live = _claim(base, config)
@@ -227,6 +242,8 @@ def test_a_sigkilled_process_spool_is_adopted_by_its_successor(
             assert snapshot["adoption_owed"] is False, snapshot
             assert not stale.exists()
             assert not dead.exists()
+            assert not old_claim.exists()
+            assert fresh_claim.exists()
             service.flush(60.0)
             assert _read_all(config) == _expected()
         finally:

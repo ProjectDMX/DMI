@@ -70,6 +70,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -292,6 +293,10 @@ class CaptureStorageService {
   void adopt_siblings();
   // Adopts one sibling; false when it is owed another try.
   bool adopt_sibling(const std::string& directory);
+  // Removes the staging copies (dmi_store::IsSpoolClaimStagingName) that
+  // claims killed before their rename left under the catalog key.
+  void clear_dead_claim_staging(
+      const std::vector<std::filesystem::path>& staging);
   // Indexes refs that are gone from their spool, keeping whatever does not
   // index in pending_index_ -- the only record of it in-process. With no
   // catalog, keeps them all. Requires cycle_mutex_.
