@@ -322,12 +322,14 @@ class NativeCaptureStorageConfig:
 
     # Every object-store request is bounded: each attempt by
     # s3_read_timeout_s (whole seconds, connecting included), with up to
-    # s3_max_attempts attempts for a transport error, a timeout, a 429 or
-    # a 5xx, and a backoff of 0.2 s doubling between them. That is how
-    # long one read the store never answers can hold the service's
-    # background cycle -- 4 x 120 s + 1.4 s on these defaults -- and a
-    # reader's request. stop() and a flush's deadline cut the service's
-    # requests short regardless (see close_flush_timeout_s).
+    # s3_max_attempts attempts for a timeout, a host that does not resolve
+    # or connect, a connection that broke or answered nothing, a 429 or a
+    # 500/502/503/504 -- not for another status, nor a TLS failure -- and a
+    # backoff between them of 0.2 s doubling up to 5 s. That is how long
+    # one read the store never answers can hold the service's background
+    # cycle -- 4 x 120 s + 1.4 s on these defaults -- and a reader's
+    # request. stop() and a flush's deadline cut the service's requests
+    # short regardless (see close_flush_timeout_s).
     s3_read_timeout_s: int = 120
     s3_max_attempts: int = 4
 
