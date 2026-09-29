@@ -37,7 +37,7 @@ import pytest
 
 # Module-level so the fake-S3 fixture registers in this module.
 from tests.test_native_s3_client import (  # noqa: E402
-    ACCESS, BUCKET, REGION, SECRET, fake_s3,
+    ACCESS, BUCKET, REGION, SECRET, STATE, fake_s3,
 )
 
 REPO = Path(__file__).resolve().parents[1]
@@ -64,6 +64,7 @@ LAYOUT = "capture_pack_reference_v1"
 LEASE = dict(lease_ttl_s=3.0, publish_timeout_s=1.0)
 INDEXED_BY_THE_DEAD = range(0, 4)   # flushed to the catalog before the kill
 STAGED_BY_THE_DEAD = range(4, 10)   # only in its spool when it dies
+STAGED_BY_THE_LIVE = range(20, 24)  # a live sibling's, never adopted
 RECORDS_PER_PACK = 2
 
 
@@ -227,9 +228,18 @@ def test_a_sigkilled_process_spool_is_adopted_by_its_successor(
         old_claim = _claim_staging(dead.parent, "r0-0badf00d", age_s=3600)
         fresh_claim = _claim_staging(dead.parent, "r0-00c0ffee", age_s=0)
 
-        # Another process's live spool, bound for the same catalog.
+        # A live sibling bound for the same catalog: ready packs its sink
+        # staged, and a stage it has in flight. Its lock is held by this
+        # process, so an adopter that took it for dead would get past the
+        # held_by_caller check and sweep it; only its liveness saves it.
         live = _claim(base, config)
-        (Path(live.directory) / "marker").write_text("live")
+        live_directory = Path(live.directory)
+        _stage_into(live.directory, STAGED_BY_THE_LIVE)
+        live_packs = sorted(live_directory.rglob("*.dmi-pack.ready"))
+        assert len(live_packs) == len(STAGED_BY_THE_LIVE) // RECORDS_PER_PACK
+        live_open = live_packs[0].parent / (
+            ".018f0000-0000-7000-8000-00000000beef.0badf00d.open")
+        live_open.write_bytes(b"half a pack")
 
         lock = _claim(base, config)
         service = _service(config, lock.directory)
@@ -245,11 +255,20 @@ def test_a_sigkilled_process_spool_is_adopted_by_its_successor(
             assert not dead.exists()
             assert not old_claim.exists()
             assert fresh_claim.exists()
+            assert snapshot["live_siblings"] == 1, snapshot
             service.flush(60.0)
+            # Only the dead process's captures reach the catalog.
             assert _read_all(config) == _expected()
         finally:
             service.stop()
-        assert (Path(live.directory) / "marker").read_text() == "live"
+        # The live sibling is as it was: nothing swept, nothing uploaded.
+        assert sorted(live_directory.rglob("*.dmi-pack.ready")) == live_packs
+        assert live_open.read_bytes() == b"half a pack"
+        live_ids = {path.name.split(".")[0] for path in live_packs}
+        with STATE.lock:
+            uploaded = list(STATE.objects)
+        assert not [key for key in uploaded
+                    if any(pack_id in key for pack_id in live_ids)]
         assert live.held
         assert lock.release_and_remove_if_empty()
         live.release()
