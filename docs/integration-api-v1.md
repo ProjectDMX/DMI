@@ -203,7 +203,11 @@ refused, naming the holder's pid and host. At start the service adopts the
 directories under the same catalog key whose owners have died: their stale
 `.open` files are swept, their ready packs uploaded and indexed, and the
 directory removed, so a crashed process's packs reach the catalog through the
-next one on the node, whatever run it belongs to. The spool root must be
+next one on the node, whatever run it belongs to. `spool_max_bytes` bounds the
+directory together with what those dead directories still hold (a live
+process's directory is its own budget), so restarts while uploads are blocked
+cannot each add a whole budget; the room comes back as they are adopted. The
+spool root must be
 node-local: NFS, Lustre, BeeGFS, CIFS/SMB2, FUSE, GPFS, 9p, AFS and OrangeFS
 are refused (by statfs `f_type`) unless `NativeSinkConfig.spool_allow_shared_filesystem`, which a FUSE
 filesystem that is itself local, such as fuse-overlayfs, needs too. Without

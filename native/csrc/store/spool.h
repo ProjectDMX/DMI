@@ -78,6 +78,18 @@ struct SpoolConfig {
   // FUSE filesystem that is local after all. Only safe when every process
   // that could open the directory runs on this node.
   bool allow_shared_filesystem = false;
+  // The root is a rank directory of the section 2.3 layout, and what its
+  // SIBLING rank directories hold (ready packs and temp files) counts
+  // against max_bytes as well -- except a sibling another live process
+  // holds, which is that process's own budget. A sibling nobody holds is a
+  // dead incarnation's, waiting to be adopted; one THIS process holds is
+  // being adopted by its service. Every process start gets a fresh rank
+  // directory, so without this each crash-restart while uploads are
+  // blocked would add a whole max_bytes to the node's spool; before the
+  // layout every restart reused one directory and one budget. The charge is
+  // refreshed wherever the committed account is (Open, and before a stage
+  // is refused), so the capacity comes back as adoption drains them.
+  bool charge_dead_siblings = false;
 };
 
 struct StagedPack {
@@ -95,6 +107,9 @@ struct SpoolSnapshot {
   uint64_t bytes = 0;
   uint64_t peak_bytes = 0;
   uint64_t max_bytes = 0;
+  // charge_dead_siblings: what the sibling directories were charged, as of
+  // the last refresh; capacity is judged against bytes plus this.
+  uint64_t sibling_bytes = 0;
 };
 
 enum class SpoolStatus {
@@ -334,9 +349,17 @@ class Spool {
   // stale-high. The retry/EEXIST-loser paths run it too, so a charge that
   // would exceed the cap is judged against the same durable truth.
   void ReconcileCommittedLocked();
+  // charge_dead_siblings: the bytes of ready and temp files in the sibling
+  // rank directories no other live process holds.
+  uint64_t ChargedSiblingBytes() const;
+  // The kFull refusal of a stage of `n` bytes. `mutex_` must be held.
+  std::string FullMessage(uint64_t n) const;
 
   std::string root_;
   uint64_t max_bytes_ = 0;
+  bool charge_dead_siblings_ = false;
+  // What ChargedSiblingBytes() found last. Under `mutex_`.
+  uint64_t sibling_bytes_ = 0;
   // Held for the object's life under OwnerLock::kTake; empty otherwise.
   SpoolOwnerLock owner_lock_;
   mutable std::mutex mutex_;

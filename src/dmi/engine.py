@@ -585,12 +585,15 @@ class MonitoringEngine:
             from .storage.capture.native_sink import create_native_pack_sink
 
             # Into the directory the engine claimed for the service, under
-            # its lock; without a service the sink owns the spool root.
+            # its lock, with what dead incarnations left beside it charged
+            # against its budget; without a service the sink owns the spool
+            # root.
             claim = self._spool_claim
             record_sink = create_native_pack_sink(
                 self._capture_sink_config,
                 spool_root=None if claim is None else claim.directory,
                 owner_lock="take" if claim is None else "held_by_caller",
+                charge_dead_siblings=claim is not None,
             ).native_sink
 
         _native_engine = _native_module()

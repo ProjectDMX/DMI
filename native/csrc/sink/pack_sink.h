@@ -73,6 +73,11 @@ struct SinkConfig {
   // holds one SpoolOwnerLock and opens both with kHeldByCaller.
   dmi_store::OwnerLock spool_owner_lock = dmi_store::OwnerLock::kTake;
   bool spool_allow_shared_filesystem = false;
+  // spool_root is a rank directory of the section 2.3 layout, and what the
+  // dead incarnations beside it still hold counts against spool_max_bytes
+  // (SpoolConfig::charge_dead_siblings). The engine sets it for the
+  // directory it claims.
+  bool spool_charge_dead_siblings = false;
   // Pack assembler workers. Records route by scope hash
   // (tenant, session, producer_rank), so one scope always lands on one
   // worker: per-scope ordering and single-scope packs are preserved at any

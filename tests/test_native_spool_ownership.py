@@ -259,6 +259,43 @@ def test_a_spool_root_a_sink_once_owned_still_takes_rank_directories(tmp_path):
         claim.release()
 
 
+@pytest.mark.skipif(not SINK_BUILT, reason="the native sink module is not built")
+def test_a_dead_siblings_bytes_count_against_the_sinks_budget(tmp_path):
+    """Each process start claims a fresh rank directory. A sink that
+    charged only its own let every crash-restart add a whole
+    spool_max_bytes while uploads were blocked; charge_dead_siblings (what
+    the engine passes) counts what the dead incarnations beside it still
+    hold, as the one directory every restart reused did before."""
+    pytest.importorskip("torch")
+    from dmi.storage.native_capture import (
+        NativeSinkConfig, claim_spool_directory,
+    )
+
+    sink_config = NativeSinkConfig(spool_root=str(tmp_path / "root"))
+    dead = claim_spool_directory(sink_config, _config())
+    dead_directory = Path(dead.directory)
+    (dead_directory / "v1").mkdir()
+    (dead_directory / "v1" / "left.dmi-pack.ready").write_bytes(
+        b"\0" * (1 << 20))
+    dead._lock.release()  # killed: the kernel let go, the packs stay
+    budget = (1 << 20) + 256  # room for the dead bytes, not for a pack
+
+    claim = claim_spool_directory(sink_config, _config())
+    try:
+        sink = _sink(claim.directory, owner_lock="held_by_caller",
+                     spool_max_bytes=budget, max_pack_bytes=budget,
+                     charge_dead_siblings=True)
+        with pytest.raises(RuntimeError, match="spool byte limit exceeded"):
+            _stage_one(sink)
+        del sink
+        uncharged = _sink(claim.directory, owner_lock="held_by_caller",
+                          spool_max_bytes=budget, max_pack_bytes=budget)
+        _stage_one(uncharged)  # the whole budget, as if nothing were left
+        del uncharged
+    finally:
+        claim.release()
+
+
 def test_a_dropped_spool_claim_keeps_its_directory_owned(tmp_path):
     """Only release() lets go of a claim. An engine dropped without close()
     drops its claim, while the ring and the sink it activated may still be

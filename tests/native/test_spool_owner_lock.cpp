@@ -18,6 +18,7 @@
 //   6. Adoption's try-lock never creates a directory, and a released
 //      directory that holds nothing but its lock file can be removed.
 //   7. The directory layout of the plan's section 2.3.
+//   8. The spool budget charges what dead sibling directories hold.
 //
 // Built and run by tests/test_native_spool_owner_lock_unit.py.
 
@@ -630,6 +631,112 @@ void TestANewDirectoryAppearsWithItsLockHeld() {
   CHECK(fs::exists(base + "/r0-0a1b2c3d/.owner.lock"));
 }
 
+// (8) The budget across incarnations. Every process start gets a fresh
+// rank directory, so a spool that charged only its own directory let each
+// crash-restart add a full max_bytes while uploads were blocked. With
+// charge_dead_siblings, what the sibling rank directories hold counts
+// against max_bytes too -- unless another live process holds one (that is
+// its own budget); one this process holds, as its service does while it
+// adopts it, still counts.
+void TestDeadSiblingsCountAgainstTheBudget() {
+  const std::string base = FreshRoot("budget");
+  std::string error;
+  const auto stage_packs = [&](const std::string& dir, int first, int n) {
+    Spool spool;
+    CHECK(Spool::Open({dir, 1 << 20}, &spool, &error) == SpoolStatus::kOk);
+    for (int i = first; i < first + n; ++i) {
+      CHECK(StageOne(spool, i, &error) == SpoolStatus::kOk);
+    }
+  };  // the Spool, and with it its lock, goes: a dead incarnation
+
+  // A dead incarnation left three 100-byte packs beside the new one.
+  const std::string key = base + "/0123456789ab";
+  stage_packs(key + "/r0-0000000a", 1, 3);
+  SpoolConfig config{key + "/r0-0000000b", 450};
+  config.charge_dead_siblings = true;
+  Spool spool;
+  CHECK(Spool::Open(config, &spool, &error) == SpoolStatus::kOk);
+  CHECK(spool.Snapshot().sibling_bytes == 300);
+  CHECK(StageOne(spool, 4, &error) == SpoolStatus::kOk);  // 300 + 100
+  error.clear();
+  CHECK(StageOne(spool, 5, &error) == SpoolStatus::kFull);  // 300 + 200
+  CHECK(Contains(error, "300 bytes"));
+  CHECK(Contains(error, "dead"));
+  // As adoption drains the dead one, the capacity comes back.
+  for (const auto& entry :
+       fs::recursive_directory_iterator(key + "/r0-0000000a")) {
+    if (entry.path().extension() == ".ready") fs::remove(entry.path());
+  }
+  CHECK(StageOne(spool, 5, &error) == SpoolStatus::kOk);
+  CHECK(spool.Snapshot().sibling_bytes == 0);
+
+  // Without the charge each incarnation had the whole budget to itself.
+  const std::string uncharged = base + "/ba9876543210";
+  stage_packs(uncharged + "/r0-0000000a", 1, 3);
+  Spool alone;
+  CHECK(Spool::Open({uncharged + "/r0-0000000b", 450}, &alone, &error) ==
+        SpoolStatus::kOk);
+  for (int i = 4; i < 8; ++i) {
+    CHECK(StageOne(alone, i, &error) == SpoolStatus::kOk);
+  }
+
+  // A sibling another live process holds is its own budget.
+  const std::string shared = base + "/aaaaaaaaaaaa";
+  int ready[2];
+  CHECK(::pipe(ready) == 0);
+  const pid_t child = ::fork();
+  if (child == 0) {
+    ::close(ready[0]);
+    Spool live;
+    std::string child_error;
+    bool ok = Spool::Open({shared + "/r1-0000000d", 1 << 20}, &live,
+                          &child_error) == SpoolStatus::kOk;
+    for (int i = 1; ok && i <= 3; ++i) {
+      ok = StageOne(live, i, &child_error) == SpoolStatus::kOk;
+    }
+    const char byte = ok ? '1' : '0';
+    if (::write(ready[1], &byte, 1) != 1) ::_exit(3);
+    ::pause();
+    ::_exit(0);
+  }
+  ::close(ready[1]);
+  char byte = 0;
+  CHECK(::read(ready[0], &byte, 1) == 1);
+  CHECK(byte == '1');
+  ::close(ready[0]);
+  SpoolConfig beside{shared + "/r0-0000000e", 450};
+  beside.charge_dead_siblings = true;
+  Spool next;
+  CHECK(Spool::Open(beside, &next, &error) == SpoolStatus::kOk);
+  CHECK(next.Snapshot().sibling_bytes == 0);
+  for (int i = 4; i < 8; ++i) {
+    CHECK(StageOne(next, i, &error) == SpoolStatus::kOk);
+  }
+  ::kill(child, SIGKILL);
+  int status = 0;
+  ::waitpid(child, &status, 0);
+
+  // One THIS process holds -- its service adopting it -- still counts.
+  const std::string adopting = base + "/bbbbbbbbbbbb";
+  SpoolOwnerLock held;
+  CHECK(SpoolOwnerLock::Acquire(adopting + "/r0-0000000f", false, &held,
+                                &error) == SpoolStatus::kOk);
+  {
+    SpoolConfig adopted{adopting + "/r0-0000000f", 1 << 20};
+    adopted.owner_lock = OwnerLock::kHeldByCaller;
+    Spool writer;
+    CHECK(Spool::Open(adopted, &writer, &error) == SpoolStatus::kOk);
+    for (int i = 1; i <= 3; ++i) {
+      CHECK(StageOne(writer, i, &error) == SpoolStatus::kOk);
+    }
+  }
+  SpoolConfig own{adopting + "/r0-00000010", 450};
+  own.charge_dead_siblings = true;
+  Spool mine;
+  CHECK(Spool::Open(own, &mine, &error) == SpoolStatus::kOk);
+  CHECK(mine.Snapshot().sibling_bytes == 300);
+}
+
 // (7) The layout: <base>/<catalog_key>/r<rank>-<incarnation>/.
 dmi_store::SpoolDestination Destination() {
   dmi_store::SpoolDestination destination;
@@ -711,6 +818,7 @@ int main() {
   TestALockOnAnUnlinkedFileIsTakenAgain();
   TestANewDirectoryAppearsWithItsLockHeld();
   TestTheDirectoryLayout();
+  TestDeadSiblingsCountAgainstTheBudget();
   if (g_failures != 0) {
     std::cerr << g_failures << " check(s) failed\n";
     return 1;

@@ -596,6 +596,8 @@ def test_the_service_starts_before_the_sink_opens_the_spool(monkeypatch, tmp_pat
     assert config["holder"]  # a generated lease holder, never empty
     (sink,) = engine._test_sinks
     assert sink["owner_lock"] == "held_by_caller"
+    # Dead incarnations' packs beside it count against its budget.
+    assert sink["charge_dead_siblings"] is True
     assert engine._test_locks[0].held
 
 
@@ -713,6 +715,7 @@ def test_a_sink_without_a_service_owns_its_spool_itself(monkeypatch, tmp_path):
     (sink,) = engine._test_sinks
     assert sink["spool_root"] == str(tmp_path / "spool")
     assert sink["owner_lock"] == "take"
+    assert sink["charge_dead_siblings"] is False  # no layout, no siblings
     assert not any(event[0] in ("lock", "layout") for event in events)
 
 

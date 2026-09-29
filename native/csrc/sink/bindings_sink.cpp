@@ -159,7 +159,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        const std::string& overload,
                        std::optional<double> admission_timeout_s,
                        const std::string& owner_lock,
-                       bool allow_shared_filesystem) {
+                       bool allow_shared_filesystem,
+                       bool charge_dead_siblings) {
              dmi_sink::SinkConfig config;
              if (!dmi_store::ParseOwnerLock(owner_lock,
                                             &config.spool_owner_lock)) {
@@ -168,6 +169,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                    owner_lock + "'");
              }
              config.spool_allow_shared_filesystem = allow_shared_filesystem;
+             config.spool_charge_dead_siblings = charge_dead_siblings;
              config.overload = ParseOverload(overload);
              config.admission_timeout_s =
                  ParseAdmissionTimeout(admission_timeout_s);
@@ -200,7 +202,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            // a SpoolOwnerLock on it, as the engine does around its sink and
            // storage service.
            py::arg("owner_lock") = "take",
-           py::arg("allow_shared_filesystem") = false)
+           py::arg("allow_shared_filesystem") = false,
+           // spool_root is a rank directory of the spool layout, and the
+           // dead incarnations' packs beside it count against
+           // spool_max_bytes, as the engine's claimed directory does.
+           py::arg("charge_dead_siblings") = false)
       .def("attach",
            [](std::shared_ptr<dmi_sink::NativePackSink> self) {
              // Simulates engine ownership for tests (the real engine takes

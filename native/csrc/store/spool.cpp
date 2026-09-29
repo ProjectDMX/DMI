@@ -1094,6 +1094,8 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
   }
   out->root_ = resolved;
   out->max_bytes_ = config.max_bytes;
+  out->charge_dead_siblings_ = config.charge_dead_siblings;
+  out->sibling_bytes_ = 0;
   out->committed_bytes_ = 0;
   out->committed_entries_ = 0;
   out->reserved_bytes_ = 0;
@@ -1125,7 +1127,51 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
     }
   }
   out->peak_bytes_ = out->committed_bytes_;
+  if (out->charge_dead_siblings_) {
+    out->sibling_bytes_ = out->ChargedSiblingBytes();
+  }
   return SpoolStatus::kOk;
+}
+
+uint64_t Spool::ChargedSiblingBytes() const {
+  const fs::path own(root_);
+  uint64_t bytes = 0;
+  std::error_code ec;
+  for (fs::directory_iterator it(own.parent_path(), ec), end;
+       !ec && it != end; it.increment(ec)) {
+    uint64_t rank = 0;
+    std::string incarnation;
+    std::error_code type_ec;
+    if (it->path() == own || it->is_symlink(type_ec) ||
+        !it->is_directory(type_ec) ||
+        !ParseSpoolRankDirectoryName(it->path().filename().string(), &rank,
+                                     &incarnation)) {
+      continue;
+    }
+    const std::string sibling = it->path().string();
+    // Another live process's directory is its own budget.
+    if (ReadSpoolOwner(sibling, nullptr) &&
+        !SpoolOwnedByThisProcess(sibling)) {
+      continue;
+    }
+    std::error_code walk_ec;
+    for (fs::recursive_directory_iterator walk(sibling, walk_ec), last;
+         !walk_ec && walk != last; walk.increment(walk_ec)) {
+      if (AtRefsDirectory(walk)) {
+        walk.disable_recursion_pending();
+        continue;
+      }
+      std::error_code entry_ec;
+      if (!walk->is_regular_file(entry_ec)) continue;
+      const std::string name = walk->path().filename().string();
+      if (!HasSuffix(name, kReadySuffix) && !HasSuffix(name, kOpenSuffix)) {
+        continue;
+      }
+      const uint64_t size = walk->file_size(entry_ec);
+      if (!entry_ec) bytes += size;
+    }
+  }
+  return bytes;
 }
 
 bool Spool::AccountReadyLocked(const std::string& path,
@@ -1194,9 +1240,25 @@ void Spool::ReconcileCommittedLocked() {
   // The path ledger is rebuilt with the aggregate it describes, so the two
   // never disagree about which files the committed account holds.
   accounted_ready_ = std::move(seen_ready);
+  // And the dead siblings' charge with it, so what adoption has drained
+  // since is capacity again.
+  if (charge_dead_siblings_) sibling_bytes_ = ChargedSiblingBytes();
   // The scan can raise the committed total (files another object wrote), and
   // peak_bytes_ must never read below what the account holds right now.
   peak_bytes_ = std::max(peak_bytes_, committed_bytes_ + reserved_bytes_);
+}
+
+std::string Spool::FullMessage(uint64_t n) const {
+  std::string message =
+      "spool byte limit exceeded: " +
+      std::to_string(committed_bytes_ + reserved_bytes_ + sibling_bytes_ + n) +
+      " > " + std::to_string(max_bytes_);
+  if (sibling_bytes_ > 0) {
+    message += " (" + std::to_string(sibling_bytes_) +
+               " bytes of it in the dead spool directories beside this one, "
+               "still to be adopted)";
+  }
+  return message;
 }
 
 void Spool::SetStageHookForTesting(std::function<void()> hook) {
@@ -1277,14 +1339,12 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
           return SpoolStatus::kConflict;
         }
       }
-      if (committed_bytes_ + reserved_bytes_ + n > max_bytes_) {
+      if (committed_bytes_ + reserved_bytes_ + sibling_bytes_ + n >
+          max_bytes_) {
         ReconcileCommittedLocked();
-        if (committed_bytes_ + reserved_bytes_ + n > max_bytes_) {
-          if (error) {
-            *error = "spool byte limit exceeded: " +
-                     std::to_string(committed_bytes_ + reserved_bytes_ + n) +
-                     " > " + std::to_string(max_bytes_);
-          }
+        if (committed_bytes_ + reserved_bytes_ + sibling_bytes_ + n >
+            max_bytes_) {
+          if (error) *error = FullMessage(n);
           return SpoolStatus::kFull;
         }
       }
@@ -1347,12 +1407,9 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
     // ready file -- a state Python cannot reach at all, since it holds its
     // lock across the whole of stage()), while a serial retry under a lowered
     // cap is admitted the way the reference admits it.
-    if (reserved_bytes_ > 0 && committed_bytes_ + reserved_bytes_ > max_bytes_) {
-      if (error) {
-        *error = "spool byte limit exceeded: " +
-                 std::to_string(committed_bytes_ + reserved_bytes_) + " > " +
-                 std::to_string(max_bytes_);
-      }
+    if (reserved_bytes_ > 0 &&
+        committed_bytes_ + reserved_bytes_ + sibling_bytes_ > max_bytes_) {
+      if (error) *error = FullMessage(0);
       return SpoolStatus::kFull;
     }
     if (AccountReadyLocked(ready, n)) ++generation_;
@@ -1624,6 +1681,7 @@ SpoolSnapshot Spool::Snapshot() const {
   snapshot.bytes = committed_bytes_ + reserved_bytes_;
   snapshot.peak_bytes = peak_bytes_;
   snapshot.max_bytes = max_bytes_;
+  snapshot.sibling_bytes = sibling_bytes_;
   return snapshot;
 }
 

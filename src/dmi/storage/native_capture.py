@@ -136,8 +136,11 @@ class NativeSinkConfig:
     ``capture_storage_config`` the engine spools into a directory of its own
     under it, ``<spool_root>/<catalog_key>/r<rank>-<incarnation>/`` (see
     :func:`claim_spool_directory`), and its storage service adopts the
-    directories of dead processes beside it. Without one, the sink owns
-    ``spool_root`` itself. A root on NFS, Lustre, BeeGFS, CIFS/SMB2, FUSE,
+    directories of dead processes beside it. ``spool_max_bytes`` then
+    bounds this directory together with what the dead incarnations beside
+    it still hold, so crash-restarts while uploads are blocked cannot each
+    add a whole budget. Without one, the sink owns ``spool_root`` itself.
+    A root on NFS, Lustre, BeeGFS, CIFS/SMB2, FUSE,
     GPFS, 9p, AFS or OrangeFS is refused unless
     ``spool_allow_shared_filesystem``: flock there does not keep out a
     process on another node (a FUSE filesystem that is local, such as
