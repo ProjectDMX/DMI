@@ -615,11 +615,13 @@ class MonitoringEngine:
         # The sink's boundary is a staged pack; with the storage service it
         # is a pack in the catalog. The service's flush returns on time:
         # past the deadline it starts no upload and at most one index
-        # batch, leaving the rest owed to its background loop -- about one
+        # batch, leaving the rest to its background loop -- about one
         # clickhouse_request_timeout_s late against a catalog or store that
-        # stopped answering (NativeCaptureStorageConfig.close_flush_timeout_s
-        # has the details). At zero it still runs one cycle, so a drained
-        # spool reports drained.
+        # stopped answering, and up to about 6 s late when the deadline cuts
+        # a multipart upload, whose abort nothing cuts
+        # (NativeCaptureStorageConfig.close_flush_timeout_s has the
+        # details). At zero it still runs one cycle, so a drained spool
+        # reports drained.
         storage = self._capture_storage
         if storage is not None:
             storage.flush(max(0.0, deadline - time.monotonic()))

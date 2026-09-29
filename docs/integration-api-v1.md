@@ -341,7 +341,9 @@ call that raises when captures are not queryable in time. Past the budget the
 drain starts no upload and at most one index batch, so against a catalog or
 object store that stops answering, `close()` outlasts the budget by up to about
 two `clickhouse_request_timeout_s` (the request in flight, and the lease
-release); `close_flush_timeout_s` documents the full bound.
+release), plus up to about 6 s when the budget cuts a multipart upload, whose
+abort nothing cuts; `close_flush_timeout_s` documents the full bound. The same
+bounds hold for `flush_and_wait(timeout_s)`, less the lease release.
 
 Closing does not disable or uninstall HookPoints: they retain hook IDs and the
 old payload tensor. Treat the attached model as terminal too. A later CUDA

@@ -1127,6 +1127,62 @@ def test_a_flush_returns_on_time_while_an_upload_stalls(fake_s3, tmp_path):
         assert sorted(_read_all(direct)) == sorted(tensors)
 
 
+def test_a_flush_that_cuts_a_multipart_upload_waits_for_its_abort(
+        fake_s3, tmp_path):
+    """The one overrun of a flush's deadline that no catalog request
+    timeout bounds: a multipart upload the deadline cuts is then aborted,
+    one request of up to 5 s that nothing cuts, after up to about a second
+    for the stalled transfer to see the cancel (libcurl's progress poll).
+    With clickhouse_request_timeout_s at 2 s -- the config allows it -- that
+    outlasts the request timeout. Here the store holds the part and the
+    abort both, so the flush pays the whole bound, and no more. The pack is
+    a sparse file of zeros named for its checksum, over the client's
+    64 MiB multipart threshold; it stays staged."""
+    import hashlib
+
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    size = 65 << 20
+    digest = hashlib.sha256()
+    zeros = bytes(1 << 20)
+    for _ in range(size // len(zeros)):
+        digest.update(zeros)
+    spool_root = tmp_path / "spool"
+    spool_root.mkdir()
+    ready = spool_root / (f"{uuid.uuid4()}.1.1.{digest.hexdigest()}"
+                          ".dmi-pack.ready")
+    with open(ready, "wb") as sparse:
+        sparse.truncate(size)
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="multipart-abort-flush",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            clickhouse_request_timeout_s=2.0,
+            publish_timeout_ns=1_000_000_000, s3_read_timeout_s=30)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            s3.stall_requests(_multipart_part_or_abort)
+            started = time.monotonic()
+            drained = service.flush(1.0)
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+        finally:
+            s3.close()
+            service.stop()
+
+    assert drained is False
+    assert len(s3.stalled) == 2, s3.stalled  # the part, then the abort
+    # The deadline, up to a second for the cut, and the 5 s abort.
+    assert elapsed < 1.0 + 1.0 + 5.0 + 1.0, (elapsed, snapshot)
+    assert snapshot["cancelled_uploads"] == 1, snapshot
+    assert snapshot["upload_failures"] == 0, snapshot
+    assert _ready(spool_root) == [ready]
+
+
 def test_stop_returns_promptly_while_an_upload_stalls(fake_s3, tmp_path):
     """stop() joined a loop whose cycle was inside a PUT the store never
     answers, so it waited out the S3 read timeout on every attempt, with the

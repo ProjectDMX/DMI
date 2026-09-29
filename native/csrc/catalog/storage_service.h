@@ -248,12 +248,16 @@ class CaptureStorageService {
   // one catalog request timeout past the deadline, and its catalog
   // statements are never cut mid-flight, each bounded by the client's
   // request timeout (under the lease, by the lease deadline). What it
-  // leaves unindexed stays owed, for the loop or a later flush. A pass ends at its first
-  // failure, so a flush overruns its deadline by about one request
-  // timeout against a catalog or an object store that stopped answering,
-  // and by one batch of statements against a slow catalog that still
-  // answers. At zero it still runs one cycle, which indexes one batch of
-  // what earlier cycles owe and uploads nothing.
+  // leaves unindexed stays owed, for the loop or a later flush. A pass
+  // ends at its first failure, so a flush overruns its deadline by about
+  // one request timeout against a catalog or an object store that stopped
+  // answering, and by one batch of statements against a slow catalog that
+  // still answers. A multipart upload the deadline cuts adds its abort,
+  // which no request timeout bounds: up to about a second for the stalled
+  // transfer to see the cancel (libcurl's progress poll), then one abort
+  // request of at most 5 s that nothing cuts -- past one request timeout
+  // when that is under about 6 s. At zero it still runs one cycle, which
+  // indexes one batch of what earlier cycles owe and uploads nothing.
   // Throws, once, if packs were set aside since the last flush: they are in
   // the object store but can never reach the catalog.
   bool flush(double timeout_s);

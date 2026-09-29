@@ -273,21 +273,22 @@ class NativeCaptureStorageConfig:
     # batch of packs at most, since the service indexes what it uploads a
     # batch at a time -- in the bucket, which only the next start's
     # reconcile indexes (reconcile_on_start). Past the budget the drain
-    # starts no upload -- one in flight is cut, and a multipart one then
-    # aborted, one request of at most 5 s -- and at most one index batch:
-    # its object-store reads are cut one clickhouse_request_timeout_s past
-    # the budget, and its catalog statements are never cut, each bounded by
-    # that timeout (under the publisher lease, by the lease's deadline when
-    # that is sooner).
-    # Stopping the service then releases the lease: one more catalog
-    # request, bounded the same way -- or, when a lease renewal is in
-    # flight, that renewal, which it waits for (a lease the renewal loses
-    # needs no release). So against a catalog or an object store that
-    # stopped answering, close() outlasts the budget by up to about two
-    # request timeouts; against a slow catalog that still answers, by one
-    # batch of statements and the release. When the sink itself is stuck,
-    # the flush its release from the ring makes adds up to 30 s. close()
-    # logs what did not drain; flush_and_wait is what raises.
+    # starts no upload -- one in flight is cut, within about a second (the
+    # transfer's progress poll), and a multipart one then aborted, one
+    # request of at most 5 s that nothing cuts -- and at most one index
+    # batch: its object-store reads are cut one clickhouse_request_timeout_s
+    # past the budget, and its catalog statements are never cut, each
+    # bounded by that timeout (under the publisher lease, by the lease's
+    # deadline when that is sooner). Stopping the service then releases the
+    # lease: one more catalog request, bounded the same way -- or, when a
+    # lease renewal is in flight, that renewal, which it waits for (a lease
+    # the renewal loses needs no release). So against a catalog or an
+    # object store that stopped answering, close() outlasts the budget by
+    # up to about two request timeouts, and up to about 6 s more when the
+    # budget cuts a multipart upload; against a slow catalog that still
+    # answers, by one batch of statements and the release. When the sink
+    # itself is stuck, the flush its release from the ring makes adds up to
+    # 30 s. close() logs what did not drain; flush_and_wait is what raises.
     close_flush_timeout_s: float = 60.0
     # Bytes of packs the uploader holds in flight at once. A staged pack
     # larger than this is never uploaded, so the sink's max_pack_bytes must
@@ -641,8 +642,12 @@ class NativeCaptureStorage:
 
         Call after the sink's own flush. Raises TimeoutError, carrying the
         last upload or index error, if the spool has not drained in time.
-        Returns on time: past ``timeout_s`` it starts no upload and at most
-        one index batch, leaving the rest to the background loop (see
+        Returns on time, to within a bound: past ``timeout_s`` it starts
+        no upload and at most one index batch, leaving the rest to the
+        background loop -- about one ``clickhouse_request_timeout_s`` late
+        against a catalog or store that stopped answering, and up to about
+        6 s late when the deadline cuts a multipart upload, whose abort
+        nothing cuts (see
         ``NativeCaptureStorageConfig.close_flush_timeout_s``).
         """
         if not self._service.flush(float(timeout_s)):
