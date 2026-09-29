@@ -30,6 +30,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -185,6 +186,14 @@ def _claim_staging(parent: Path, name: str, *, age_s: float) -> Path:
     return staging
 
 
+def _wait_for(predicate, timeout_s: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("timed out waiting for the service")
+        time.sleep(0.05)
+
+
 def _read_all(config) -> dict:
     from dmi.storage.native_capture import NativeCaptureReader
 
@@ -335,6 +344,79 @@ def _stage_into(directory: str, indexes) -> None:
     assert sink.flush_and_wait(60.0)
     sink.rethrow_if_failed()
     del lease, sink
+
+
+def test_no_dead_spool_is_uploaded_while_an_adopted_pack_is_owed(
+        fake_s3, tmp_path):
+    """Owner decision 7, inside adoption. Two dead siblings; the catalog
+    goes away just after the first one's packs reach the object store, so
+    they cannot be indexed and are owed in memory. The second sibling's
+    packs must then stay in its spool, where a crash cannot lose them --
+    not be uploaded into a list only this process remembers. Once the
+    catalog is back, both are indexed."""
+    from tests.test_native_capture_storage_live import _Switch
+
+    base = tmp_path / "spool"
+    with _catalog() as prefix:
+        # The servers are part of the catalog key, so the siblings are
+        # claimed through the same switch URLs as the service reaches.
+        clickhouse = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+        store = _Switch.to_url(fake_s3)
+        config = _storage_config(store.url, prefix,
+                                 clickhouse_host="127.0.0.1",
+                                 clickhouse_port=clickhouse.port)
+        halves = (range(0, 4), range(4, 10))
+        siblings = []
+        for indexes in halves:
+            sibling = _claim(base, config)
+            siblings.append(Path(sibling.directory))
+            _stage_into(sibling.directory, indexes)
+            sibling.release()  # its owner is gone
+        first, second = sorted(siblings)  # adopted in this order
+        second_packs = sorted(second.rglob("*.dmi-pack.ready"))
+        assert second_packs
+
+        cut = threading.Event()
+
+        def _cut_the_catalog_at_the_first_upload(request: bytes) -> float:
+            if request.startswith(b"PUT ") and not cut.is_set():
+                cut.set()
+                clickhouse.cut()
+            return 0.0
+
+        store.delay_requests(_cut_the_catalog_at_the_first_upload)
+        lock = _claim(base, config)
+        service = _service(config, lock.directory)
+        service.start()
+        try:
+            _wait_for(lambda: service.snapshot()["pending_index"] > 0)
+            snapshot = service.snapshot()
+            assert cut.is_set()
+            assert not sorted(first.rglob("*.dmi-pack.ready")), snapshot
+            # Nothing of the second left its spool while the first's packs
+            # were owed.
+            assert sorted(second.rglob("*.dmi-pack.ready")) == second_packs
+            assert snapshot["adoption_owed"] is True, snapshot
+            with pytest.raises(TimeoutError):
+                service.flush(2.0)
+            assert sorted(second.rglob("*.dmi-pack.ready")) == second_packs
+
+            clickhouse.restore()
+            service.flush(60.0)
+            _wait_for(lambda: service.snapshot()["adopted_spools"] == 2, 60.0)
+            snapshot = service.snapshot()
+            assert snapshot["adoption_owed"] is False, snapshot
+            assert not first.exists() and not second.exists()
+            service.flush(60.0)
+            expected = {}
+            for indexes in halves:
+                for capture_id, tensor in _envelope(indexes).expected.items():
+                    expected[capture_id] = (
+                        tensor.contiguous().view(-1).numpy().tobytes())
+            assert _read_all(config) == expected
+        finally:
+            service.stop()
+        lock.release_and_remove_if_empty()
 
 
 def test_a_sibling_whose_owner_dies_after_start_is_adopted_by_a_recheck(
