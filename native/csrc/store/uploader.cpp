@@ -110,6 +110,8 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
   std::string last_error;
   int attempts = 0;
   bool cancelled = false;
+  // The Cancellation cut this attempt's failed request short.
+  bool attempt_cut = false;
   if (cancelled_out) *cancelled_out = false;
   for (int attempt = 0; attempt < config_.max_attempts; ++attempt) {
     // A cancel ends the retries: the backoff wakes for it, and no attempt
@@ -125,12 +127,14 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
       break;
     }
     ++attempts;
+    attempt_cut = false;
 
     // 1. Preflight: an object already carrying this pack is re-read and
     // re-hashed before it is blessed — metadata alone is not proof.
     {
       std::string head_error;
-      const ObjectHead head = client_->HeadObject(key, &head_error);
+      const ObjectHead head =
+          client_->HeadObject(key, &head_error, &attempt_cut);
       if (!head_error.empty()) {
         last_error = head_error;
         continue;  // transport-level: retryable below
@@ -142,7 +146,7 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
           std::vector<uint8_t> existing;
           std::string get_error;
           if (!client_->GetRange(key, 0, staged.object_bytes, &existing,
-                                 &get_error) ||
+                                 &get_error, nullptr, &attempt_cut) ||
               Sha256HexBytes(existing.data(), existing.size()) !=
                   staged.checksum) {
             last_error = get_error.empty()
@@ -209,14 +213,15 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
     std::string put_error;
     if (!client_->PutObject(key, data.data(), data.size(),
                             PackMetadata(staged), config_.content_type, &etag,
-                            &put_error)) {
+                            &put_error, &attempt_cut)) {
       last_error = put_error;
       continue;
     }
     // 3. Post-upload visibility: the object must be there.
     {
       std::string head_error;
-      const ObjectHead head = client_->HeadObject(key, &head_error);
+      const ObjectHead head =
+          client_->HeadObject(key, &head_error, &attempt_cut);
       if (!head_error.empty() || !head.found ||
           head.size != staged.object_bytes) {
         last_error = head_error.empty()
@@ -239,11 +244,12 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
     if (attempts_out) *attempts_out = attempts;
     return true;
   }
-  // The last attempt cut short by a cancel ends the loop without the check
-  // above seeing it.
-  if (!cancelled && cancel_ != nullptr && cancel_->cancelled()) {
-    cancelled = true;
-  }
+  // The last attempt cut short by a cancel ends the loop without the checks
+  // above seeing it. Only its request's own report says so: attempts that
+  // ran out on real failures, or the corrupt-bytes break, stay failures
+  // even when a flush's deadline passed meanwhile, so the error is counted
+  // and recorded rather than booked as a cancel.
+  if (!cancelled && attempt_cut) cancelled = true;
   if (cancelled) {
     last_error = last_error.empty()
                      ? kUploadCancelled

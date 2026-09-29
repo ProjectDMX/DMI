@@ -121,7 +121,14 @@ class S3Client {
   int last_attempts() const { return last_attempts_.load(std::memory_order_relaxed); }
 
   // HEAD /bucket/key. 404 → {found=false}, no error.
-  ObjectHead HeadObject(const std::string& key, std::string* error);
+  //
+  // On failure, *cancelled (when given, here and on GetRange and
+  // PutObject) says whether the Cancellation cut the call short -- before
+  // an attempt, in its transfer or in a retry's backoff -- rather than the
+  // store failing it: a cancel that merely comes in while a failure is
+  // reported does not count.
+  ObjectHead HeadObject(const std::string& key, std::string* error,
+                        bool* cancelled = nullptr);
 
   // GET /bucket/key, optionally Range: bytes=offset-(offset+length-1).
   // length==0 returns empty without a request (matches read_range).
@@ -132,7 +139,7 @@ class S3Client {
   // short body), which says something about the object itself.
   bool GetRange(const std::string& key, uint64_t offset, uint64_t length,
                 std::vector<uint8_t>* out, std::string* error,
-                bool* unavailable = nullptr);
+                bool* unavailable = nullptr, bool* cancelled = nullptr);
 
   // PUT /bucket/key with x-amz-content-sha256 over the exact bytes plus the
   // DMI metadata headers. Over multipart_threshold_bytes the call becomes
@@ -140,7 +147,7 @@ class S3Client {
   bool PutObject(const std::string& key, const uint8_t* data, size_t n,
                  const std::map<std::string, std::string>& metadata,
                  const std::string& content_type, std::string* etag_out,
-                 std::string* error);
+                 std::string* error, bool* cancelled = nullptr);
 
   bool DeleteObject(const std::string& key, std::string* error);
 
@@ -191,11 +198,11 @@ class S3Client {
   bool PutSingle(const std::string& key, const uint8_t* data, size_t n,
                  const std::map<std::string, std::string>& metadata,
                  const std::string& content_type, std::string* etag_out,
-                 std::string* error);
+                 std::string* error, bool* cancelled_out);
   bool PutMultipart(const std::string& key, const uint8_t* data, size_t n,
                     const std::map<std::string, std::string>& metadata,
                     const std::string& content_type, std::string* etag_out,
-                    std::string* error);
+                    std::string* error, bool* cancelled_out);
 };
 
 }  // namespace dmi_store

@@ -59,8 +59,10 @@ struct UploadFailure {
   std::string object_key;
   int attempts = 0;
   std::string error;
-  // Cut short by a cancel, before it started or between its attempts; the
-  // pack is still staged. Not counted in failed_packs.
+  // Cut short by a cancel: before it started, between its attempts, or in
+  // a request the cancel cut. The pack is still staged. Not counted in
+  // failed_packs. Attempts that ran out on failures of their own stay
+  // failures, even when a cancel came in meanwhile.
   bool cancelled = false;
 };
 

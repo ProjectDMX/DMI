@@ -344,6 +344,48 @@ def test_a_cancel_ends_the_retries_and_keeps_the_pack_staged(fake_s3,
         store.close()
 
 
+@pytest.mark.parametrize("request_cut", [False, True],
+                         ids=["failed-on-its-own", "cut-by-the-cancel"])
+def test_a_cancel_counts_only_when_it_ended_the_upload(fake_s3, tmp_path,
+                                                       request_cut):
+    """UploadOne booked a pack cancelled whenever its Cancellation was set
+    once its attempts were over -- also when they had run out on real
+    failures and a flush's deadline merely passed meanwhile. The storage
+    service then counted the pack in cancelled_uploads, not in
+    upload_failures, and never recorded its error, so the TimeoutError a
+    flush raised named no cause. The one attempt's HEAD is answered 500
+    after 1.2 s, and the cancel comes at 0.3 s. With only the uploader
+    holding the Cancellation the HEAD runs to its answer: a failure, and
+    it says so. With the client holding it too the cancel cuts the HEAD,
+    and that is a cancel, last attempt or not."""
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        staged = _stage(sink, tmp_path / "spool", 6)
+        staged = dict(staged, object_key=(
+            "fault/slow-once-500/" + staged["object_key"].rsplit("/", 1)[1]))
+        fields = _store_base(fake_s3, max_attempts=1)
+        fields.update(
+            op="upload_one", root=str(tmp_path / "spool"),
+            spool_max_bytes=1 << 40, upload_max_attempts=1,
+            staged=staged, cancel_after_ms=300,
+            cancel_uploader_only=not request_cut,
+        )
+        result = store.call(**fields)
+        assert not result["ok"], result
+        assert result["upload_attempts"] == 1, result
+        assert result["cancelled"] is request_cut, result
+        if request_cut:
+            assert "cancel" in result["what"], result
+        else:
+            assert "HTTP 500" in result["what"], result
+            assert "cancel" not in result["what"], result
+        assert Path(staged["path"]).exists()
+    finally:
+        sink.close()
+        store.close()
+
+
 def test_pack_over_the_byte_gate_fails_fast(fake_s3, tmp_path):
     sink = DriverSession(SINK_DRIVER)
     store = DriverSession(STORE_DRIVER)

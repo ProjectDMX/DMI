@@ -21,6 +21,9 @@
 // Cancellation, cancelled N ms after the op starts unless it has finished,
 // and the response says whether that fired ("cancelled"; for upload_one,
 // whether the cancel ended the upload, and per failure for upload_pending).
+// With "cancel_uploader_only":true only the uploader gets it, so a request
+// the cancel comes in during runs to its own end, as one whose answer
+// lands in the gap before libcurl next asks the Cancellation would.
 
 #include "s3_client.h"
 
@@ -224,7 +227,9 @@ int main() {
     }
     const bool armed = cancel_after_ms > 0;
     if (armed) {
-      client.set_cancellation(&canceller.cancel);
+      if (!jc::FindBool(line, "cancel_uploader_only")) {
+        client.set_cancellation(&canceller.cancel);
+      }
       canceller.Arm(cancel_after_ms);
     }
     bool upload_cancelled = false;

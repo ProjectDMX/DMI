@@ -380,11 +380,14 @@ S3Response S3Client::ExchangeWith(
   return response;
 }
 
-ObjectHead S3Client::HeadObject(const std::string& key, std::string* error) {
+ObjectHead S3Client::HeadObject(const std::string& key, std::string* error,
+                                bool* cancelled) {
   ObjectHead head;
+  if (cancelled) *cancelled = false;
   S3Response response =
       Exchange("HEAD", key, {}, {}, nullptr, 0, Sha256Hex(""));
   if (!response.ok) {
+    if (cancelled) *cancelled = response.cancelled;
     if (error) *error = response.error;
     return head;
   }
@@ -423,9 +426,11 @@ ObjectHead S3Client::HeadObject(const std::string& key, std::string* error) {
 
 bool S3Client::GetRange(const std::string& key, uint64_t offset,
                         uint64_t length, std::vector<uint8_t>* out,
-                        std::string* error, bool* unavailable) {
+                        std::string* error, bool* unavailable,
+                        bool* cancelled) {
   out->clear();
   if (unavailable) *unavailable = false;
+  if (cancelled) *cancelled = false;
   if (length == 0) return true;
   std::map<std::string, std::string> headers;
   headers["Range"] = "bytes=" + std::to_string(offset) + "-" +
@@ -434,6 +439,7 @@ bool S3Client::GetRange(const std::string& key, uint64_t offset,
                                  Sha256Hex(""));
   if (!response.ok) {
     if (unavailable) *unavailable = true;
+    if (cancelled) *cancelled = response.cancelled;
     if (error) *error = response.error;
     return false;
   }
@@ -464,7 +470,7 @@ bool S3Client::PutSingle(
     const std::string& key, const uint8_t* data, size_t n,
     const std::map<std::string, std::string>& metadata,
     const std::string& content_type, std::string* etag_out,
-    std::string* error) {
+    std::string* error, bool* cancelled_out) {
   std::map<std::string, std::string> headers;
   headers["Content-Type"] = content_type;
   for (const auto& [name, value] : metadata) {
@@ -473,6 +479,7 @@ bool S3Client::PutSingle(
   S3Response response =
       Exchange("PUT", key, {}, headers, data, n, Sha256Hex(data, n));
   if (!response.ok) {
+    if (cancelled_out) *cancelled_out = response.cancelled;
     if (error) *error = response.error;
     return false;
   }
@@ -493,7 +500,7 @@ bool S3Client::PutMultipart(
     const std::string& key, const uint8_t* data, size_t n,
     const std::map<std::string, std::string>& metadata,
     const std::string& content_type, std::string* etag_out,
-    std::string* error) {
+    std::string* error, bool* cancelled_out) {
   std::map<std::string, std::string> headers;
   headers["Content-Type"] = content_type;
   for (const auto& [name, value] : metadata) {
@@ -504,6 +511,7 @@ bool S3Client::PutMultipart(
       Exchange("POST", key, {{"uploads", ""}}, headers, nullptr, 0,
                Sha256Hex(""));
   if (!created.ok || created.http_status != 200) {
+    if (cancelled_out) *cancelled_out = created.cancelled;
     if (error) {
       *error = "CreateMultipartUpload failed: " +
                (created.ok ? "HTTP " + std::to_string(created.http_status)
@@ -531,6 +539,7 @@ bool S3Client::PutMultipart(
          {"uploadId", upload_id}},
         {}, data + offset, len, Sha256Hex(data + offset, len));
     if (!part.ok || part.http_status != 200) {
+      if (cancelled_out) *cancelled_out = part.cancelled;
       abort_error =
           "UploadPart failed: " +
           (part.ok ? "HTTP " + std::to_string(part.http_status) : part.error);
@@ -572,6 +581,7 @@ bool S3Client::PutMultipart(
     // the object it made is the pack's own, which a retry's preflight
     // re-reads and blesses.
     AbortMultipart(key, upload_id, true);
+    if (cancelled_out) *cancelled_out = true;
     if (error) *error = "CompleteMultipartUpload failed: " + done.error;
     return false;
   }
@@ -607,11 +617,15 @@ void S3Client::AbortMultipart(const std::string& key,
 bool S3Client::PutObject(const std::string& key, const uint8_t* data, size_t n,
                          const std::map<std::string, std::string>& metadata,
                          const std::string& content_type,
-                         std::string* etag_out, std::string* error) {
+                         std::string* etag_out, std::string* error,
+                         bool* cancelled) {
+  if (cancelled) *cancelled = false;
   if (n >= config_.multipart_threshold_bytes) {
-    return PutMultipart(key, data, n, metadata, content_type, etag_out, error);
+    return PutMultipart(key, data, n, metadata, content_type, etag_out, error,
+                        cancelled);
   }
-  return PutSingle(key, data, n, metadata, content_type, etag_out, error);
+  return PutSingle(key, data, n, metadata, content_type, etag_out, error,
+                   cancelled);
 }
 
 bool S3Client::DeleteObject(const std::string& key, std::string* error) {
