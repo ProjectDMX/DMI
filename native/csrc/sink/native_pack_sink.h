@@ -61,6 +61,9 @@ class NativePackSink final : public ring::RecordSink {
   std::optional<Duration> admission_bound() const override;
 
   const PackSink& sink() const { return *sink_; }
+  // Test seam: the PackSink itself, so a test can park its stages
+  // (PackSink::SpoolForTesting) and wedge the pipeline.
+  PackSink& sink_for_testing() { return *sink_; }
   const std::string& layout() const { return layout_; }
   Duration release_flush_timeout() const { return release_flush_timeout_; }
 
