@@ -2258,15 +2258,36 @@ def test_the_lease_renews_while_start_reconciles(
             assert sorted(captures) == sorted(tensors)
 
 
+def _multipart_part_or_abort(request: bytes) -> bool:
+    line = request.partition(b"\r\n")[0]
+    return ((line.startswith(b"PUT ") and b"partNumber=" in line)
+            or (line.startswith(b"DELETE ") and b"uploadId=" in line))
+
+
 def test_the_lease_renews_until_the_loops_last_cycle_is_done(
         fake_s3, tmp_path):
     """stop() woke the loop and the lease thread together, and the lease
-    thread left at once while the loop's last cycle still ran: a pass
-    reading a pack then found its lease abandoned at the commit, and the
-    snapshot said "held" over a dead row until then. The lease thread now
-    stops only after the loop has. stop() also cuts the read in flight now,
-    rather than waiting it out, so the last cycle ends at once: the pack is
-    left in the bucket, and the next start's reconcile indexes it."""
+    thread left at once while the loop's last cycle still ran: the snapshot
+    said "held" over a row that had expired meanwhile, and stop() found its
+    lease abandoned instead of releasing it. The lease thread now stops only
+    after the loop has.
+
+    stop() cuts the cycle's object-store requests short, so the cycle needs
+    something to do that no cancel cuts, outside the lease lock (inside it,
+    each request renews the lease when due). A multipart upload that stop()
+    cuts is aborted with a request of its own, one attempt of up to 5 s --
+    here held for all of it, past the 3 s lease -- while the lease thread
+    must go on renewing. (It used to be an index read held past the lease
+    deadline; stop() cuts reads now.) The pack is a sparse file of zeros
+    named for its checksum, over the client's 64 MiB multipart threshold:
+    it is only ever uploaded, and stays staged."""
+    import hashlib
+
+    size = 65 << 20
+    digest = hashlib.sha256()
+    zeros = bytes(1 << 20)
+    for _ in range(size // len(zeros)):
+        digest.update(zeros)
     spool_root = tmp_path / "spool"
     s3 = _Switch.to_url(fake_s3)
     with _catalog() as (client, catalog):
@@ -2275,18 +2296,13 @@ def test_the_lease_renews_until_the_loops_last_cycle_is_done(
                                  publish_timeout_s=1)
         service = _service(config, spool_root)
         service.start()
-        reads = []
-
-        def _first_read(request: bytes) -> bool:
-            if _ranged_get(request):
-                reads.append(time.monotonic())
-                return True
-            return False
-
         try:
-            s3.slow_once(_first_read, 4.0)  # past the lease deadline
-            tensors = _stage(spool_root, range(2))
-            _wait_for(lambda: reads, timeout_s=10.0)
+            s3.stall_requests(_multipart_part_or_abort)
+            ready = spool_root / (f"{uuid.uuid4()}.1.1.{digest.hexdigest()}"
+                                  ".dmi-pack.ready")
+            with open(ready, "wb") as sparse:
+                sparse.truncate(size)
+            _wait_for(lambda: s3.stalled, timeout_s=10.0)  # a part, held
             started = time.monotonic()
             log = _sample_during(service.stop, service, client,
                                  catalog.table_prefix)
@@ -2297,17 +2313,15 @@ def test_the_lease_renews_until_the_loops_last_cycle_is_done(
             s3.close()
 
         assert not _held_but_dead(log), log
-        assert elapsed < 2.0, (elapsed, snapshot)  # the read is cut short
-        assert snapshot["indexed_packs"] == 0, snapshot
-        assert snapshot["lease_state"] == "released", snapshot
-        direct = _storage_config(fake_s3, catalog.table_prefix)
-        successor = _service(direct, spool_root)  # reconciles at start
-        successor.start()
-        try:
-            successor.flush(30.0)
-        finally:
-            successor.stop()
-        assert sorted(_read_all(direct)) == sorted(tensors)
+        assert snapshot["lease_state"] == "released", (snapshot, log)
+        # The part was cut and the abort held to its 5 s bound: the loop's
+        # last cycle outlived the lease, which kept renewing throughout.
+        assert len(s3.stalled) == 2, s3.stalled
+        assert 4.5 < elapsed < 9.0, (elapsed, snapshot)
+        assert snapshot["lease_renewals"] >= 3, snapshot
+        assert snapshot["cancelled_uploads"] == 1, snapshot
+        assert snapshot["upload_failures"] == 0, snapshot
+        assert _ready(spool_root) == [ready]
 
 
 def _slow_catalog(insert_s: float, read_s: float):
