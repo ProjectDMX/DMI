@@ -105,14 +105,14 @@ def _service(config, directory: str, **options):
         adopt_sibling_spools=True, **options)
 
 
-def _envelope(indexes):
+def _envelope(indexes, width: int = 6):
     from tests.test_native_capture_chain_live import _Envelope
 
     import torch
 
     envelope = _Envelope()
     for index in indexes:
-        envelope.add(index, torch.arange(6, dtype=torch.float16) + index)
+        envelope.add(index, torch.arange(width, dtype=torch.float16) + index)
     return envelope
 
 
@@ -350,7 +350,7 @@ def test_a_dead_spool_waits_in_place_while_the_object_store_is_down(
         lock.release_and_remove_if_empty()
 
 
-def _stage_into(directory: str, indexes) -> None:
+def _stage_into(directory: str, indexes, width: int = 6) -> None:
     """Stage records into a directory this process holds, as its own sink
     would: the REAL native pack sink, held_by_caller."""
     import torch  # noqa: F401 -- the sink extension links against it
@@ -365,7 +365,7 @@ def _stage_into(directory: str, indexes) -> None:
         max_pack_records=RECORDS_PER_PACK, max_linger_ns=600 * 10**9,
         owner_lock="held_by_caller")
     lease = sink.attach()
-    envelope = _envelope(indexes)
+    envelope = _envelope(indexes, width)
     sink.submit_envelope(LAYOUT, envelope.rows, envelope.payload())
     assert sink.flush_and_wait(60.0)
     sink.rethrow_if_failed()
@@ -439,6 +439,62 @@ def test_no_dead_spool_is_uploaded_while_an_adopted_pack_is_owed(
                 for capture_id, tensor in _envelope(indexes).expected.items():
                     expected[capture_id] = (
                         tensor.contiguous().view(-1).numpy().tobytes())
+            assert _read_all(config) == expected
+        finally:
+            service.stop()
+        lock.release_and_remove_if_empty()
+
+
+def test_a_dead_spool_this_service_can_never_upload_is_left_and_reported(
+        fake_s3, tmp_path):
+    """A pack this service can never upload -- here larger than its
+    uploader_max_in_flight_bytes, which a crashed run with a larger bound
+    left behind -- blocks its dead directory for good: retrying it only
+    re-hashes it and keeps the loop backing off. It is reported once and
+    left in place for a process that can (or a person), the siblings after
+    it are adopted, and nothing is owed or retried."""
+    base = tmp_path / "spool"
+    with _catalog() as prefix:
+        # A 4096-byte bound: the wide captures' packs exceed it, the narrow
+        # ones' fit.
+        config = _storage_config(fake_s3, prefix,
+                                 uploader_max_in_flight_bytes=4096)
+        directories = []
+        for indexes, width in ((range(0, 4), 4096), (range(4, 10), 6)):
+            sibling = _claim(base, config)
+            directories.append(Path(sibling.directory))
+            _stage_into(sibling.directory, indexes, width)
+            sibling.release()  # its owner is gone
+        blocked, adoptable = directories
+        blocked_packs = sorted(blocked.rglob("*.dmi-pack.ready"))
+        assert all(path.stat().st_size > 4096 for path in blocked_packs)
+
+        lock = _claim(base, config)
+        service = _service(config, lock.directory)
+        service.start()
+        try:
+            _wait_for(_adopted(service, 1))
+            snapshot = service.snapshot()
+            assert snapshot["blocked_siblings"] == [str(blocked)], snapshot
+            assert "in-flight byte limit" in snapshot["last_error"], snapshot
+            assert sorted(blocked.rglob("*.dmi-pack.ready")) == blocked_packs
+            assert not adoptable.exists()
+            # Not retried: no more failed uploads, and no backoff -- the
+            # loop keeps its poll interval.
+            failures, cycles = (snapshot["upload_failures"],
+                                snapshot["cycles"])
+            time.sleep(1.0)
+            snapshot = service.snapshot()
+            assert snapshot["upload_failures"] == failures, snapshot
+            assert snapshot["cycles"] >= cycles + 5, snapshot
+            assert snapshot["adoption_owed"] is False, snapshot
+            started = time.monotonic()
+            service.flush(10.0)
+            assert time.monotonic() - started < 2.0
+            expected = {
+                capture_id: tensor.contiguous().view(-1).numpy().tobytes()
+                for capture_id, tensor in _envelope(
+                    range(4, 10)).expected.items()}
             assert _read_all(config) == expected
         finally:
             service.stop()

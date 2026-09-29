@@ -17,7 +17,9 @@
 //    "objects":[{"key":"...","size":N,"etag":"..."}...],"attempts":N}
 //   {"op":"upload_one"|"upload_pending",...,"root":"...",
 //    "owner_lock":"take"|"held_by_caller" (optional, take by default)}
-//     open the spool at root, owner lock included, for the one op.
+//     open the spool at root, owner lock included, for the one op;
+//     upload_pending's failures carry pack_id, object_key, attempts, error
+//     and retryable.
 // Errors: {"ok":false,"what":"..."}.
 
 #include "s3_client.h"
@@ -385,6 +387,8 @@ int main() {
           out += ",\"attempts\":" + std::to_string(failure.attempts);
           out += ",\"error\":";
           jc::EscapeJson(failure.error, &out);
+          out += std::string(",\"retryable\":") +
+                 (failure.retryable ? "true" : "false");
           out += "}";
           first = false;
         }

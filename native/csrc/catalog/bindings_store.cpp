@@ -178,6 +178,7 @@ py::dict snapshot_dict(const dc::StorageServiceSnapshot& s) {
   out["adopted_packs"] = s.adopted_packs;
   out["adoption_owed"] = s.adoption_owed;
   out["live_siblings"] = s.live_siblings;
+  out["blocked_siblings"] = s.blocked_siblings;
   out["failed"] = s.failed;
   out["lease_state"] = s.lease_state;
   // Seconds on the monotonic clock, comparable with time.monotonic() (both

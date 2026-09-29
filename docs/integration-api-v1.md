@@ -208,7 +208,12 @@ the node, whatever run it belongs to. Neither `create_record_runtime` nor
 `flush_and_wait` waits for that: a flush covers this process's records (an
 adopted pack uploaded and not yet indexed is waited for like its own), and the
 storage part of `capture_status()` reports the adoption (`adopted_spools`,
-`adopted_packs`, `adoption_owed`, `live_siblings`). `spool_max_bytes` bounds the
+`adopted_packs`, `adoption_owed`, `live_siblings`). A dead directory the
+service can never adopt -- one holding a pack it can never upload, such as one
+larger than its `uploader_max_in_flight_bytes` or one whose key already holds a
+different object, or one it cannot lock -- is left in place once the rest of
+its packs are up, listed in `blocked_siblings`, reported once in `last_error`,
+and neither retried nor owed. `spool_max_bytes` bounds the
 directory together with what those dead directories still hold (a live
 process's directory is its own budget), so restarts while uploads are blocked
 cannot each add a whole budget; the room comes back as they are adopted. The

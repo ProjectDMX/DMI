@@ -320,6 +320,8 @@ def test_pack_over_the_byte_gate_fails_fast(fake_s3, tmp_path):
         assert result["snapshot"]["failed_packs"] == 1
         assert result["failures"][0]["attempts"] == 0
         assert "in-flight" in result["failures"][0]["error"]
+        # No retry by this uploader can admit it.
+        assert result["failures"][0]["retryable"] is False
     finally:
         sink.close()
         store.close()
@@ -416,8 +418,10 @@ def test_a_pack_conflict_reports_why_it_will_not_overwrite(fake_s3, tmp_path):
         assert staged["object_key"] in failure["error"], failure
         assert "do not overwrite" in failure["error"], failure
         # Counted like every other attempted failure: the HEAD that found
-        # the conflict was an attempt, and it is not retried.
+        # the conflict was an attempt, and it is not retried -- now or by a
+        # later batch.
         assert failure["attempts"] == 1, failure
+        assert failure["retryable"] is False, failure
 
         # The refusal is real: nothing was written over the existing object,
         # and the staged pack is still there to inspect.
@@ -673,6 +677,8 @@ def test_a_64_mib_pack_uploads_multipart_over_https_with_a_private_ca(
         assert untrusted["refs"][0]["pack_id"] == "", untrusted
         assert failure["pack_id"] == staged["pack_id"], failure
         assert "certificate" in failure["error"].lower(), failure
+        # A transport failure: a later try (with the CA, here) can succeed.
+        assert failure["retryable"] is True, failure
         assert STATE.calls == [] and STATE.objects == {}
         assert Path(staged["path"]).exists()
 

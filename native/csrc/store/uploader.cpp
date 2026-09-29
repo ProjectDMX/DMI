@@ -94,7 +94,9 @@ SpoolUploader::SpoolUploader(Spool* spool, S3Client* client,
     : spool_(spool), client_(client), config_(std::move(config)) {}
 
 bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
-                              int* attempts_out, std::string* error) {
+                              int* attempts_out, std::string* error,
+                              bool* retryable_out) {
+  if (retryable_out) *retryable_out = true;
   const std::string& key = staged.object_key;
   std::mt19937_64 rng(
       static_cast<uint64_t>(std::hash<std::string>{}(staged.pack_id)));
@@ -164,6 +166,7 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
         // the retry-exhausted exit carries one.
         if (attempts_out) *attempts_out = attempts;
         if (error) *error = last_error;
+        if (retryable_out) *retryable_out = false;
         return false;  // NOT retryable
       }
     }
@@ -181,6 +184,7 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
       // Corrupt staged bytes: no retry can fix local corruption, but report
       // it as the failure rather than uploading garbage.
       last_error = "staged bytes do not match the staged checksum";
+      if (retryable_out) *retryable_out = false;
       break;
     }
     std::string etag;
@@ -266,7 +270,7 @@ UploadBatchResult SpoolUploader::UploadEntries(
       // test_mixed_batch_reports_oversized_pack_at_its_position), and
       // docs/benchmarks.md records the accounting decision behind it.
       result.failures[i] = {pending[i].pack_id, pending[i].object_key, 0,
-                            "pack exceeds the in-flight byte limit"};
+                            "pack exceeds the in-flight byte limit", false};
       ++result.snapshot.attempted_packs;
       ++result.snapshot.failed_packs;
     }
@@ -339,7 +343,8 @@ UploadBatchResult SpoolUploader::UploadEntries(
       PackRef ref;
       std::string error;
       int attempts = 0;
-      const bool ok = UploadOne(*staged, &ref, &attempts, &error);
+      bool retryable = true;
+      const bool ok = UploadOne(*staged, &ref, &attempts, &error, &retryable);
       const int64_t elapsed = NowNs() - started;
       {
         std::lock_guard<std::mutex> lock(mutex);
@@ -361,7 +366,7 @@ UploadBatchResult SpoolUploader::UploadEntries(
         } else {
           result.refs[slot.index] = PackRef{};
           result.failures[slot.index] = {staged->pack_id, staged->object_key,
-                                         attempts, error};
+                                         attempts, error, retryable};
           ++result.snapshot.failed_packs;
           if (attempts > 1) {
             result.snapshot.retries += static_cast<uint64_t>(attempts - 1);

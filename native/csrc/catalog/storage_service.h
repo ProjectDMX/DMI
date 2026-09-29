@@ -75,6 +75,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -121,10 +122,18 @@ struct StorageServiceConfig {
   // and neither a flush() nor the service's own uploads wait behind all of
   // it. A drained sibling is removed once nothing but its lock file is
   // left. An upload that failed stays in the dead spool and is retried by
-  // a later cycle, after the backoff. flush() covers this process's
-  // records: a sibling still to adopt does not keep it from reporting
-  // drained, though adopted packs uploaded and not yet indexed are owed
-  // like the service's own. Live siblings -- another rank or job on this
+  // a later cycle, after the backoff -- unless no retry by this service can
+  // ever succeed (dmi_store::UploadFailure::retryable: a pack over
+  // uploader.max_in_flight_bytes, a different object at its key, bytes that
+  // no longer match), or the sibling cannot be locked or opened at all.
+  // Such a sibling is blocked: once the rest of its packs are up it is left
+  // in place, with its lock let go, for a process that can adopt it (or a
+  // person); it is reported once (last_error, snapshot blocked_siblings),
+  // never retried or re-hashed by this service, and not owed. So is one
+  // drained of packs that still holds other files. flush() covers this
+  // process's records: a sibling still to adopt does not keep it from
+  // reporting drained, though adopted packs uploaded and not yet indexed
+  // are owed like the service's own. Live siblings -- another rank or job on this
   // node, a predecessor still closing -- are left alone, and are not owed.
   bool adopt_sibling_spools = false;
   // While a pass found a live sibling, the loop passes over the siblings
@@ -230,6 +239,9 @@ struct StorageServiceSnapshot {
   bool adoption_owed = false;
   // Siblings whose owner was alive at the last adoption pass.
   uint64_t live_siblings = 0;
+  // Dead siblings this service will not adopt, left in place (see
+  // adopt_sibling_spools), by directory.
+  std::vector<std::string> blocked_siblings;
   // A foreign lease outlived 2 x TTL: the service stopped for good.
   bool failed = false;
   // "none" before start, "held", "quarantined" (an unknown outcome set the
@@ -335,8 +347,11 @@ class CaptureStorageService {
   // Uploads and indexes one round of adopting_'s packs; false when an
   // upload failed.
   bool upload_adopted_round();
-  // adopting_ holds no pack any more: removes the directory.
+  // adopting_ holds no pack any more: removes the directory, or leaves a
+  // blocked one.
   void finish_adoption();
+  // Leaves a dead sibling in place for good, reporting why.
+  void block_sibling(const std::string& directory, const std::string& reason);
   bool adoption_owed() const;  // requires cycle_mutex_
   bool stop_requested();
   // Removes the staging copies (dmi_store::IsSpoolClaimStagingName) that
@@ -433,6 +448,7 @@ class CaptureStorageService {
   bool adoption_scan_owed_ = false;
   std::deque<std::string> adoption_queue_;
   std::unique_ptr<Adoption> adopting_;
+  std::set<std::string> blocked_siblings_;
   bool live_siblings_ = false;
   uint64_t last_adoption_scan_ns_ = 0;
   int failure_streak_ = 0;  // consecutive failed cycles, for the backoff

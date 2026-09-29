@@ -54,6 +54,11 @@ struct UploadFailure {
   std::string object_key;
   int attempts = 0;
   std::string error;
+  // False when no retry by this uploader can ever succeed: a pack over
+  // max_in_flight_bytes, a different object already at its key (a
+  // conflict), staged bytes that no longer match their checksum. The pack
+  // stays staged either way.
+  bool retryable = true;
 };
 
 struct UploadSnapshot {
@@ -97,9 +102,10 @@ class SpoolUploader {
   // time) and must not pay for another hash of everything it holds.
   UploadBatchResult UploadEntries(std::vector<StagedPack> entries);
 
-  // Upload one staged entry with retry. Public for tests.
+  // Upload one staged entry with retry. Public for tests. *retryable_out
+  // says, on failure, whether a later try could succeed (UploadFailure).
   bool UploadOne(const StagedPack& staged, PackRef* ref, int* attempts_out,
-                 std::string* error);
+                 std::string* error, bool* retryable_out = nullptr);
 
  private:
   Spool* spool_;
