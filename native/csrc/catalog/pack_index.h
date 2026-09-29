@@ -20,7 +20,9 @@ namespace dmi_catalog {
 
 // read_pack_descriptor_rows could not get the object store's answer about
 // the pack: a transport error or timeout, a retryable status on every
-// attempt, or the S3 client's Cancellation (cancelled() says which). It says
+// attempt, or the S3 client's Cancellation cutting the read (cancelled()
+// says which; a cancel that came in once the store had failed it does not
+// count, as in S3Client). It says
 // nothing about the pack itself, unlike every other refusal the read makes.
 // A CatalogError of kind kValue like those, so a caller that treats every
 // unreadable pack alike still does.

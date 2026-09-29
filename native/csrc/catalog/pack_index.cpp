@@ -34,11 +34,13 @@ constexpr uint64_t kMaxLayerNumber = 0x7FFFFFFFull;  // 2^31 - 1
 }
 
 // A range read that failed: the store's answer about the pack, or no
-// answer at all (StoreUnavailableError). A failure while the client's
-// Cancellation is in force is taken for the cancel's.
+// answer at all (StoreUnavailableError) -- the cancel's only when the read
+// says the Cancellation cut it. One set once the store had failed the read
+// (a flush's deadline passing just after a 503) cut nothing: that failure
+// is the store's, and is recorded as such.
 [[noreturn]] void range_read_failed(const std::string& what, bool unavailable,
-                                    const dmi_store::S3Client* s3) {
-  if (unavailable) throw StoreUnavailableError(what, s3->cancelled());
+                                    bool cancelled) {
+  if (unavailable) throw StoreUnavailableError(what, cancelled);
   throw CatalogError(CatalogError::Kind::kValue, what);
 }
 
@@ -443,9 +445,11 @@ std::vector<std::string> read_pack_descriptor_rows(
   const uint64_t trailer_offset = ref.object_bytes - kTrailerSize;
   if (charge) charge(kTrailerSize);
   bool unavailable = false;
+  bool cancelled = false;
   if (!s3->GetRange(ref.object_key, trailer_offset, kTrailerSize, &trailer,
-                   &error, &unavailable)) {
-    range_read_failed("pack trailer read failed: " + error, unavailable, s3);
+                   &error, &unavailable, &cancelled)) {
+    range_read_failed("pack trailer read failed: " + error, unavailable,
+                      cancelled);
   }
   if (trailer.size() != kTrailerSize) format_error("pack trailer is truncated");
   const auto read_u64 = [&](size_t at) {
@@ -491,8 +495,9 @@ std::vector<std::string> read_pack_descriptor_rows(
   // about to be read -- not the object's size, which only bounds it.
   if (charge) charge(footer_length);
   if (!s3->GetRange(ref.object_key, footer_offset, footer_length, &footer,
-                   &error, &unavailable)) {
-    range_read_failed("pack footer read failed: " + error, unavailable, s3);
+                   &error, &unavailable, &cancelled)) {
+    range_read_failed("pack footer read failed: " + error, unavailable,
+                      cancelled);
   }
   if (dmi_pack::Crc32(footer.data(), footer.size()) != footer_crc) {
     throw CatalogError(CatalogError::Kind::kValue, "footer checksum mismatch");

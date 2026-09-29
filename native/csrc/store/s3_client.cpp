@@ -199,8 +199,10 @@ S3Response S3Client::Exchange(
     const std::vector<std::pair<std::string, std::string>>& query,
     const std::map<std::string, std::string>& extra_headers,
     const uint8_t* body, size_t body_len, const std::string& body_hash_hex) {
-  return ExchangeWith(method, key, query, extra_headers, body, body_len,
-                      body_hash_hex, ExchangeOptions{});
+  S3Response response = ExchangeWith(method, key, query, extra_headers, body,
+                                     body_len, body_hash_hex, ExchangeOptions{});
+  if (after_exchange_for_testing_) after_exchange_for_testing_();
+  return response;
 }
 
 S3Response S3Client::ExchangeWith(

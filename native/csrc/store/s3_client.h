@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cancel.h"
@@ -157,6 +158,15 @@ class S3Client {
                    int max_keys, const std::string& continuation,
                    ListResult* out, std::string* error);
 
+  // Test seam: called each time an exchange has returned (every attempt of
+  // it done), before the call that made it reads the response. A test can
+  // cancel there, to stand for a cancel that comes in once a request has
+  // failed on its own -- the case *cancelled must not report. Set it
+  // before the client is shared.
+  void SetAfterExchangeHookForTesting(std::function<void()> hook) {
+    after_exchange_for_testing_ = std::move(hook);
+  }
+
   // Exposed for the fault-matrix tests: one raw signed exchange.
   S3Response Exchange(const std::string& method, const std::string& key,
                       const std::vector<std::pair<std::string, std::string>>& query,
@@ -174,6 +184,7 @@ class S3Client {
   // threads, and every request writes this; a plain int was a data race.
   std::atomic<int> last_attempts_{0};
   const Cancellation* cancel_ = nullptr;
+  std::function<void()> after_exchange_for_testing_;
 
   // How one exchange departs from the config: whether the Cancellation
   // applies, and (when positive) its own attempt count and whole-request

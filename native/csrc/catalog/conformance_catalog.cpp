@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "../common/json.h"
+#include "../store/cancel.h"
 #include "../store/s3_client.h"
 #include "catalog_writer.h"
 #include "clickhouse_client.h"
@@ -464,6 +465,66 @@ std::string respond(const std::string& line, Session* session) {
         escape_into(fields[i], &out);
       }
       out += "]";
+      return prefix + "true" + out + "}";
+    }
+    if (op == "read_pack_rows") {
+      // Session-less: one pack's descriptor rows, read through the object
+      // store as the indexer reads them, the client holding a Cancellation
+      // -- whose deadline passes cancel_after_ms from now, as a flush arms
+      // one, or which is cancelled once the first exchange has returned
+      // (cancel_after_exchange), as a cancel that comes in while a failure
+      // is reported. Pins how a failed read is told apart -- the store's
+      // answer, the store not answering, and whether a cancel is what cut
+      // it -- without a catalog.
+      dmi_store::S3Config s3_config;
+      s3_config.endpoint = jc::FindString(line, "endpoint");
+      s3_config.bucket = jc::FindString(line, "bucket");
+      s3_config.region = jc::FindString(line, "region");
+      s3_config.access_key = jc::FindString(line, "access");
+      s3_config.secret_key = jc::FindString(line, "secret");
+      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      if (jc::HasKey(line, "read_timeout")) {
+        s3_config.read_timeout_s =
+            static_cast<int>(field_int(line, "read_timeout"));
+      }
+      if (jc::HasKey(line, "max_attempts")) {
+        s3_config.max_attempts =
+            static_cast<int>(field_int(line, "max_attempts"));
+      }
+      dmi_store::Cancellation cancel;  // outlives the client
+      dmi_store::S3Client s3(s3_config);
+      if (jc::HasKey(line, "cancel_after_ms")) {
+        cancel.set_deadline(
+            dmi_store::Cancellation::NowNs() +
+            static_cast<uint64_t>(field_int(line, "cancel_after_ms")) *
+                1'000'000ull);
+        s3.set_cancellation(&cancel);
+      }
+      if (jc::FindBool(line, "cancel_after_exchange")) {
+        s3.set_cancellation(&cancel);
+        s3.SetAfterExchangeHookForTesting([&cancel] { cancel.Cancel(); });
+      }
+      const std::string element = jc::FindObject(line, "ref");
+      dmi_catalog::PackRefData ref;
+      ref.pack_id = jc::FindString(element, "pack_id");
+      ref.store_id = jc::FindString(element, "store_id");
+      ref.object_key = jc::FindString(element, "object_key");
+      ref.object_bytes =
+          static_cast<uint64_t>(field_int(element, "object_bytes"));
+      ref.checksum = jc::FindString(element, "checksum");
+      ref.record_count =
+          static_cast<uint64_t>(field_int(element, "record_count"));
+      try {
+        out = ",\"rows\":" +
+              std::to_string(dmi_catalog::read_pack_descriptor_rows(&s3, ref)
+                                 .size());
+      } catch (const dmi_catalog::StoreUnavailableError& e) {
+        std::string message;
+        escape_into(e.what(), &message);
+        return prefix + "false,\"error\":\"StoreUnavailable\",\"cancelled\":" +
+               (e.cancelled() ? "true" : "false") + ",\"message\":" +
+               message + "}";
+      }
       return prefix + "true" + out + "}";
     }
     if (session->writer == nullptr) {
