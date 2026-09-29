@@ -12,9 +12,9 @@
 //      it forked without exec does not keep it.
 //   4. Nesting: a directory under a HELD one, or containing one with a lock
 //      file, is refused -- also when two processes take the pair at once.
-//   5. The node-local check refuses NFS, Lustre, BeeGFS, CIFS/SMB2 and FUSE
-//      by statfs f_type, unless explicitly allowed (a test seam stands in
-//      for statfs).
+//   5. The node-local check refuses NFS, Lustre, BeeGFS, CIFS/SMB2, FUSE,
+//      GPFS, 9p, AFS and OrangeFS by statfs f_type, unless explicitly
+//      allowed (a test seam stands in for statfs).
 //   6. Adoption's try-lock never creates a directory, and a released
 //      directory that holds nothing but its lock file can be removed.
 //   7. The directory layout of the plan's section 2.3.
@@ -497,12 +497,17 @@ void TestSharedFilesystemsAreRefusedUnlessAllowed() {
   const std::string root = FreshRoot("statfs") + "/spool";
   // Each one's flock does not keep out a process on another node: NFS and
   // Lustre (the plan's two), BeeGFS (client-local unless
-  // tuneUseGlobalFileLocks), CIFS/SMB2, and FUSE, which cannot tell sshfs,
-  // s3fs, gcsfuse or GlusterFS from a local filesystem.
+  // tuneUseGlobalFileLocks), CIFS/SMB2, FUSE, which cannot tell sshfs,
+  // s3fs, gcsfuse or GlusterFS from a local filesystem, GPFS (IBM Storage
+  // Scale, whose flock is node-local), 9p, AFS (OpenAFS and kAFS) and
+  // OrangeFS -- network filesystems all, where a spool is never node-local.
   const std::vector<std::pair<int64_t, std::string>> shared = {
       {0x6969, "NFS"},        {0x0BD00BD0, "Lustre"},
       {0x19830326, "BeeGFS"}, {0xFF534D42, "CIFS"},
-      {0xFE534D42, "SMB2"},   {0x65735546, "FUSE"}};
+      {0xFE534D42, "SMB2"},   {0x65735546, "FUSE"},
+      {0x47504653, "GPFS"},   {0x01021997, "9p"},
+      {0x5346414F, "AFS"},    {0x6B414653, "AFS"},
+      {0x20030528, "OrangeFS"}};
   for (const auto& [magic, name] : shared) {
     const char* named = dmi_store::SharedFilesystemName(magic);
     CHECK(named != nullptr && std::string(named) == name);
@@ -511,6 +516,8 @@ void TestSharedFilesystemsAreRefusedUnlessAllowed() {
   CHECK(dmi_store::SharedFilesystemName(0x58465342) == nullptr);  // xfs
   CHECK(dmi_store::SharedFilesystemName(0x794C7630) == nullptr);  // overlayfs
   CHECK(dmi_store::SharedFilesystemName(0x01021994) == nullptr);  // tmpfs
+  CHECK(dmi_store::SharedFilesystemName(0x9123683E) == nullptr);  // btrfs
+  CHECK(dmi_store::SharedFilesystemName(0x2FC12FC1) == nullptr);  // zfs
 
   std::string error;
   for (const auto& [magic, name] : shared) {

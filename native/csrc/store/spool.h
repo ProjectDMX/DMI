@@ -39,9 +39,10 @@
 // check runs after the lock is taken, so of two processes taking an outer
 // and a nested directory at once, at least one is refused. <root>/_refs/ is
 // never scanned: the upload handoff's ref files live there (plan section
-// 2.4). The spool must be node-local: NFS, Lustre, BeeGFS, CIFS/SMB2 and
-// FUSE are refused by statfs f_type unless allow_shared_filesystem is set,
-// since none guarantees a flock that excludes a process on another node.
+// 2.4). The spool must be node-local: NFS, Lustre, BeeGFS, CIFS/SMB2, FUSE,
+// GPFS, 9p, AFS and OrangeFS are refused by statfs f_type unless
+// allow_shared_filesystem is set, since none guarantees a flock that
+// excludes a process on another node.
 //
 // The Python DurablePackSpool (spool.py) takes no lock, and its recover()
 // deletes every .open file under its root; the C++ spool is deliberately
@@ -120,8 +121,8 @@ inline const char* SpoolStatusName(SpoolStatus s) {
 }
 
 // The statfs f_type names of the shared filesystems a spool refuses: "NFS",
-// "Lustre", "BeeGFS", "CIFS", "SMB2", "FUSE", or nullptr for any other.
-// The list needs maintenance as
+// "Lustre", "BeeGFS", "CIFS", "SMB2", "FUSE", "GPFS", "9p", "AFS",
+// "OrangeFS", or nullptr for any other. The list needs maintenance as
 // deployments meet new ones.
 const char* SharedFilesystemName(int64_t f_type);
 

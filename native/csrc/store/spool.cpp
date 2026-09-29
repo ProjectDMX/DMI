@@ -38,18 +38,25 @@ constexpr const char* kClaimStagingSuffix = ".creating";
 // is ever staged under it.
 constexpr const char* kRefsDirectory = "_refs";
 
-// statfs(2) f_type values of filesystems whose flock does not keep out a
-// process on another node (linux/magic.h has NFS, SMB2, CIFS and FUSE;
-// Lustre's and BeeGFS's are their own). BeeGFS keeps flock client-local
-// unless tuneUseGlobalFileLocks is set. FUSE covers network filesystems
-// (sshfs, s3fs, gcsfuse, GlusterFS) and local ones alike, and f_type cannot
-// tell them apart, so a local one needs the override.
+// statfs(2) f_type values of network filesystems, whose flock does not
+// keep out a process on another node -- or is not a place a node-local
+// spool can be (linux/magic.h has NFS, SMB2, CIFS, FUSE, 9p and both AFS
+// values; the others are their own). BeeGFS keeps flock client-local
+// unless tuneUseGlobalFileLocks is set, and GPFS (IBM Storage Scale) keeps
+// it node-local. FUSE covers network filesystems (sshfs, s3fs, gcsfuse,
+// GlusterFS) and local ones alike, and f_type cannot tell them apart, so a
+// local one needs the override. AFS is OpenAFS's and kAFS's.
 constexpr uint32_t kNfsSuperMagic = 0x6969;
 constexpr uint32_t kLustreSuperMagic = 0x0BD00BD0;
 constexpr uint32_t kBeeGfsSuperMagic = 0x19830326;
 constexpr uint32_t kCifsSuperMagic = 0xFF534D42;
 constexpr uint32_t kSmb2SuperMagic = 0xFE534D42;
 constexpr uint32_t kFuseSuperMagic = 0x65735546;
+constexpr uint32_t kGpfsSuperMagic = 0x47504653;
+constexpr uint32_t kV9fsMagic = 0x01021997;
+constexpr uint32_t kAfsSuperMagic = 0x5346414F;
+constexpr uint32_t kAfsFsMagic = 0x6B414653;
+constexpr uint32_t kOrangeFsSuperMagic = 0x20030528;
 
 std::atomic<int64_t> g_filesystem_type_for_testing{-1};
 std::function<void(const std::string&)>& LockOpenHookForTesting() {
@@ -456,6 +463,11 @@ const char* SharedFilesystemName(int64_t f_type) {
     case kCifsSuperMagic: return "CIFS";
     case kSmb2SuperMagic: return "SMB2";
     case kFuseSuperMagic: return "FUSE";
+    case kGpfsSuperMagic: return "GPFS";
+    case kV9fsMagic: return "9p";
+    case kAfsSuperMagic: return "AFS";
+    case kAfsFsMagic: return "AFS";
+    case kOrangeFsSuperMagic: return "OrangeFS";
     default: return nullptr;
   }
 }

@@ -315,7 +315,9 @@ def test_releasing_a_claim_removes_its_directory_once_drained(tmp_path):
 
 @pytest.mark.parametrize("f_type, name", [
     (0x6969, "NFS"), (0x0BD00BD0, "Lustre"), (0x19830326, "BeeGFS"),
-    (0xFF534D42, "CIFS"), (0xFE534D42, "SMB2"), (0x65735546, "FUSE")])
+    (0xFF534D42, "CIFS"), (0xFE534D42, "SMB2"), (0x65735546, "FUSE"),
+    (0x47504653, "GPFS"), (0x01021997, "9p"), (0x5346414F, "AFS"),
+    (0x6B414653, "AFS"), (0x20030528, "OrangeFS")])
 def test_each_shared_filesystem_is_refused_by_name(tmp_path, f_type, name):
     store = _store()
     store._set_spool_filesystem_type_for_testing(f_type)
