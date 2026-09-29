@@ -334,10 +334,7 @@ void CaptureStorageService::stop() {
   // lease has to keep renewing until that is done.
   stop_lease_thread();
   std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
-  // A sibling half adopted keeps what is left of it, for the next process
-  // on the node; what was uploaded from it was indexed, or is owed.
-  adopting_.reset();
-  adoption_queue_.clear();
+  let_go_of_adoption();
   if (started_) {
     started_ = false;
     // A quarantined writer holds no lease, so it writes no tombstone: the
@@ -422,11 +419,22 @@ void CaptureStorageService::loop() {
       if (stop_requested_) return;
       kick_ = false;
     }
+    bool failed = false;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
-      if (failure_) return;  // another publisher holds the catalog
+      failed = failure_ != nullptr;
     }
     std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
+    if (failed) {
+      // Another publisher holds the catalog, and no cycle runs again. A
+      // sibling half adopted would stay locked by this process, with
+      // nobody working on it, until stop() -- the engine's close(), maybe
+      // hours of capture later -- and every other process on the node
+      // would read it as live meanwhile. Nor does it look again.
+      adoption_scan_owed_ = false;
+      let_go_of_adoption();
+      return;
+    }
     run_cycle(true);
     // poll_interval * 2^streak, capped: flush() shares the streak, so an
     // outage it saw also slows the loop, and a success from either resets it.
@@ -585,6 +593,15 @@ void CaptureStorageService::index_or_owe(std::vector<PackRefData> refs,
   }
   pending_index_.insert(pending_index_.end(), unindexed.begin(),
                         unindexed.end());
+}
+
+void CaptureStorageService::let_go_of_adoption() {
+  // A sibling half adopted keeps what is left of it, for the next process
+  // on the node; what was uploaded from it was indexed, or is owed.
+  adopting_.reset();
+  adoption_queue_.clear();
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  state_.adoption_owed = adoption_owed();
 }
 
 bool CaptureStorageService::adoption_owed() const {
@@ -1420,6 +1437,13 @@ void CaptureStorageService::latch_failure(std::exception_ptr failure,
   std::fprintf(stderr, "dmi capture storage: indexing stopped: %s\n",
                line.c_str());
   std::fflush(stderr);
+  // Woken now, not after its wait (up to max_backoff_ns in an outage), so
+  // the loop lets go of a sibling it was adopting at once.
+  {
+    std::lock_guard<std::mutex> lock(wake_mutex_);
+    kick_ = true;
+  }
+  wake_.notify_all();
 }
 
 }  // namespace dmi_catalog

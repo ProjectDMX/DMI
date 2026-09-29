@@ -358,6 +358,10 @@ class CaptureStorageService {
   void block_sibling(const std::string& directory, const std::string& reason,
                      dmi_store::SpoolOwnerLock* lock = nullptr);
   bool adoption_owed() const;  // requires cycle_mutex_
+  // Lets go of the sibling being adopted, and of those queued, leaving what
+  // is left of them for the next process on the node: at stop(), and once
+  // the service has latched. Requires cycle_mutex_.
+  void let_go_of_adoption();
   bool stop_requested();
   // Removes the staging copies (dmi_store::IsSpoolClaimStagingName) that
   // claims killed before their rename left under the catalog key.

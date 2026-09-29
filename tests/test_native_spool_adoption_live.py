@@ -629,5 +629,63 @@ def test_a_sibling_whose_owner_dies_after_start_is_adopted_by_a_recheck(
         lock.release_and_remove_if_empty()
 
 
+def test_a_latched_service_lets_go_of_the_sibling_it_was_adopting(
+        fake_s3, tmp_path):
+    """A service whose catalog another publisher keeps for 2 x TTL latches,
+    and its loop stops for good -- but the dead sibling it was half-way
+    through adopting stayed locked by this process, with nobody working on
+    it, until the engine's close(), possibly hours of capture later. Every
+    other process on the node read it as live meanwhile. The latched loop
+    lets go of it, at once."""
+    from dmi.storage.native_capture import NativeCaptureStorage
+    from tests.test_native_capture_storage_live import _Switch
+
+    base = tmp_path / "spool"
+    with _catalog() as prefix:
+        # The servers are part of the catalog key: the sibling is claimed
+        # through the same switch URLs as the service reaches.
+        clickhouse = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+        store = _Switch.to_url(fake_s3)
+        config = _storage_config(store.url, prefix,
+                                 clickhouse_host="127.0.0.1",
+                                 clickhouse_port=clickhouse.port,
+                                 reconcile_on_start=False)
+        sibling = _claim(base, config)
+        dead = Path(sibling.directory)
+        _stage_into(sibling.directory, STAGED_BY_THE_DEAD)
+        sibling.release()  # its owner is gone
+        staged = sorted(dead.rglob("*.dmi-pack.ready"))
+        store.cut()  # so the adoption stays half done
+        lock = _claim(base, config)
+        service = _service(config, lock.directory)
+        rival = NativeCaptureStorage(
+            _storage_config(fake_s3, prefix, holder="rival-publisher",
+                            start_lease_wait_s=10.0,
+                            reconcile_on_start=False),
+            spool_root=str(tmp_path / "rival"), spool_max_bytes=1 << 30,
+            sweep_spool=True)
+        service.start()
+        try:
+            _wait_for(lambda: service.snapshot()["upload_failures"] > 0, 60.0)
+            owner = _store().spool_owner(str(dead))
+            assert owner is not None and owner["pid"] == os.getpid(), owner
+
+            clickhouse.cut()  # the service can renew no more
+            rival.start()  # waits out the lease the cut service cannot renew
+            clickhouse.restore()
+            _wait_for(lambda: service.snapshot()["failed"], 30.0)
+            _wait_for(lambda: _store().spool_owner(str(dead)) is None, 5.0)
+            snapshot = service.snapshot()
+            assert snapshot["adoption_owed"] is False, snapshot
+            assert snapshot["adopted_packs"] == 0, snapshot
+            assert sorted(dead.rglob("*.dmi-pack.ready")) == staged
+        finally:
+            service.stop()
+            rival.stop()
+            clickhouse.close()
+            store.close()
+        lock.release_and_remove_if_empty()
+
+
 if __name__ == "__main__":
     _dead_capture_process(*sys.argv[1:4])
