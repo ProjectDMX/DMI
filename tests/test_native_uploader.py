@@ -410,7 +410,11 @@ def test_a_cancel_stops_the_listing_between_packs(fake_s3, tmp_path):
     assert result["listing_cancelled"] is True, result
     assert result["refs"] == [] and result["failures"] == [], result
     assert result["snapshot"]["cancelled_packs"] == 0, result
-    assert elapsed < 1.0, elapsed
+    # Between packs, not after the listing: the cut ends within one pack's
+    # hash of the cancel, about 0.5 s here, where the whole listing takes
+    # over 3 s. The bound leaves room for a loaded runner, whose hashing
+    # slows with it (about 1.1 s at 4x oversubscription).
+    assert elapsed < 2.0, elapsed
     assert sorted(root.rglob("*.dmi-pack.ready")) == sorted(backlog)
     assert STATE.calls == []
 
