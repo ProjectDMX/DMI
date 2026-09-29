@@ -174,7 +174,12 @@ def test_a_forked_worker_does_not_keep_a_dead_owners_lock(tmp_path):
     multiprocessing worker -- shares the lock's open file description. It
     used to keep the lock after its parent was SIGKILLed, so the dead
     parent's directory read as owned, naming the dead pid, and was never
-    adopted."""
+    adopted.
+
+    The worker says it has run before its owner is killed: the fork
+    handler closes its copy of the lock only once the child is first
+    scheduled, which on a loaded host can come tens of milliseconds after
+    the owner is reaped, and until then the lock outlives its owner."""
     directory = tmp_path / "spool"
     script = (
         "import os, sys, time; sys.path.insert(0, sys.argv[1]);"
@@ -182,6 +187,7 @@ def test_a_forked_worker_does_not_keep_a_dead_owners_lock(tmp_path):
         "lock = m.SpoolOwnerLock(sys.argv[2])\n"
         "worker = os.fork()\n"
         "if worker == 0:\n"
+        "    print('worker ran', flush=True)\n"  # past fork(), and its handler
         "    time.sleep(3600)\n"
         "    os._exit(0)\n"
         "print(worker, flush=True)\n"
@@ -189,8 +195,13 @@ def test_a_forked_worker_does_not_keep_a_dead_owners_lock(tmp_path):
     owner = subprocess.Popen(
         [sys.executable, "-c", script, str(BUILD), str(directory)],
         stdout=subprocess.PIPE, text=True)
-    worker = int(owner.stdout.readline())
+    worker = None
     try:
+        # The worker's line and the owner's, in either order.
+        lines = {owner.stdout.readline().strip(),
+                 owner.stdout.readline().strip()}
+        assert "worker ran" in lines, lines
+        (worker,) = [int(line) for line in lines if line != "worker ran"]
         assert _store().spool_owner(str(directory))["pid"] == owner.pid
         os.kill(owner.pid, signal.SIGKILL)
         owner.wait(timeout=30)
@@ -199,10 +210,11 @@ def test_a_forked_worker_does_not_keep_a_dead_owners_lock(tmp_path):
         with _store().SpoolOwnerLock(str(directory)):
             pass
     finally:
-        try:
-            os.kill(worker, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if worker is not None:
+            try:
+                os.kill(worker, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         if owner.poll() is None:
             owner.kill()
             owner.wait(timeout=30)

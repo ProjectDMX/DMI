@@ -393,7 +393,10 @@ void TestAForkedChildDoesNotKeepTheLockPastItsParent() {
 // with the fork handler only once the lock was held, that copy was never
 // closed in the child, which kept the directory looking live after its
 // owner died. Here the fork runs in that window, through the lock-open
-// test seam.
+// test seam. The worker says it has run before its owner is killed: the
+// fork handler closes its copy only once the child is first scheduled,
+// which on a loaded host can come tens of milliseconds after the owner
+// is reaped, and until then the lock outlives its owner.
 void TestAForkWhileALockIsTakenLeavesTheChildNothing() {
   const std::string root = FreshRoot("fork-window") + "/spool";
   fs::create_directories(root);
@@ -407,6 +410,9 @@ void TestAForkWhileALockIsTakenLeavesTheChildNothing() {
       if (worker >= 0) return;
       worker = ::fork();  // no exec
       if (worker == 0) {
+        // Past fork(), so past the fork handler.
+        const char ran = 'w';
+        if (::write(ready[1], &ran, 1) != 1) ::_exit(3);
         ::pause();  // outlives its parent until killed
         ::_exit(0);
       }
@@ -424,16 +430,20 @@ void TestAForkWhileALockIsTakenLeavesTheChildNothing() {
     ::_exit(0);
   }
   ::close(ready[1]);
+  // The worker's 'w' and the owner's "k<worker pid>\n", in any order.
   std::string seen;
   char byte = 0;
-  while (seen.find('\n') == std::string::npos &&
-         ::read(ready[0], &byte, 1) == 1) {
+  while (seen.find('\n') == std::string::npos ||
+         seen.find('w') == std::string::npos) {
+    if (::read(ready[0], &byte, 1) != 1) break;
     seen.push_back(byte);
   }
   ::close(ready[0]);
-  CHECK(!seen.empty() && seen[0] == 'k');
-  const pid_t worker =
-      static_cast<pid_t>(std::atoi(seen.empty() ? "" : seen.c_str() + 1));
+  CHECK(seen.find('w') != std::string::npos);  // the worker has run
+  const size_t outcome = seen.find_first_of("kx");
+  CHECK(outcome != std::string::npos && seen[outcome] == 'k');
+  const pid_t worker = static_cast<pid_t>(std::atoi(
+      outcome == std::string::npos ? "" : seen.c_str() + outcome + 1));
   CHECK(worker > 0);
   dmi_store::SpoolOwner record;
   CHECK(dmi_store::ReadSpoolOwner(root, &record));
