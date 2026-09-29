@@ -197,10 +197,11 @@ directory itself, taken before the service starts and let go after the sink and
 the service are done, when a drained directory is removed. The directory's own
 lock keeps it owned should its `.owner.lock` be removed from under it, and
 systemd-tmpfiles skips a flocked directory when it ages `/tmp`; other cleaners
-may not, so keep `spool_root` out of what they age. If the sink did not seal within
-`close_flush_timeout_s`, it may still be staging, so the directory stays owned
-by the process until it exits (a warning names it) and the next process on the
-node adopts it; so does the directory of an engine dropped without `close()`.
+may not, so keep `spool_root` out of what they age. If the sink did not seal --
+the release backstop's flush, when the stopping ring lets go of it, did not go
+through -- it may still be staging, so the directory stays owned by the
+process until it exits (a warning names it) and the next process on the node
+adopts it; so does the directory of an engine dropped without `close()`.
 A second process on a directory is
 refused, naming the holder's pid and host. Once started, the service's
 background loop adopts the directories under the same catalog key whose owners
@@ -209,7 +210,11 @@ indexed, a round at a time and a slice of each cycle, and the directory
 removed, so a crashed process's packs reach the catalog through the next one on
 the node, whatever run it belongs to. Neither `create_record_runtime` nor
 `flush_and_wait` waits for that: a flush covers this process's records (an
-adopted pack uploaded and not yet indexed is waited for like its own), and the
+adopted pack uploaded and not yet indexed is waited for like its own), waits
+for no more of an adoption in progress than the step it is in (one round, or
+one directory's listing), and `close()` cuts an adoption as it cuts the
+service's own uploads, leaving what it did not upload in the dead directory
+for the next process. The
 storage part of `capture_status()` reports the adoption (`adopted_spools`,
 `adopted_packs`, `adoption_owed`, `live_siblings`). A dead directory the
 service can never adopt -- one holding a pack it can never upload, such as one
