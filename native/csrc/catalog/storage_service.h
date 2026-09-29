@@ -317,8 +317,9 @@ class CaptureStorageService {
   // Indexes refs in bounded batches, appending every ref that did not index
   // to *unindexed. Only a lost lease propagates; other failures are
   // recorded. A non-zero deadline_ns (steady ns) starts no batch past it
-  // but the first. Returns how many of *unindexed a cancel or the deadline
-  // left there: owed, but not failed.
+  // but the first, and none starts once read_cancel_ is cancelled. Returns
+  // how many of *unindexed a cancel or the deadline left there: owed, but
+  // not failed.
   size_t index_bounded(std::vector<PackRefData> refs,
                        std::vector<PackRefData>* unindexed,
                        uint64_t deadline_ns = 0);

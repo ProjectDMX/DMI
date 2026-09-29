@@ -732,11 +732,16 @@ size_t CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
   };
   bool first = true;
   while (!work.empty()) {
+    // Once the reads are cut -- stop(), or a flush one request timeout
+    // past its deadline -- no batch starts, the first included: it could
+    // read nothing, and would only send catalog statements (the replay
+    // guard) whose answer is thrown away, and which stop() waits for.
     // Past the deadline no batch starts but the first: the pass overruns
     // it by one batch at most, never by the rest of its work, however many
     // batches that is. Catalog statements are never cut, so this is where
     // the pass can stop.
-    if (!first && deadline_ns != 0 && steady_ns() >= deadline_ns) {
+    if (read_cancel_.cancelled() ||
+        (!first && deadline_ns != 0 && steady_ns() >= deadline_ns)) {
       std::vector<PackRefData> none;
       defer(none);
       break;
@@ -871,6 +876,8 @@ bool CaptureStorageService::reconcile() {
       packs.push_back(&object);
     }
     if (packs.empty()) continue;
+    // A listing answered just as stop() came: nothing after it can be read.
+    if (upload_cancel_.cancelled()) return false;
     std::set<PackIdentity> committed;
     {
       LeaseScope lease(this);
