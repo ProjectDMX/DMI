@@ -344,6 +344,39 @@ def test_a_cancel_ends_the_retries_and_keeps_the_pack_staged(fake_s3,
         store.close()
 
 
+def test_a_cancel_wakes_the_uploaders_own_backoff(fake_s3, tmp_path):
+    """The uploader backs off between its attempts on a pack, for up to
+    max_backoff_s (10 s), apart from the S3 client's backoff inside each
+    attempt. Here each attempt is one HEAD answered 500 at once (one
+    transport attempt), and the uploader's backoff is 2 s (+-20% jitter):
+    the cancel at 0.3 s lands in the first one. Slept out, it would end
+    after 1.6 s at the earliest, when the check before the next attempt
+    stops the upload anyway."""
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        staged = _stage(sink, tmp_path / "spool", 7)
+        staged = dict(staged, object_key=(
+            "fault/always-500/" + staged["object_key"].rsplit("/", 1)[1]))
+        fields = _store_base(fake_s3, max_attempts=1)
+        fields.update(
+            op="upload_one", root=str(tmp_path / "spool"),
+            spool_max_bytes=1 << 40, upload_max_attempts=4,
+            upload_base_backoff_ms=2000, staged=staged, cancel_after_ms=300,
+        )
+        started = time.monotonic()
+        result = store.call(**fields)
+        elapsed = time.monotonic() - started
+        assert not result["ok"], result
+        assert result["cancelled"] is True, result
+        assert result["upload_attempts"] == 1, result
+        assert elapsed < 1.2, (elapsed, result)
+        assert Path(staged["path"]).exists()
+    finally:
+        sink.close()
+        store.close()
+
+
 @pytest.mark.parametrize("request_cut", [False, True],
                          ids=["failed-on-its-own", "cut-by-the-cancel"])
 def test_a_cancel_counts_only_when_it_ended_the_upload(fake_s3, tmp_path,

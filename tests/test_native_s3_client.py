@@ -930,14 +930,17 @@ def test_a_cancel_aborts_a_multipart_upload_and_says_so_to_the_store(fake_s3):
 def test_a_cancel_interrupts_the_retry_backoff(fake_s3):
     """Ten attempts against a store that always answers 500 back off for
     about 26 s in all; a cancel wakes the backoff instead of sleeping it
-    out."""
+    out. The attempts start at 0, 0.2, 0.6 and 1.4 s, and the cancel lands
+    early in the 1.6 s backoff after the fourth: slept out, that backoff
+    ends at 3.0 s, where the check before the fifth attempt would stop it
+    anyway -- so only a return well before then shows the backoff woke."""
     head, elapsed = _timed_call(
         "head", **_base(fake_s3, max_attempts=10), key="fault/always-500/c",
-        cancel_after_ms=500)
+        cancel_after_ms=1500)
     assert not head["ok"], head
     assert head.get("cancelled") is True, head
-    assert head["attempts"] <= 3, head
-    assert elapsed < 3.0, elapsed
+    assert head["attempts"] == 4, head
+    assert elapsed < 2.2, elapsed
 
 
 def test_an_uncancelled_request_is_untouched_by_the_cancel_hook(fake_s3):

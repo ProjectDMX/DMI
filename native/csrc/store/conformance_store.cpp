@@ -162,6 +162,10 @@ dmi_store::UploaderConfig ReadUploaderConfig(const std::string& line) {
   // attempt (like botocore), and only its exhaustion surfaces here.
   const int64_t attempts = Integer(line, "upload_max_attempts");
   if (attempts > 0) config.max_attempts = static_cast<int>(attempts);
+  // The uploader's own backoff between attempts, base * 2^attempt capped
+  // at max_backoff_s: long enough, a cancel shows whether it wakes it.
+  const int64_t backoff_ms = Integer(line, "upload_base_backoff_ms");
+  if (backoff_ms > 0) config.base_backoff_s = backoff_ms / 1000.0;
   config.store_id = jc::FindString(line, "store_id");
   if (config.store_id.empty()) config.store_id = "s3";
   return config;
