@@ -783,22 +783,58 @@ def test_close_flushes_the_sink_before_the_ring_stops(monkeypatch, tmp_path):
     assert engine._capture_storage is None
 
 
-def test_close_still_stops_when_the_sink_flush_fails(monkeypatch, tmp_path):
-    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
-    engine.create_record_runtime(_record_format())
-
+def _fail_the_sink_flush(engine, events):
     def _failing_flush(timeout_s):
         events.append(("sink", "flush", timeout_s))
         raise TimeoutError("timed out waiting for durable record completion")
 
     engine._ring_transport.flush_records_and_wait = _failing_flush
+
+
+def test_close_still_stops_when_the_sink_flush_fails(monkeypatch, tmp_path,
+                                                     caplog):
+    """The service still stops. The spool lock does not go: a sink that did
+    not seal may still be staging -- it outlives close() through the user's
+    RecordRuntime, and its stagers and destructor write into the directory
+    -- so another process's adoption (or this one's next engine) must not
+    take the directory from under it. The kernel lets go at exit."""
+    from dmi.storage import native_capture
+
+    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
+    engine.create_record_runtime(_record_format())
+    _fail_the_sink_flush(engine, events)
+    (lock,) = engine._test_locks
     events.clear()
 
-    engine.close()
+    with caplog.at_level("WARNING", logger="dmi.engine"):
+        engine.close()
 
     assert [event[:2] for event in events] == [
         ("sink", "flush"), ("ring", "stop"),
-        ("service", "flush"), ("service", "stop"), ("lock", "release")]
+        ("service", "flush"), ("service", "stop")]
+    assert lock.held
+    assert engine._spool_claim is None
+    # Kept alive for the process, so no garbage collection lets go of it.
+    assert any(claim._lock is lock
+               for claim in native_capture._HELD_SPOOL_CLAIMS)
+    assert lock.directory in caplog.text
+    assert "stays owned" in caplog.text
+
+
+def test_replacing_a_record_ring_keeps_the_lock_when_the_sink_did_not_seal(
+        monkeypatch, tmp_path):
+    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
+    engine.create_record_runtime(_record_format())
+    _fail_the_sink_flush(engine, events)
+    (lock,) = engine._test_locks
+    events.clear()
+
+    engine.enable_ring_transport(object())
+
+    assert [event[:2] for event in events] == [
+        ("sink", "flush"), ("ring", "stop"),
+        ("service", "flush"), ("service", "stop"), ("ring", "create")]
+    assert lock.held
 
 
 def test_close_releases_the_lease_even_when_the_drain_fails(monkeypatch, tmp_path):

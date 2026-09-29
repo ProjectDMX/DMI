@@ -253,6 +253,32 @@ def test_a_spool_root_a_sink_once_owned_still_takes_rank_directories(tmp_path):
         claim.release()
 
 
+def test_a_dropped_spool_claim_keeps_its_directory_owned(tmp_path):
+    """Only release() lets go of a claim. An engine dropped without close()
+    drops its claim, while the ring and the sink it activated may still be
+    capturing into the directory: garbage collection must not unlock it for
+    another process to adopt. The kernel lets go when the process exits."""
+    import gc
+
+    from dmi.storage import native_capture
+    from dmi.storage.native_capture import (
+        NativeSinkConfig, claim_spool_directory,
+    )
+
+    claim = claim_spool_directory(
+        NativeSinkConfig(spool_root=str(tmp_path / "root")), _config())
+    directory = claim.directory
+    del claim
+    gc.collect()
+    try:
+        assert _store().spool_owner(directory)["pid"] == os.getpid()
+    finally:
+        for kept in list(native_capture._HELD_SPOOL_CLAIMS):
+            if kept.directory == directory:
+                kept.release()
+    assert _store().spool_owner(directory) is None
+
+
 def test_a_shared_filesystem_is_refused_unless_allowed(tmp_path):
     store = _store()
     store._set_spool_filesystem_type_for_testing(NFS_SUPER_MAGIC)

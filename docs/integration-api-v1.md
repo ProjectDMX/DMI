@@ -192,7 +192,11 @@ hex digits of sha256 of `database/table_prefix/store_id`, the rank torchrun's
 `RANK`, 0 when unset, and the incarnation fresh on every
 `create_record_runtime`), and owns it: an flock on its `.owner.lock`, taken
 before the service starts and let go after the sink and the service are done,
-when a drained directory is removed. A second process on a directory is
+when a drained directory is removed. If the sink did not seal within
+`close_flush_timeout_s`, it may still be staging, so the directory stays owned
+by the process until it exits (a warning names it) and the next process on the
+node adopts it; so does the directory of an engine dropped without `close()`.
+A second process on a directory is
 refused, naming the holder's pid and host. At start the service adopts the
 directories under the same catalog key whose owners have died: their stale
 `.open` files are swept, their ready packs uploaded and indexed, and the

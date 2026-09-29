@@ -824,8 +824,8 @@ class MonitoringEngine:
             drain_deadline = None if storage is None else (
                 time.monotonic()
                 + self._capture_storage_config.close_flush_timeout_s)
-            if storage is not None:
-                self._seal_capture_sink(drain_deadline)
+            sealed = storage is not None and self._seal_capture_sink(
+                drain_deadline)
             if old_record_mode:
                 self._report_capture_failure()
             try:
@@ -846,7 +846,8 @@ class MonitoringEngine:
             self._record_mode = False
             self._record_sink = None
             if storage is not None:
-                self._retire_capture_storage(storage, drain_deadline)
+                self._retire_capture_storage(storage, drain_deadline,
+                                             sink_sealed=sealed)
 
         # Pass the DMXHostEngine C++ object directly; RingEngine builds a
         # SubmitFn that calls submit_direct without touching Python/GIL.
@@ -886,8 +887,8 @@ class MonitoringEngine:
         self._auto_batch_group_id += 1
         return gid
 
-    def _seal_capture_sink(self, deadline: float) -> None:
-        """Flush the record sink before its ring stops.
+    def _seal_capture_sink(self, deadline: float) -> bool:
+        """Flush the record sink before its ring stops; whether it sealed.
 
         Stopping the ring releases the sink WITHOUT flushing it, so the
         records of its open pack would still be in memory while the service
@@ -898,8 +899,11 @@ class MonitoringEngine:
                 max(0.0, deadline - time.monotonic()))
         except Exception as exc:
             _LOG.warning("capture sink did not flush: %s", exc)
+            return False
+        return True
 
-    def _retire_capture_storage(self, storage: Any, deadline: float) -> None:
+    def _retire_capture_storage(self, storage: Any, deadline: float, *,
+                                sink_sealed: bool) -> None:
         """Drain the storage service until ``deadline``, then stop it."""
         if self._capture_storage is not storage:
             return
@@ -916,9 +920,33 @@ class MonitoringEngine:
             try:
                 storage.stop()
             finally:
-                # Last: the ring is stopped and the sink sealed by now, and
-                # the service has stopped touching the directory.
-                self._release_spool_claim()
+                # Last: the ring is stopped by now, and the service has
+                # stopped touching the directory. The sink is let go of only
+                # if it sealed.
+                if sink_sealed:
+                    self._release_spool_claim()
+                else:
+                    self._keep_spool_claim_held()
+
+    def _keep_spool_claim_held(self) -> None:
+        """Leave the spool directory owned by this process until it exits.
+
+        A sink that did not seal may still be staging: it outlives the ring
+        (the user's RecordRuntime keeps it), its stagers carry on, and its
+        destructor stages what it still holds. Let go of now, the directory
+        is another process's to adopt (or this process's next engine's),
+        and that adoption would sweep a stage in flight; removed, it would
+        be recreated by the next stage with no lock at all. The claim stays
+        in ``native_capture``'s registry, so nothing lets go of it until the
+        kernel does, at exit; the next process on the node adopts it then.
+        """
+        claim, self._spool_claim = self._spool_claim, None
+        if claim is not None:
+            _LOG.warning(
+                "capture sink did not seal, so its spool directory %s stays "
+                "owned by this process until it exits; the next process on "
+                "the node for this catalog adopts what it holds",
+                claim.directory)
 
     def close(self) -> None:
         """Tear down backend resources."""
@@ -928,6 +956,9 @@ class MonitoringEngine:
         # pack, then getting everything staged into the catalog.
         drain_deadline = None if storage is None else (
             time.monotonic() + self._capture_storage_config.close_flush_timeout_s)
+        # Whether nothing can still stage into the spool: no record sink to
+        # seal, or one whose seal went through.
+        sealed = True
         if self._ring_transport is not None:
             record_mode = self._record_mode
             stopped = False
@@ -940,7 +971,7 @@ class MonitoringEngine:
                 except Exception:
                     pass
             if record_mode and storage is not None:
-                self._seal_capture_sink(drain_deadline)
+                sealed = self._seal_capture_sink(drain_deadline)
             if record_mode:
                 self._report_capture_failure()
             try:
@@ -965,7 +996,8 @@ class MonitoringEngine:
             self._record_sink = None
 
         if storage is not None:
-            self._retire_capture_storage(storage, drain_deadline)
+            self._retire_capture_storage(storage, drain_deadline,
+                                         sink_sealed=sealed)
 
         if self._host_engine is not None:
             try:

@@ -585,18 +585,29 @@ def _spool_producer_rank() -> int:
     return int(text) if text.isdigit() else 0
 
 
+# Every SpoolClaim not yet released. Dropping a claim must not let go of its
+# directory: an engine dropped without close() drops its claim while the
+# ring and the sink it activated may still be capturing into the directory,
+# and another process's adoption would then sweep it from under them. So a
+# claim lives until release(), or until the process exits and the kernel
+# drops its lock.
+_HELD_SPOOL_CLAIMS: set["SpoolClaim"] = set()
+
+
 class SpoolClaim:
     """This process's own spool directory, owned through its lock.
 
     From :func:`claim_spool_directory`. Hold it for as long as anything in
     the process writes or reads the directory -- the engine holds it from
     before its storage service starts until the sink and the service are
-    done -- then :meth:`release` it.
+    done -- then :meth:`release` it. Only ``release()`` lets go: a claim
+    that is merely dropped stays held until the process exits.
     """
 
     def __init__(self, lock: Any) -> None:
         self._lock = lock
         self.directory: str = lock.directory
+        _HELD_SPOOL_CLAIMS.add(self)
 
     @property
     def held(self) -> bool:
@@ -606,7 +617,9 @@ class SpoolClaim:
         """Let go of the directory, removing it if nothing but its lock
         file is left. Whatever did not drain stays, and the next process on
         the node for this catalog adopts it. Returns whether it was
-        removed."""
+        removed. Call it only once nothing in the process can still write
+        the directory."""
+        _HELD_SPOOL_CLAIMS.discard(self)
         return bool(self._lock.release_and_remove_if_empty())
 
 
