@@ -4,14 +4,17 @@
 //   NativePackSink -> spool  (the sink, in the capture process)
 //   spool -> SpoolUploader -> object store -> NativeIndexer -> catalog  (here)
 //
-// One background thread runs a cycle: upload everything pending, index what
-// was uploaded, keep the publisher lease alive, and periodically reconcile the
-// bucket against the catalog. The conformance drivers exercise each of these
-// pieces; this is what composes them outside a test.
+// One background thread runs a cycle: upload what is pending and index it, a
+// chunk at a time, keep the publisher lease alive, and periodically reconcile
+// the bucket against the catalog. The conformance drivers exercise each of
+// these pieces; this is what composes them outside a test.
 //
 // SpoolUploader removes a pack from the spool the moment its upload is
 // verified, before anything indexes it, so the spool alone cannot say what is
-// still owed to the catalog. Two things cover the gap:
+// still owed to the catalog. A cycle uploads a chunk of indexer.max_packs at
+// a time and indexes it before it uploads the next, so at most one chunk is
+// in that gap at once, and a cycle cut short leaves the rest in the spool.
+// Two things cover the gap:
 //   - in-process, a pack whose indexing fails stays on a retry list, and
 //     flush() does not report drained until that list is empty. Nothing new
 //     is uploaded while it is not, so an outage leaves new packs in the
@@ -64,6 +67,27 @@
 // (or, once, until the quarantine it left is over), and lease requests that
 // keep timing out say which knobs bound them (snapshot().lease_timeout_error). The constructor refuses a clock skew
 // that leaves a renewal too little time to finish.
+//
+// Cancelled object-store work. The uploads go through an S3 client of their
+// own that shares one Cancellation with the uploader; the index reads and
+// the reconcile go through the other client, which has a Cancellation of
+// its own. stop() cancels both for good. A flush arms a deadline on both
+// for the cycle it runs: the uploads' at the flush deadline, the reads'
+// one catalog request timeout past it, since a pack cut short on upload
+// stays in the durable spool but one uploaded and not yet indexed is owed,
+// and only this process remembers it. A cancel starts no further request,
+// aborts a transfer in flight (a multipart upload is then aborted, one
+// attempt bounded by 5 s) and ends a retry backoff; a cancelled upload
+// leaves its pack in the spool, a cancelled read leaves its pack owed. The
+// uploads' cancel also stops a spool listing between packs, since listing
+// hashes every staged pack and a backlog would hold it for as long.
+// Catalog statements are never cut mid-flight: each is bounded by the
+// client's request timeout, or under the lease by the lease deadline.
+// An index pass ends at its first failure: a batch that threw, or a pack
+// the object store did not answer for (a transport error, a timeout, a
+// retryable status on every attempt), which leaves the rest of the pass
+// owed without counting against the packs. Only a pack the store answered
+// for and the indexer refused counts towards max_index_attempts.
 #pragma once
 
 #include <atomic>
@@ -83,6 +107,7 @@
 #include "catalog/catalog_writer.h"
 #include "catalog/clickhouse_client.h"
 #include "catalog/indexer.h"
+#include "store/cancel.h"
 #include "store/s3_client.h"
 #include "store/spool.h"
 #include "store/uploader.h"
@@ -196,14 +221,14 @@ struct StorageServiceConfig {
   // take the lease and sweep while the first is still writing; one on
   // another (database, table_prefix) never meets the lease at all. Its
   // Recover() also lists the first's sealed packs, which the first may
-  // upload too. A cycle checks the lease once, before its upload batch, and
-  // UploadPending does not stop when the lease is lost: a holder that is
-  // quarantined, or refused a renewal or publish, while a batch is in
-  // flight finishes that batch (which can outlast the TTL), and only its
-  // later cycles upload nothing while it holds no lease. One whose catalog
-  // requests stall gives the lease up at its deadline, before its row
+  // upload too. A cycle checks the lease before each chunk it uploads, and
+  // the uploads in flight do not stop when the lease is lost: a holder that
+  // is quarantined, or refused a renewal or publish, while a chunk is in
+  // flight finishes that chunk (which can outlast the TTL), and uploads
+  // nothing more while it holds no lease. One whose catalog requests
+  // stall gives the lease up at its deadline, before its row
   // lapses: requests made under the lease are cut off there, and a cycle's
-  // check abandons a lease past it (LeaseScope), so no batch starts after
+  // check abandons a lease past it (LeaseScope), so no chunk starts after
   // that. Only a holder whose whole process stalls keeps the lease locally
   // past its row: until it resumes and next checks, or -- after a system
   // suspend, which the steady clock the deadline runs on does not count --
@@ -221,6 +246,9 @@ struct StorageServiceSnapshot {
   uint64_t uploaded_packs = 0;
   uint64_t uploaded_bytes = 0;
   uint64_t upload_failures = 0;
+  // Uploads a flush deadline or stop() cancelled, the pack left staged.
+  // Not failures: nothing was wrong with the pack or the store.
+  uint64_t cancelled_uploads = 0;
   uint64_t indexed_packs = 0;
   uint64_t indexed_rows = 0;
   uint64_t index_failures = 0;
@@ -288,15 +316,46 @@ class CaptureStorageService {
   // Run cycles until one finds the spool empty with every uploaded pack
   // indexed, or the timeout passes. Call after the sink's own flush, so
   // everything it will stage is already staged. Returns false on timeout,
-  // including while a cycle already in flight outlives the deadline; it can
-  // overrun only by its own last cycle, whose requests are all bounded.
+  // including while a cycle already in flight outlives the deadline, and
+  // once stop() has begun. The cycles it runs honour the deadline: they
+  // skip the reconcile (the loop runs it), and at the deadline their
+  // uploads are cancelled, each pack cut short left in the spool, and no
+  // further chunk starts, so what is not uploaded by then stays in the
+  // spool. The chunk a cycle has uploaded it still indexes, since until
+  // then only this process remembers it -- but past the deadline no index
+  // batch starts after the first: that batch's object-store reads are cut
+  // one catalog request timeout past the deadline, and its catalog
+  // statements are never cut mid-flight, each bounded by the client's
+  // request timeout (under the lease, by the lease deadline). What it
+  // leaves unindexed stays owed, for the loop or a later flush. A pass
+  // ends at its first failure, so a flush overruns its deadline by about
+  // one request timeout against a catalog or an object store that stopped
+  // answering, and by one batch of statements against a slow catalog that
+  // still answers. A multipart upload the deadline cuts adds its abort,
+  // which no request timeout bounds: up to about a second for the stalled
+  // transfer to see the cancel (libcurl's progress poll), then one abort
+  // request of at most 5 s that nothing cuts -- past one request timeout
+  // when that is under about 6 s. At zero it still runs one cycle, which
+  // indexes one batch of what earlier cycles owe and uploads nothing.
   // Its cycles adopt nothing, and a dead sibling still to adopt does not
   // keep it from returning true (adopt_sibling_spools).
   // Throws, once, if packs were set aside since the last flush: they are in
   // the object store but can never reach the catalog.
   bool flush(double timeout_s);
 
-  // Stop the background cycle and release the lease. Does not flush.
+  // Stop the background cycle and release the lease. Does not flush. Its
+  // object-store work is cancelled first: a spool listing stops between
+  // packs; an upload in flight is aborted, its pack left in the spool for
+  // the next start, with every pack no upload has reached; an index read
+  // in flight is cut, its pack left owed -- which stop() drops, so it waits
+  // in the bucket for a start's reconcile (reconcile_on_start); that is at
+  // most the one chunk a cycle has uploaded and not yet indexed. A retry
+  // backoff ends, and so does the reconcile. What stop() still waits for
+  // is the catalog work in flight, never cut mid-flight, the abort of a
+  // multipart upload it cut (one attempt, 5 s at most), and the lease
+  // release, each catalog request bounded by the client's request timeout
+  // (under the lease, by the lease deadline); the lease renews until the
+  // loop is done.
   void stop();
 
   StorageServiceSnapshot snapshot() const;
@@ -309,6 +368,9 @@ class CaptureStorageService {
   struct CycleOutcome {
     bool drained = false;  // nothing pending and nothing failed
     bool failed = true;    // an upload or index failed, or the cycle threw
+    // A cancel left packs in the spool: neither drained nor a failure, so
+    // it moves the backoff neither way.
+    bool cut_short = false;
   };
 
   // Holds lease_mutex_ for a stretch of catalog work, and bounds every
@@ -369,18 +431,31 @@ class CaptureStorageService {
       const std::vector<std::filesystem::path>& staging);
   // Indexes refs that are gone from their spool, keeping whatever does not
   // index in pending_index_ -- the only record of it in-process. With no
-  // catalog, keeps them all. Requires cycle_mutex_.
-  void index_or_owe(std::vector<PackRefData> refs, bool catalog);
+  // catalog, keeps them all. Returns how many of those a cancel or the
+  // deadline left owed (index_bounded). Only a lost lease propagates.
+  // Requires cycle_mutex_.
+  size_t index_or_owe(std::vector<PackRefData> refs, bool catalog,
+                      uint64_t deadline_ns);
   // Stops the lease thread and waits for it.
   void stop_lease_thread();
-  // Requires cycle_mutex_. `adopt`: the loop's cycles adopt, flush()'s do
-  // not.
-  CycleOutcome run_cycle(bool adopt);
+  // One cycle. A non-zero deadline_ns (steady ns) cancels its uploads at
+  // that moment -- flush()'s -- and allow_reconcile false skips the
+  // periodic and the owed reconcile. `adopt`: the loop's cycles adopt dead
+  // siblings (adopt_sibling_spools), flush()'s do not. Requires
+  // cycle_mutex_.
+  CycleOutcome run_cycle(uint64_t deadline_ns, bool allow_reconcile,
+                         bool adopt);
   // Indexes refs in bounded batches, appending every ref that did not index
-  // to *unindexed. Only a lost lease propagates; other failures are recorded.
-  void index_bounded(std::vector<PackRefData> refs,
-                     std::vector<PackRefData>* unindexed);
-  void reconcile();
+  // to *unindexed. Only a lost lease propagates; other failures are
+  // recorded. A non-zero deadline_ns (steady ns) starts no batch past it
+  // but the first, and none starts once read_cancel_ is cancelled. Returns
+  // how many of *unindexed a cancel or the deadline left there: owed, but
+  // not failed.
+  size_t index_bounded(std::vector<PackRefData> refs,
+                       std::vector<PackRefData>* unindexed,
+                       uint64_t deadline_ns = 0);
+  // False when stop() cut it short, between two of its requests.
+  bool reconcile();
   void keep_lease();          // the lease thread's body
   void renew_lease_if_due();  // requires lease_mutex_
   // LeaseScope's before_request hook: renew_lease_if_due() before each
@@ -415,7 +490,16 @@ class CaptureStorageService {
   void latch_failure(std::exception_ptr failure, const std::string& message);
 
   const StorageServiceConfig config_;
+  // Cancels the uploads: stop() for good, a flush's cycle at its deadline.
+  // Before the clients that point at it.
+  dmi_store::Cancellation upload_cancel_;
+  // Cancels the index reads and the reconcile's requests: stop() for good,
+  // a flush's cycle one catalog request timeout past its deadline.
+  dmi_store::Cancellation read_cancel_;
+  // Indexing and the reconcile read through s3_, which read_cancel_ cuts;
+  // the uploader writes through upload_s3_, which upload_cancel_ does.
   dmi_store::S3Client s3_;
+  dmi_store::S3Client upload_s3_;
   std::shared_ptr<const ClickHouseClient> clickhouse_;
   CatalogWriter writer_;
   NativeIndexer indexer_;
@@ -461,6 +545,10 @@ class CaptureStorageService {
   bool live_siblings_ = false;
   uint64_t last_adoption_scan_ns_ = 0;
   int failure_streak_ = 0;  // consecutive failed cycles, for the backoff
+  // steady ns at which the last cycle -- the loop's or a flush's -- ended;
+  // 0 before the first. The loop waits its interval from it. Guarded by
+  // cycle_mutex_.
+  uint64_t last_cycle_end_ns_ = 0;
   // Uploaded, so gone from the spool, but not yet in the catalog.
   std::vector<PackRefData> pending_index_;
   std::map<std::string, int> index_attempts_;  // by pack id

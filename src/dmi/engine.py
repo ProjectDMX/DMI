@@ -681,7 +681,15 @@ class MonitoringEngine:
         deadline = time.monotonic() + float(timeout_s)
         transport.flush_records_and_wait(float(timeout_s))
         # The sink's boundary is a staged pack; with the storage service it
-        # is a pack in the catalog. Its flush runs one cycle even at zero.
+        # is a pack in the catalog. The service's flush returns on time:
+        # past the deadline it starts no upload and at most one index
+        # batch, leaving the rest to its background loop -- about one
+        # clickhouse_request_timeout_s late against a catalog or store that
+        # stopped answering, and up to about 6 s late when the deadline cuts
+        # a multipart upload, whose abort nothing cuts
+        # (NativeCaptureStorageConfig.close_flush_timeout_s has the
+        # details). At zero it still runs one cycle, so a drained spool
+        # reports drained.
         storage = self._capture_storage
         if storage is not None:
             storage.flush(max(0.0, deadline - time.monotonic()))
@@ -893,11 +901,14 @@ class MonitoringEngine:
         return gid
 
     def _seal_capture_sink(self, deadline: float) -> bool:
-        """Flush the record sink before its ring stops; whether it sealed.
+        """Flush the record sink before its ring stops, within ``deadline``;
+        whether it sealed.
 
-        Stopping the ring releases the sink WITHOUT flushing it, so the
-        records of its open pack would still be in memory while the service
-        drains a spool that does not hold them yet.
+        Releasing the sink from the stopping ring flushes it too (the native
+        pack sink's release backstop), but only as a last resort: bounded
+        by its own timeout, and with nothing but a line on stderr when it
+        fails. This flush comes first, inside close()'s budget, and logs
+        why it failed.
         """
         try:
             self._ring_transport.flush_records_and_wait(
@@ -914,9 +925,10 @@ class MonitoringEngine:
             return
         self._capture_storage = None
         # Best effort: once the sink is sealed, a pack that does not reach
-        # the catalog here is still in the spool or the bucket, and the next
-        # start uploads or reconciles it. flush_and_wait is the boundary
-        # that reports.
+        # the catalog here is still in the spool, which the next start on it
+        # uploads, or uploaded but unindexed -- one index batch at most --
+        # which only the next start's reconcile finds (reconcile_on_start,
+        # on by default). flush_and_wait is the boundary that reports.
         try:
             storage.flush(max(0.0, deadline - time.monotonic()))
         except Exception as exc:
@@ -954,7 +966,21 @@ class MonitoringEngine:
                 claim.directory)
 
     def close(self) -> None:
-        """Tear down backend resources."""
+        """Tear down backend resources.
+
+        A record ring is stopped, which drains its queued records into the
+        sink and releases the sink; the native pack sink stages its open
+        pack in the spool on that release. With a storage service
+        (``capture_storage_config``), close() drains capture first, best
+        effort, with a budget of ``close_flush_timeout_s``: it flushes the
+        sink, stops the ring, waits for the service to get the staged packs
+        into the catalog, then stops the service. The drain can outlast
+        the budget -- stopping the service is not bounded by it -- and
+        ``NativeCaptureStorageConfig.close_flush_timeout_s`` says by how
+        much. What does not drain in time is logged, not raised, and stays
+        where the next start recovers it; ``flush_and_wait`` is the call
+        that raises.
+        """
 
         storage = self._capture_storage
         # One budget for the whole capture drain: sealing the sink's open

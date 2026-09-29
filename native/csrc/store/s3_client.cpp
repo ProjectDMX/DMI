@@ -77,13 +77,28 @@ bool IsRetryableStatus(long status) {
          status == 504;
 }
 
-void Backoff(int attempt) {
+// False when `cancel` (may be null) woke it before the wait was out.
+bool Backoff(int attempt, const Cancellation* cancel) {
   // 0.2s * 2^attempt, capped at 5s. Deterministic: the fault-matrix tests
-  // assert attempt counts, not wall time, so no jitter.
+  // assert attempt counts, not wall time, so no jitter. The shift is capped
+  // too: max_attempts goes up to 1000, and 200 << 56 overflows int64 (a
+  // negative wait, so no backoff at all), 200 << 64 is undefined.
   using namespace std::chrono;
-  const int64_t ms = std::min<int64_t>(5000, 200LL << attempt);
+  const int64_t ms = std::min<int64_t>(5000, 200LL << std::min(attempt, 5));
+  if (cancel != nullptr) return cancel->SleepFor(milliseconds(ms));
   std::this_thread::sleep_for(milliseconds(ms));
+  return true;
 }
+
+// CURLOPT_XFERINFOFUNCTION: libcurl calls it throughout a transfer --
+// connecting included, and at least once a second while nothing moves --
+// and aborts the transfer (CURLE_ABORTED_BY_CALLBACK) on a non-zero return.
+int AbortWhenCancelled(void* cancel, curl_off_t, curl_off_t, curl_off_t,
+                       curl_off_t) {
+  return static_cast<const Cancellation*>(cancel)->cancelled() ? 1 : 0;
+}
+
+constexpr const char* kCancelled = "request cancelled";
 
 std::string XmlEscape(const std::string& value) {
   std::string out;
@@ -186,7 +201,33 @@ S3Response S3Client::Exchange(
     const std::vector<std::pair<std::string, std::string>>& query,
     const std::map<std::string, std::string>& extra_headers,
     const uint8_t* body, size_t body_len, const std::string& body_hash_hex) {
+  S3Response response =
+      ExchangeWith(method, key, query, extra_headers, body, body_len,
+                   body_hash_hex, ExchangeOptions{});
+  if (after_exchange_for_testing_) after_exchange_for_testing_();
+  return response;
+}
+
+S3Response S3Client::ExchangeWith(
+    const std::string& method, const std::string& key,
+    const std::vector<std::pair<std::string, std::string>>& query,
+    const std::map<std::string, std::string>& extra_headers,
+    const uint8_t* body, size_t body_len, const std::string& body_hash_hex,
+    const ExchangeOptions& options) {
   S3Response response;
+  const Cancellation* cancel = options.cancellable ? cancel_ : nullptr;
+  const int max_attempts =
+      options.max_attempts > 0 ? options.max_attempts : config_.max_attempts;
+  const long timeout_s =
+      options.timeout_s > 0 ? options.timeout_s : config_.read_timeout_s;
+  const long connect_timeout_s =
+      std::min<long>(config_.connect_timeout_s, timeout_s);
+  const auto cancelled = [&response] {
+    response.ok = false;
+    response.cancelled = true;
+    response.error = kCancelled;
+    return response;
+  };
   if (!config_error_.empty()) {
     last_attempts_ = 0;
     response.error = config_error_;
@@ -228,7 +269,9 @@ S3Response S3Client::Exchange(
                           (query_text.empty() ? "" : "?" + query_text);
 
   last_attempts_ = 0;
-  for (int attempt = 0; attempt < config_.max_attempts; ++attempt) {
+  for (int attempt = 0; attempt < max_attempts; ++attempt) {
+    // Nothing goes out once cancelled, a first attempt included.
+    if (cancel != nullptr && cancel->cancelled()) return cancelled();
     ++last_attempts_;
     // Signed per attempt, not once before the loop: SigV4 binds the
     // signature to x-amz-date, and S3 refuses a date more than 15 minutes
@@ -259,9 +302,15 @@ S3Response S3Client::Exchange(
     }
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, chunk);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, config_.connect_timeout_s);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, config_.read_timeout_s);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connect_timeout_s);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_s);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    if (cancel != nullptr) {
+      curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+      curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, AbortWhenCancelled);
+      curl_easy_setopt(curl, CURLOPT_XFERINFODATA,
+                       const_cast<Cancellation*>(cancel));
+    }
     if (is_https_) {
       // https always verifies: peer and host name, stated explicitly rather
       // than left to libcurl's defaults, and never switched off. A private
@@ -310,10 +359,11 @@ S3Response S3Client::Exchange(
     curl_slist_free_all(chunk);
     curl_easy_cleanup(curl);
 
+    if (code == CURLE_ABORTED_BY_CALLBACK) return cancelled();
     if (code != CURLE_OK) {
       response.error = std::string("curl: ") + curl_easy_strerror(code);
-      if (IsRetryableCurl(code) && attempt + 1 < config_.max_attempts) {
-        Backoff(attempt);
+      if (IsRetryableCurl(code) && attempt + 1 < max_attempts) {
+        if (!Backoff(attempt, cancel)) return cancelled();
         continue;
       }
       return response;
@@ -322,8 +372,8 @@ S3Response S3Client::Exchange(
     response.http_status = status;
     response.headers = std::move(response_headers);
     response.body = std::move(response_body);
-    if (IsRetryableStatus(status) && attempt + 1 < config_.max_attempts) {
-      Backoff(attempt);
+    if (IsRetryableStatus(status) && attempt + 1 < max_attempts) {
+      if (!Backoff(attempt, cancel)) return cancelled();
       continue;
     }
     return response;
@@ -335,11 +385,14 @@ S3Response S3Client::Exchange(
   return response;
 }
 
-ObjectHead S3Client::HeadObject(const std::string& key, std::string* error) {
+ObjectHead S3Client::HeadObject(const std::string& key, std::string* error,
+                                bool* cancelled) {
   ObjectHead head;
+  if (cancelled) *cancelled = false;
   S3Response response =
       Exchange("HEAD", key, {}, {}, nullptr, 0, Sha256Hex(""));
   if (!response.ok) {
+    if (cancelled) *cancelled = response.cancelled;
     if (error) *error = response.error;
     return head;
   }
@@ -378,8 +431,11 @@ ObjectHead S3Client::HeadObject(const std::string& key, std::string* error) {
 
 bool S3Client::GetRange(const std::string& key, uint64_t offset,
                         uint64_t length, std::vector<uint8_t>* out,
-                        std::string* error) {
+                        std::string* error, bool* unavailable,
+                        bool* cancelled) {
   out->clear();
+  if (unavailable) *unavailable = false;
+  if (cancelled) *cancelled = false;
   if (length == 0) return true;
   std::map<std::string, std::string> headers;
   headers["Range"] = "bytes=" + std::to_string(offset) + "-" +
@@ -387,10 +443,14 @@ bool S3Client::GetRange(const std::string& key, uint64_t offset,
   S3Response response = Exchange("GET", key, {}, headers, nullptr, 0,
                                  Sha256Hex(""));
   if (!response.ok) {
+    if (unavailable) *unavailable = true;
+    if (cancelled) *cancelled = response.cancelled;
     if (error) *error = response.error;
     return false;
   }
   if (response.http_status != 200 && response.http_status != 206) {
+    // Retried until the attempts ran out: the store, not the object.
+    if (unavailable) *unavailable = IsRetryableStatus(response.http_status);
     if (error) {
       *error = "GetObject returned HTTP " +
                std::to_string(response.http_status);
@@ -415,7 +475,7 @@ bool S3Client::PutSingle(
     const std::string& key, const uint8_t* data, size_t n,
     const std::map<std::string, std::string>& metadata,
     const std::string& content_type, std::string* etag_out,
-    std::string* error) {
+    std::string* error, bool* cancelled_out) {
   std::map<std::string, std::string> headers;
   headers["Content-Type"] = content_type;
   for (const auto& [name, value] : metadata) {
@@ -424,6 +484,7 @@ bool S3Client::PutSingle(
   S3Response response =
       Exchange("PUT", key, {}, headers, data, n, Sha256Hex(data, n));
   if (!response.ok) {
+    if (cancelled_out) *cancelled_out = response.cancelled;
     if (error) *error = response.error;
     return false;
   }
@@ -444,7 +505,7 @@ bool S3Client::PutMultipart(
     const std::string& key, const uint8_t* data, size_t n,
     const std::map<std::string, std::string>& metadata,
     const std::string& content_type, std::string* etag_out,
-    std::string* error) {
+    std::string* error, bool* cancelled_out) {
   std::map<std::string, std::string> headers;
   headers["Content-Type"] = content_type;
   for (const auto& [name, value] : metadata) {
@@ -455,6 +516,7 @@ bool S3Client::PutMultipart(
       Exchange("POST", key, {{"uploads", ""}}, headers, nullptr, 0,
                Sha256Hex(""));
   if (!created.ok || created.http_status != 200) {
+    if (cancelled_out) *cancelled_out = created.cancelled;
     if (error) {
       *error = "CreateMultipartUpload failed: " +
                (created.ok ? "HTTP " + std::to_string(created.http_status)
@@ -482,6 +544,7 @@ bool S3Client::PutMultipart(
          {"uploadId", upload_id}},
         {}, data + offset, len, Sha256Hex(data + offset, len));
     if (!part.ok || part.http_status != 200) {
+      if (cancelled_out) *cancelled_out = part.cancelled;
       abort_error =
           "UploadPart failed: " +
           (part.ok ? "HTTP " + std::to_string(part.http_status) : part.error);
@@ -496,8 +559,7 @@ bool S3Client::PutMultipart(
     offset += len;
   }
   if (!abort_error.empty()) {
-    Exchange("DELETE", key, {{"uploadId", upload_id}}, {}, nullptr, 0,
-             Sha256Hex(""));
+    AbortMultipart(key, upload_id, cancelled());
     if (error) *error = abort_error;
     return false;
   }
@@ -518,6 +580,16 @@ bool S3Client::PutMultipart(
                reinterpret_cast<const uint8_t*>(xml.data()), xml.size(),
                Sha256Hex(reinterpret_cast<const uint8_t*>(xml.data()),
                          xml.size()));
+  if (done.cancelled) {
+    // Cut short with every part sent: the upload may have completed or
+    // not. Aborting a completed one fails harmlessly (NoSuchUpload), and
+    // the object it made is the pack's own, which a retry's preflight
+    // re-reads and blesses.
+    AbortMultipart(key, upload_id, true);
+    if (cancelled_out) *cancelled_out = true;
+    if (error) *error = "CompleteMultipartUpload failed: " + done.error;
+    return false;
+  }
   if (!done.ok || done.http_status != 200) {
     if (error) {
       *error = "CompleteMultipartUpload failed: " +
@@ -532,14 +604,33 @@ bool S3Client::PutMultipart(
   return true;
 }
 
+void S3Client::AbortMultipart(const std::string& key,
+                              const std::string& upload_id,
+                              bool after_cancel) {
+  // Best effort either way: an upload left behind is invisible, and a
+  // bucket lifecycle rule for incomplete multipart uploads reaps it.
+  ExchangeOptions options;
+  if (after_cancel) {
+    options.cancellable = false;
+    options.max_attempts = 1;
+    options.timeout_s = kAbortAfterCancelTimeoutS;
+  }
+  ExchangeWith("DELETE", key, {{"uploadId", upload_id}}, {}, nullptr, 0,
+               Sha256Hex(""), options);
+}
+
 bool S3Client::PutObject(const std::string& key, const uint8_t* data, size_t n,
                          const std::map<std::string, std::string>& metadata,
                          const std::string& content_type,
-                         std::string* etag_out, std::string* error) {
+                         std::string* etag_out, std::string* error,
+                         bool* cancelled) {
+  if (cancelled) *cancelled = false;
   if (n >= config_.multipart_threshold_bytes) {
-    return PutMultipart(key, data, n, metadata, content_type, etag_out, error);
+    return PutMultipart(key, data, n, metadata, content_type, etag_out, error,
+                        cancelled);
   }
-  return PutSingle(key, data, n, metadata, content_type, etag_out, error);
+  return PutSingle(key, data, n, metadata, content_type, etag_out, error,
+                   cancelled);
 }
 
 bool S3Client::DeleteObject(const std::string& key, std::string* error) {

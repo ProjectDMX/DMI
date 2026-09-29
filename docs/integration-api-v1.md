@@ -389,6 +389,22 @@ Shutdown exceptions are suppressed, so an integration requiring an
 authoritative final read must ensure every worker reaches this close path and
 should separately check native host failures.
 
+Under `storage_backend="persistent"`, the native pack sink stages the pack it
+still has open when the stopping ring releases it, so the last records reach
+the spool without a flush. With `capture_storage_config` set, `close()` first
+drains capture, best effort, with a budget of `close_flush_timeout_s`: it
+flushes the sink, stops the ring, waits for the storage service to get the
+staged packs into the catalog, and stops the service. What misses the budget is
+logged and left for the next start (the spool, or the reconcile);
+`flush_and_wait` is the call that raises when captures are not queryable in
+time. Past the budget the drain starts no upload and at most one index batch,
+so against a catalog or object store that stops answering, `close()` outlasts
+the budget by up to about two `clickhouse_request_timeout_s` (the request in
+flight, and the lease release), plus up to about 6 s when the budget cuts a
+multipart upload, whose abort nothing cuts; `close_flush_timeout_s` documents
+the full bound. The same bounds hold for `flush_and_wait(timeout_s)`, less the
+lease release.
+
 Closing does not disable or uninstall HookPoints: they retain hook IDs and the
 old payload tensor. Treat the attached model as terminal too. A later CUDA
 forward—especially after another engine becomes active—can combine stale hook

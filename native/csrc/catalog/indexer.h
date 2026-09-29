@@ -27,6 +27,14 @@ struct IndexerConfig {
   int max_rows_per_insert = 10'000;
   uint64_t max_estimated_bytes = 128ull * 1024 * 1024;
   int max_publish_attempts = 8;
+  // read() ends at a pack the object store did not answer for
+  // (StoreUnavailableError propagates) instead of failing that one pack
+  // and reading the next. The oracle, CatalogIndexer, fails the pack and
+  // moves on, and so does the default; the storage service sets it, since
+  // against a store that stopped answering every further pack costs the
+  // client's full timeouts and fails the same way, and an outage is not
+  // the pack's fault to count against it.
+  bool end_read_when_store_unavailable = false;
   // Test seam, unset in production, called with each allocated version
   // just before the publish that carries it. The publish wedges in
   // CatalogWriter exist for the same reason: a version race needs the
@@ -82,7 +90,8 @@ class NativeIndexer {
   // Deduplicates refs and reads the replay guard (the catalog).
   IndexPlan plan(const std::vector<PackRefData>& refs);
   // Reads each pending pack's descriptor rows (the object store only).
-  // Throws kBatchTooLarge past max_estimated_bytes.
+  // Throws kBatchTooLarge past max_estimated_bytes, and
+  // StoreUnavailableError under end_read_when_store_unavailable.
   void read(IndexPlan* plan);
   // Allocates a version, writes the descriptors, publishes and commits the
   // inventory (the catalog). Requires read().

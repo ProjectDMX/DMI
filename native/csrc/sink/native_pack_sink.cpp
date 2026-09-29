@@ -3,6 +3,7 @@
 #include <ATen/ATen.h>
 
 #include <chrono>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 
@@ -104,10 +105,16 @@ std::string AtenDtypeName(int32_t scalar_type) {
 }
 
 NativePackSink::NativePackSink(std::unique_ptr<PackSink> sink,
-                               std::string layout)
-    : sink_(std::move(sink)), layout_(std::move(layout)) {
+                               std::string layout,
+                               Duration release_flush_timeout)
+    : sink_(std::move(sink)),
+      layout_(std::move(layout)),
+      release_flush_timeout_(release_flush_timeout) {
   if (!sink_) invalid("PackSink is required");
   if (layout_.empty()) invalid("layout is required");
+  if (release_flush_timeout_ < Duration::zero()) {
+    invalid("release_flush_timeout must not be negative");
+  }
   std::string error;
   const std::string start_error = sink_->Start(&error);
   if (!start_error.empty()) invalid("sink start failed: " + start_error);
@@ -248,6 +255,32 @@ bool NativePackSink::flush_and_wait(Duration timeout) {
         std::to_string(persisted - baseline_.persisted_records));
   }
   return true;
+}
+
+void NativePackSink::on_engine_release() noexcept {
+  if (release_flush_timeout_ == Duration::zero()) return;
+  try {
+    std::string error;
+    const bool flushed = sink_->Flush(
+        std::chrono::duration<double>(release_flush_timeout_).count(), &error);
+    if (flushed) return;
+    // Once released, rethrow_if_failed refuses the sink as not attached,
+    // and a timeout latches nothing: this line is what says what became of
+    // the open pack (a failure also counts in the snapshot's failures).
+    const std::string why =
+        error.empty() ? "timed out after " +
+                            std::to_string(release_flush_timeout_.count()) +
+                            " ms"
+                      : error;
+    std::fprintf(stderr,
+                 "NativePackSink: the open pack did not reach the spool when "
+                 "the engine released the sink: %s\n",
+                 why.substr(0, 512).c_str());
+    std::fflush(stderr);
+  } catch (...) {
+    // noexcept: a release cannot fail. The sink's own Flush does not
+    // throw; this guards against allocation failure in the message.
+  }
 }
 
 void NativePackSink::rethrow_if_failed() const {

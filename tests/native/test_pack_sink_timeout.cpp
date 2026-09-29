@@ -28,6 +28,10 @@
 // timeouts. There the stager is slowed rather than wedged, so each row after
 // the pipeline fills waits a little under one timeout for room.
 //
+// A third case pins Flush's own timeout while another flush is in flight:
+// the wedged stager keeps the first from completing, and the second must
+// still return within its own timeout.
+//
 // Built and run by tests/test_native_pack_sink_timeout.py.
 
 #include <chrono>
@@ -280,11 +284,84 @@ void TestAnEnvelopeSharesOneAdmissionDeadline() {
   CHECK(final_snap.persisted_records == static_cast<uint64_t>(admitted));
 }
 
+// A flush is bounded by its own timeout even while another flush is in
+// flight. The second waited for the first to give up before its own wait
+// began, since the flush lock was untimed: NativePackSink's release
+// backstop, a 30 s flush the ring's stop runs, waited out a concurrent
+// flush_and_wait's 600 s. Here the stager is wedged, so neither flush can
+// complete: the first is given 4 s, the second 0.5 s, and the second must
+// return within about its own 0.5 s.
+void TestAFlushIsBoundedWhileAnotherIsInFlight() {
+  const char* base = std::getenv("SPOOL_TEST_ROOT");
+  const std::string root =
+      std::string(base != nullptr ? base : "/tmp") + "/sink-concurrent-flush";
+  fs::remove_all(root);
+
+  dmi_sink::SinkConfig config;
+  config.spool_root = root;
+  config.num_workers = 1;
+  config.max_linger_ns = 3600ull * 1000 * 1000 * 1000;  // linger never fires
+
+  dmi_sink::PackSink sink(config);
+  const std::string start_error = sink.Start();
+  CHECK(start_error.empty());
+  if (!start_error.empty()) return;
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool in_hook = false, release = false;
+  sink.SpoolForTesting().SetStageHookForTesting([&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    in_hook = true;
+    cv.notify_all();
+    cv.wait(lock, [&] { return release; });
+  });
+
+  CHECK(SubmitRecord(sink, 1) == dmi_sink::Admission::kAccepted);
+  bool first_flushed = false;
+  std::thread first([&] {
+    std::string error;
+    first_flushed = sink.Flush(4.0, &error);
+  });
+  {
+    // The first flush sealed the open pack and the stager is parked with
+    // it: that flush now holds the flush lock, waiting on its barrier.
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [&] { return in_hook; });
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  const auto started = std::chrono::steady_clock::now();
+  std::string error;
+  const bool second_flushed = sink.Flush(0.5, &error);
+  const double elapsed_s = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - started).count();
+  CHECK(!second_flushed);
+  CHECK(elapsed_s < 1.5);
+  if (elapsed_s >= 1.5) {
+    std::cerr << "concurrent flush: Flush(0.5) returned after " << elapsed_s
+              << " s\n";
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release = true;
+    cv.notify_all();
+  }
+  first.join();
+  CHECK(first_flushed);  // released inside its 4 s, its barrier completes
+  std::string close_error;
+  const dmi_sink::SinkSnapshot final_snap = sink.Close(-1.0, &close_error);
+  CHECK(close_error.empty());
+  CHECK(final_snap.persisted_records == 1);
+}
+
 }  // namespace
 
 int main() {
   TestBlockedPipelineTimesOutAndCountsIt();
   TestAnEnvelopeSharesOneAdmissionDeadline();
+  TestAFlushIsBoundedWhileAnotherIsInFlight();
   if (g_failures != 0) {
     std::cerr << g_failures << " check(s) failed\n";
     return 1;

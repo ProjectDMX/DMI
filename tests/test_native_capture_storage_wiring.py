@@ -115,6 +115,30 @@ def test_https_with_the_insecure_flag_is_refused():
                         s3_allow_insecure_http=True)
 
 
+def test_the_object_store_bounds_default_to_the_native_client_and_reach_it():
+    # The read timeout and attempts bound how long one read the store never
+    # answers holds the service's cycle; they were fixed at the native
+    # defaults (native/csrc/store/s3_client.h S3Config) with no way to
+    # lower them.
+    config = _storage_config()
+    assert (config.s3_read_timeout_s, config.s3_max_attempts) == (120, 4)
+    native = _storage_config(s3_read_timeout_s=10, s3_max_attempts=2)
+    assert native._native_dict()["s3_read_timeout_s"] == 10
+    assert native._native_dict()["s3_max_attempts"] == 2
+    # The reader reads through the same client configuration.
+    assert native._native_reader_dict()["s3_read_timeout_s"] == 10
+
+
+@pytest.mark.parametrize("name, value", [
+    ("s3_read_timeout_s", 0), ("s3_read_timeout_s", -1),
+    ("s3_read_timeout_s", 1.5), ("s3_read_timeout_s", True),
+    ("s3_read_timeout_s", 86_401), ("s3_max_attempts", 0),
+    ("s3_max_attempts", 2.0), ("s3_max_attempts", False)])
+def test_the_object_store_bounds_must_be_positive_ints(name, value):
+    with pytest.raises(ValueError, match=name):
+        _storage_config(**{name: value})
+
+
 # --- the catalog connection: scheme, credentials, TLS --------------------------
 
 

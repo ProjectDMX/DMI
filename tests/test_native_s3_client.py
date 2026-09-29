@@ -185,9 +185,25 @@ class FakeS3Handler(BaseHTTPRequestHandler):
             return 500, b"boom"
         if under("fault/always-500"):
             return 500, b"boom"
+        if under("fault/hang-put") and self.command == "PUT" and \
+                "partNumber=" not in self.path:
+            # Only a single-request PUT: the upload's HEADs are answered.
+            time.sleep(5)
+            return None
         if under("fault/forbidden"):
             return 403, b"no"
         if under("fault/hang"):
+            time.sleep(5)
+            return None
+        if under("fault/hang-parts") and self.command == "PUT" and \
+                "partNumber=" in self.path:
+            # Only a multipart upload's parts: its create and its abort are
+            # answered at once.
+            time.sleep(5)
+            return None
+        if under("fault/hang-complete") and self.command == "POST" and \
+                "uploadId=" in self.path:
+            # Only CompleteMultipartUpload, with every part already in.
             time.sleep(5)
             return None
         return None
@@ -868,3 +884,106 @@ def test_a_missing_ca_is_named_before_any_request(fake_s3_tls, tmp_path):
                  key="anything")
     assert not head["ok"] and str(missing) in head["what"], head
     assert STATE.calls == []
+
+
+# --- cancellation --------------------------------------------------------------
+#
+# The storage service cancels the object store work of its uploads when it
+# stops, and when a flush's deadline passes: an upload stalled on a server
+# that accepted it and never answers must not hold stop() or flush() for
+# read_timeout x max_attempts. `cancel_after_ms` makes the driver cancel the
+# client that long after the request starts.
+
+
+def _timed_call(op: str, **fields) -> tuple[dict, float]:
+    started = time.monotonic()
+    result = _call(op, **fields)
+    return result, time.monotonic() - started
+
+
+def test_a_cancel_aborts_a_put_in_flight(fake_s3):
+    """fault/hang holds the request for 5 s; the cancel lands at 0.3 s, and
+    libcurl's progress callback, which runs at least once a second while a
+    transfer waits, aborts it."""
+    put, elapsed = _timed_call(
+        "put", **_base(fake_s3, read_timeout=30), key="fault/hang/a",
+        data_b64=base64.b64encode(b"data").decode(), metadata={},
+        content_type="application/octet-stream", cancel_after_ms=300)
+    assert not put["ok"], put
+    assert put.get("cancelled") is True, put
+    assert "cancel" in put["what"], put
+    assert put["attempts"] == 1, put  # a cancelled request is not retried
+    assert elapsed < 3.0, elapsed
+
+
+def test_a_cancel_aborts_a_multipart_upload_and_says_so_to_the_store(fake_s3):
+    """A cancelled part leaves an upload the store would keep, invisible and
+    billed, until a lifecycle rule reaps it: the client aborts it, with a
+    request of its own that the cancel does not cut."""
+    payload = bytes((i * 13) & 0xFF for i in range(10 * MIB))
+    put, elapsed = _timed_call(
+        "put", **_base(fake_s3, read_timeout=30), key="fault/hang-parts/b",
+        data_b64=base64.b64encode(payload).decode(), metadata={},
+        content_type="application/vnd.dmi.pack",
+        multipart_threshold=5 * MIB, multipart_chunk=5 * MIB,
+        cancel_after_ms=300)
+    assert not put["ok"], put
+    assert put.get("cancelled") is True, put
+    assert elapsed < 4.0, elapsed
+    aborts = [call for call in STATE.calls
+              if call["method"] == "DELETE" and "uploadId=" in call["path"]]
+    assert len(aborts) == 1, STATE.calls
+    assert STATE.uploads == {}
+    assert "fault/hang-parts/b" not in STATE.objects
+
+
+def test_a_cancel_that_cuts_the_complete_still_aborts_the_upload(fake_s3):
+    """Cut short with every part sent, CompleteMultipartUpload may or may
+    not have taken effect. The client aborts the upload either way: a
+    completed one refuses the abort harmlessly, and one left open would
+    otherwise sit in the bucket, invisible and billed."""
+    payload = bytes((i * 7) & 0xFF for i in range(10 * MIB))
+    put, elapsed = _timed_call(
+        "put", **_base(fake_s3, read_timeout=30), key="fault/hang-complete/d",
+        data_b64=base64.b64encode(payload).decode(), metadata={},
+        content_type="application/vnd.dmi.pack",
+        multipart_threshold=5 * MIB, multipart_chunk=5 * MIB,
+        cancel_after_ms=1000)
+    assert not put["ok"], put
+    assert put.get("cancelled") is True, put
+    assert "CompleteMultipartUpload" in put["what"], put
+    assert elapsed < 4.0, elapsed
+    completes = [call for call in STATE.calls
+                 if call["method"] == "POST" and "uploadId=" in call["path"]]
+    assert len(completes) == 1, STATE.calls
+    aborts = [call for call in STATE.calls
+              if call["method"] == "DELETE" and "uploadId=" in call["path"]]
+    assert len(aborts) == 1, STATE.calls
+    assert STATE.uploads == {}
+
+
+def test_a_cancel_interrupts_the_retry_backoff(fake_s3):
+    """Ten attempts against a store that always answers 500 back off for
+    about 26 s in all; a cancel wakes the backoff instead of sleeping it
+    out. The attempts start at 0, 0.2, 0.6 and 1.4 s, and the cancel lands
+    early in the 1.6 s backoff after the fourth: slept out, that backoff
+    ends at 3.0 s, where the check before the fifth attempt would stop it
+    anyway -- so only a return well before then shows the backoff woke."""
+    head, elapsed = _timed_call(
+        "head", **_base(fake_s3, max_attempts=10), key="fault/always-500/c",
+        cancel_after_ms=1500)
+    assert not head["ok"], head
+    assert head.get("cancelled") is True, head
+    assert head["attempts"] == 4, head
+    assert elapsed < 2.2, elapsed
+
+
+def test_an_uncancelled_request_is_untouched_by_the_cancel_hook(fake_s3):
+    """A cancel armed for later than the request takes changes nothing."""
+    put = _call("put", **_base(fake_s3), key="packs/on-time",
+                data_b64=base64.b64encode(b"data").decode(), metadata={},
+                content_type="application/octet-stream",
+                cancel_after_ms=30_000)
+    assert put["ok"], put
+    assert put.get("cancelled") is False, put
+    assert STATE.objects["packs/on-time"]["body"] == b"data"

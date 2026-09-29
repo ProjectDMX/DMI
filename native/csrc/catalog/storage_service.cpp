@@ -74,6 +74,40 @@ std::string seconds_text(uint64_t ns) {
   return out;
 }
 
+// The service's indexer ends a read pass at a pack the object store did not
+// answer for, rather than failing that pack and reading the next.
+IndexerConfig service_indexer_config(IndexerConfig config) {
+  config.end_read_when_store_unavailable = true;
+  return config;
+}
+
+// How long past a flush's deadline its index reads may still run: the one
+// catalog request timeout the flush may overrun by anyway. Capped so the
+// nanoseconds cannot overflow.
+uint64_t read_grace_ns(const ClickHouseConnection& connection) {
+  const double seconds = std::min(connection.timeouts.request_s, 1e6);
+  return seconds > 0 ? static_cast<uint64_t>(seconds * 1e9) : 0;
+}
+
+// Arms a Cancellation's deadline for one cycle, at ns (0: none), and
+// disarms it at the end. Cancel(), stop()'s, outlives it.
+class ArmedDeadline {
+ public:
+  ArmedDeadline(dmi_store::Cancellation* cancel, uint64_t ns)
+      : cancel_(cancel), armed_(ns != 0) {
+    if (armed_) cancel_->set_deadline(ns);
+  }
+  ~ArmedDeadline() {
+    if (armed_) cancel_->set_deadline(0);
+  }
+  ArmedDeadline(const ArmedDeadline&) = delete;
+  ArmedDeadline& operator=(const ArmedDeadline&) = delete;
+
+ private:
+  dmi_store::Cancellation* cancel_;
+  const bool armed_;
+};
+
 }  // namespace
 
 class CaptureStorageService::LeaseScope {
@@ -137,9 +171,10 @@ struct CaptureStorageService::Adoption {
 CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
     : config_(std::move(config)),
       s3_(config_.s3),
+      upload_s3_(config_.s3),
       clickhouse_(std::make_shared<const ClickHouseClient>(config_.clickhouse)),
       writer_(clickhouse_, config_.writer),
-      indexer_(&s3_, &writer_, config_.indexer) {
+      indexer_(&s3_, &writer_, service_indexer_config(config_.indexer)) {
   if (config_.spool_root.empty()) {
     throw std::invalid_argument("storage service: spool_root is required");
   }
@@ -206,8 +241,11 @@ CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
           spool_.root());
     }
   }
-  uploader_ = std::make_unique<dmi_store::SpoolUploader>(&spool_, &s3_,
+  s3_.set_cancellation(&read_cancel_);
+  upload_s3_.set_cancellation(&upload_cancel_);
+  uploader_ = std::make_unique<dmi_store::SpoolUploader>(&spool_, &upload_s3_,
                                                           config_.uploader);
+  uploader_->set_cancellation(&upload_cancel_);
 }
 
 CaptureStorageService::~CaptureStorageService() {
@@ -220,6 +258,9 @@ CaptureStorageService::~CaptureStorageService() {
 void CaptureStorageService::start() {
   std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
   if (started_) throw std::logic_error("storage service: already started");
+  // A stop() before this one cancelled both for good.
+  upload_cancel_.Reset();
+  read_cancel_.Reset();
 
   CatalogSchema(clickhouse_, config_.writer.database, config_.writer.table_prefix)
       .ensure(&writer_.leases(), config_.schema_retry_sleep_ns);
@@ -328,6 +369,14 @@ void CaptureStorageService::stop() {
     std::lock_guard<std::mutex> lock(wake_mutex_);
     stop_requested_ = true;
   }
+  // Before the join: an upload or an index read the store never answers,
+  // or a retry backoff, would otherwise hold it for the S3 client's
+  // timeouts on every attempt, with the lease held. A cancelled upload
+  // leaves its pack in the spool; a cancelled read leaves its pack owed,
+  // as a read that timed out would, and so in the bucket for the next
+  // start's reconcile.
+  upload_cancel_.Cancel();
+  read_cancel_.Cancel();
   wake_.notify_all();
   if (thread_.joinable()) thread_.join();
   // Only after the loop: its last cycle may still be indexing, and the
@@ -371,6 +420,13 @@ bool CaptureStorageService::flush(double timeout_s) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::duration<double>(timeout_s));
+  // The same instant for the cycles' upload cancel, on the steady clock
+  // steady_ns() reads. Never 0, which would arm none.
+  const uint64_t deadline_ns = std::max<uint64_t>(
+      1, static_cast<uint64_t>(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 deadline.time_since_epoch())
+                 .count()));
   while (true) {
     {
       // A cycle in flight -- the loop's, stuck on a slow catalog -- must not
@@ -379,7 +435,15 @@ bool CaptureStorageService::flush(double timeout_s) {
       if (!cycle.try_lock_until(deadline)) return false;
       if (!started_) throw std::logic_error("storage service: not started");
       rethrow_if_failed();
-      const bool drained = run_cycle(false).drained;
+      // stop() has begun: it cancelled the uploads for good and waits for
+      // this lock. Cycles now could only index, and would do so until the
+      // deadline.
+      if (upload_cancel_.cancelled_for_good()) return false;
+      // Its own cycle, bounded by the deadline, and without the reconcile:
+      // the reconcile lists the whole bucket and asks the catalog about
+      // every page, which no deadline bounds. The loop runs it. Nor does it
+      // adopt: a dead backlog is not this process's records.
+      const bool drained = run_cycle(deadline_ns, false, false).drained;
       if (!rejected_unreported_.empty()) {
         std::string message = "storage service: " +
                               std::to_string(rejected_unreported_.size()) +
@@ -411,12 +475,15 @@ void CaptureStorageService::rethrow_if_failed() const {
 
 void CaptureStorageService::loop() {
   uint64_t wait_ns = config_.poll_interval_ns;
+  bool waited_again = false;  // the last wake gave way to a flush's cycle
   while (true) {
+    bool kicked = false;
     {
       std::unique_lock<std::mutex> lock(wake_mutex_);
       wake_.wait_for(lock, std::chrono::nanoseconds(wait_ns),
                      [this] { return stop_requested_ || kick_; });
       if (stop_requested_) return;
+      kicked = kick_;
       kick_ = false;
     }
     bool failed = false;
@@ -435,7 +502,28 @@ void CaptureStorageService::loop() {
       let_go_of_adoption();
       return;
     }
-    run_cycle(true);
+    {
+      std::lock_guard<std::mutex> lock(wake_mutex_);
+      if (stop_requested_) return;
+    }
+    // The wait runs from the end of the last cycle, anyone's. A flush that
+    // held the lock while this waited for it has just run one; running
+    // another straight after it would only delay a stop() that follows the
+    // flush -- close()'s order -- by that cycle's catalog work, which stop()
+    // cannot cut. So wait out the rest of the interval first, unless a
+    // fresh lease asked for a cycle now -- once: flushes that keep coming
+    // do every cycle's work but the reconcile and the adoption, which only
+    // this loop runs, so the next wake runs a cycle whatever they did.
+    // start() kicks the first cycle when there are siblings to look at.
+    const uint64_t since_ns = steady_ns() - last_cycle_end_ns_;
+    if (!kicked && !waited_again && last_cycle_end_ns_ != 0 &&
+        since_ns < wait_ns) {
+      wait_ns -= since_ns;
+      waited_again = true;
+      continue;
+    }
+    waited_again = false;
+    run_cycle(0, true, true);
     // poll_interval * 2^streak, capped: flush() shares the streak, so an
     // outage it saw also slows the loop, and a success from either resets it.
     wait_ns = config_.poll_interval_ns;
@@ -448,8 +536,27 @@ void CaptureStorageService::loop() {
 }
 
 CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
-    bool adopt) {
+    uint64_t deadline_ns, bool allow_reconcile, bool adopt) {
   CycleOutcome outcome;
+  // stop() has begun: it cancelled the uploads and the reads for good, so a
+  // cycle could only make catalog requests -- a lease claim, a replay guard
+  // -- that stop() would have to wait out. Neither drained nor failed.
+  if (upload_cancel_.cancelled_for_good()) {
+    outcome.failed = false;
+    outcome.cut_short = true;
+    last_cycle_end_ns_ = steady_ns();
+    return outcome;
+  }
+  // flush()'s deadline cancels this cycle's uploads at that moment, and its
+  // index reads one catalog request timeout later: an upload cut short
+  // leaves its pack in the spool, but a read cut short leaves an uploaded
+  // pack owed, which only this process remembers, so what the cycle
+  // uploaded gets the time a catalog statement in flight would. The loop's
+  // cycles are cancelled only by stop(), which cancels both for good.
+  const ArmedDeadline upload_deadline(&upload_cancel_, deadline_ns);
+  const ArmedDeadline read_deadline(
+      &read_cancel_,
+      deadline_ns == 0 ? 0 : deadline_ns + read_grace_ns(config_.clickhouse));
   // The catalog phase needs the lease. Without one -- quarantined after an
   // unknown outcome, or refused by another holder -- the cycle uploads
   // nothing either: whatever it uploaded it could only owe, in memory.
@@ -458,55 +565,126 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
     LeaseScope lease(this);
     catalog = ensure_publisher_lease();
   }
+  // What a cycle uploads and cannot index stays owed in pending_index_
+  // (index_or_owe). Those a cancel or the deadline left owed are counted
+  // here: they make the cycle cut short, not failed.
+  size_t deferred = 0;
   try {
     // 1. Retry what earlier cycles uploaded but could not index. While any
     //    of it is still owed, the catalog is down or refusing: upload
     //    nothing new, so new packs stay in the durable spool rather than
-    //    joining a list that only this process remembers.
+    //    joining a list that only this process remembers. Past a flush's
+    //    deadline no batch starts but the first (index_bounded).
     if (catalog && !pending_index_.empty()) {
       std::vector<PackRefData> owed;
       owed.swap(pending_index_);
-      index_or_owe(std::move(owed), catalog);
+      deferred += index_or_owe(std::move(owed), catalog, deadline_ns);
     }
 
-    // 2. Upload everything the sink has staged -- but only with the lease
-    //    and nothing owed. Without the lease an uploaded pack could only be
+    // 2. Upload what the sink has staged -- but only with the lease and
+    //    nothing owed. Without the lease an uploaded pack could only be
     //    owed, and pending_index_ dies with the process: with
     //    reconcile_on_start off, a crash would leave it in the bucket and
     //    never in the catalog. Left in the spool it survives the crash.
-    dmi_store::UploadBatchResult batch;
-    if (catalog && pending_index_.empty()) {
-      batch = uploader_->UploadPending(-1);
-    }
-    std::vector<PackRefData> to_index;
-    uint64_t uploaded_packs = 0;
-    uint64_t uploaded_bytes = 0;
+    //    The spool is listed once, since listing hashes every staged pack.
+    //    A cancel (the flush deadline, or stop()) stops the listing between
+    //    packs, before the next hash, starts no upload, and cuts those in
+    //    flight: those packs stay staged too. So a flush out of time before
+    //    this point -- flush(0) -- hashes nothing: a listing already
+    //    cancelled stops at the first staged pack, and finds an empty spool
+    //    empty, which then reports drained.
+    // 3. Index them -- a chunk of indexer.max_packs at a time, each chunk
+    //    indexed before the next is uploaded, so at most one chunk is ever
+    //    out of the spool and not yet in the catalog, remembered by this
+    //    process alone (stop() drops it). A cancel starts no further chunk,
+    //    so what the flush deadline or stop() finds unsent stays in the
+    //    spool, which any later start uploads, not owed in memory; a chunk
+    //    left owed, or a lease lost meanwhile, stops the uploads as in step
+    //    1. What a chunk uploaded it indexes, a cancel of the uploads or
+    //    not: past a flush's deadline, as its one batch past it
+    //    (index_bounded). Its reads end at stop(), or one request timeout
+    //    past a flush's deadline, leaving what they did not read owed.
+    // Every staged pack listed and uploaded: drained as far as flush() is
+    // concerned, since the listing came after the sink's flush.
+    bool uploaded_all = false;
+    bool listing_failed = false;
+    bool lost_lease = false;
     size_t upload_failures = 0;
-    for (size_t i = 0; i < batch.refs.size(); ++i) {
-      const dmi_store::PackRef& ref = batch.refs[i];
-      if (!ref.pack_id.empty()) {
-        to_index.push_back({ref.pack_id, ref.store_id, ref.object_key,
-                            ref.object_bytes, ref.checksum, ref.record_count});
-        ++uploaded_packs;
-        uploaded_bytes += ref.object_bytes;
+    if (catalog && pending_index_.empty()) {
+      std::vector<dmi_store::StagedPack> staged;
+      std::string error;
+      bool cut = false;
+      if (spool_.ListPending(&staged, &error, &upload_cancel_, &cut) !=
+          dmi_store::SpoolStatus::kOk) {
+        record_error("spool listing failed: " + error);
+        listing_failed = true;
+      } else if (cut) {
+        outcome.cut_short = true;
       } else {
-        // A failed upload stays in the spool, so the next cycle retries it.
-        ++upload_failures;
-        if (i < batch.failures.size()) {
-          record_error("upload failed for " + batch.failures[i].object_key +
-                       ": " + batch.failures[i].error);
+        const size_t chunk =
+            static_cast<size_t>(std::max(1, config_.indexer.max_packs));
+        size_t next = 0;
+        while (next < staged.size()) {
+          if (next != 0) {
+            if (!pending_index_.empty()) break;  // the chunk before is owed
+            if (upload_cancel_.cancelled()) {
+              outcome.cut_short = true;
+              break;
+            }
+            // No request: a lease quarantined or refused meanwhile has
+            // already been dropped, and a fresh one is the next cycle's.
+            LeaseScope lease(this);
+            if (writer_.held_lease() == nullptr) {
+              lost_lease = true;
+              break;
+            }
+          }
+          const size_t end = std::min(staged.size(), next + chunk);
+          const dmi_store::UploadBatchResult batch = uploader_->UploadStaged(
+              std::vector<dmi_store::StagedPack>(staged.begin() + next,
+                                                 staged.begin() + end));
+          next = end;
+          std::vector<PackRefData> to_index;
+          uint64_t uploaded_packs = 0;
+          uint64_t uploaded_bytes = 0;
+          size_t failed_uploads = 0;
+          size_t cancelled_uploads = 0;
+          for (size_t i = 0; i < batch.refs.size(); ++i) {
+            const dmi_store::PackRef& ref = batch.refs[i];
+            if (!ref.pack_id.empty()) {
+              to_index.push_back({ref.pack_id, ref.store_id, ref.object_key,
+                                  ref.object_bytes, ref.checksum,
+                                  ref.record_count});
+              ++uploaded_packs;
+              uploaded_bytes += ref.object_bytes;
+            } else if (i < batch.failures.size() &&
+                       batch.failures[i].cancelled) {
+              ++cancelled_uploads;  // still staged; not the pack's fault
+            } else {
+              // A failed upload stays in the spool, so a later cycle
+              // retries it.
+              ++failed_uploads;
+              if (i < batch.failures.size()) {
+                record_error("upload failed for " +
+                             batch.failures[i].object_key + ": " +
+                             batch.failures[i].error);
+              }
+            }
+          }
+          if (cancelled_uploads != 0) outcome.cut_short = true;
+          upload_failures += failed_uploads;
+          {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            state_.uploaded_packs += uploaded_packs;
+            state_.uploaded_bytes += uploaded_bytes;
+            state_.upload_failures += failed_uploads;
+            state_.cancelled_uploads += cancelled_uploads;
+          }
+          deferred += index_or_owe(std::move(to_index), catalog, deadline_ns);
         }
+        uploaded_all = next == staged.size() && upload_failures == 0;
       }
     }
-    {
-      std::lock_guard<std::mutex> lock(state_mutex_);
-      state_.uploaded_packs += uploaded_packs;
-      state_.uploaded_bytes += uploaded_bytes;
-      state_.upload_failures += upload_failures;
-    }
-
-    // 3. Index them.
-    index_or_owe(std::move(to_index), catalog);
 
     // 3a. The loop's cycles adopt dead siblings, a slice at a time, under
     //     the same rule as the uploads above: only with the lease, nothing
@@ -519,43 +697,31 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
     }
 
     // 4. Reconcile on its interval, or when the pass at start() lost the
-    //    lease before it finished. The lease thread keeps the lease alive.
-    if (catalog &&
+    //    lease before it finished -- in the loop's cycles only, and not
+    //    once a cancel came. The lease thread keeps the lease alive.
+    if (allow_reconcile && catalog && !upload_cancel_.cancelled() &&
         (reconcile_owed_ ||
          (config_.reconcile_interval_ns > 0 &&
           steady_ns() - last_reconcile_ns_ >= config_.reconcile_interval_ns))) {
-      reconcile();
-      reconcile_owed_ = false;
-      last_reconcile_ns_ = steady_ns();
+      if (reconcile()) {
+        reconcile_owed_ = false;
+        last_reconcile_ns_ = steady_ns();
+      }
     }
 
-    // Drained: nothing failed to upload, every uploaded pack is in the
-    // catalog, and nothing is pending. A batch that uploaded everything it
-    // listed is drained as far as flush() is concerned -- its listing came
-    // after the sink's flush -- so the spool is re-listed only when the batch
-    // was empty, which UploadPending also returns when its listing FAILED.
-    // A cycle that already failed is not drained whatever the spool holds,
-    // so it skips the listing: an empty spool lists for free, but a backlog
-    // would be re-hashed on every cycle of an outage.
-    // Without the lease nothing can be confirmed in the catalog, so the
-    // cycle is not drained, and it counts towards the backoff.
-    // A dead sibling still to adopt is not a failure, nor undrained: only
-    // an adoption upload that failed backs the loop off.
-    outcome.failed = !catalog || upload_failures != 0 ||
-                     !pending_index_.empty() || adoption_failed;
-    bool nothing_pending = !batch.refs.empty();
-    if (batch.refs.empty() && !outcome.failed) {
-      std::vector<dmi_store::StagedPack> pending;
-      std::string error;
-      const bool listed =
-          spool_.ListPending(&pending, &error) == dmi_store::SpoolStatus::kOk;
-      if (!listed) {
-        record_error("spool listing failed: " + error);
-        outcome.failed = true;
-      }
-      nothing_pending = listed && pending.empty();
-    }
-    outcome.drained = nothing_pending && !outcome.failed;
+    // Drained: every staged pack uploaded, every uploaded pack in the
+    // catalog, and nothing pending. Without the lease nothing can be
+    // confirmed in the catalog, so the cycle is not drained, and it counts
+    // towards the backoff. Packs a cancel or the deadline left owed make it
+    // cut short, not failed. A dead sibling still to adopt is not a
+    // failure, nor undrained: only an adoption upload that failed backs the
+    // loop off, and adopted packs uploaded and not indexed are owed like
+    // the service's own.
+    if (deferred != 0) outcome.cut_short = true;
+    outcome.failed = !catalog || listing_failed || lost_lease ||
+                     upload_failures != 0 || adoption_failed ||
+                     pending_index_.size() > deferred;
+    outcome.drained = uploaded_all && !outcome.failed && !outcome.cut_short;
     std::lock_guard<std::mutex> lock(state_mutex_);
     ++state_.cycles;
   } catch (const CatalogError& exc) {
@@ -573,19 +739,31 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
     state_.pending_index = pending_index_.size();
     state_.adoption_owed = adoption_owed();
   }
-  failure_streak_ = outcome.failed ? std::min(failure_streak_ + 1, 32) : 0;
+  // A cycle a cancel cut short proved nothing about the store or the
+  // catalog: it resets the backoff only by succeeding, and grows it only by
+  // failing.
+  if (outcome.failed) {
+    failure_streak_ = std::min(failure_streak_ + 1, 32);
+  } else if (!outcome.cut_short) {
+    failure_streak_ = 0;
+  }
+  last_cycle_end_ns_ = steady_ns();
   return outcome;
 }
 
-void CaptureStorageService::index_or_owe(std::vector<PackRefData> refs,
-                                         bool catalog) {
+size_t CaptureStorageService::index_or_owe(std::vector<PackRefData> refs,
+                                           bool catalog,
+                                           uint64_t deadline_ns) {
   if (!catalog) {
     pending_index_.insert(pending_index_.end(), refs.begin(), refs.end());
-    return;
+    return 0;
   }
   std::vector<PackRefData> unindexed;
+  size_t deferred = 0;
   try {
-    if (!refs.empty()) index_bounded(std::move(refs), &unindexed);
+    if (!refs.empty()) {
+      deferred = index_bounded(std::move(refs), &unindexed, deadline_ns);
+    }
   } catch (...) {
     pending_index_.insert(pending_index_.end(), unindexed.begin(),
                           unindexed.end());
@@ -593,6 +771,7 @@ void CaptureStorageService::index_or_owe(std::vector<PackRefData> refs,
   }
   pending_index_.insert(pending_index_.end(), unindexed.begin(),
                         unindexed.end());
+  return deferred;
 }
 
 void CaptureStorageService::let_go_of_adoption() {
@@ -756,7 +935,7 @@ bool CaptureStorageService::upload_adopted_round() {
     adoption.remaining.pop_front();
   }
   dmi_store::SpoolUploader uploader(&adoption.spool, &s3_, config_.uploader);
-  const dmi_store::UploadBatchResult batch = uploader.UploadEntries(entries);
+  const dmi_store::UploadBatchResult batch = uploader.UploadStaged(entries);
   std::vector<PackRefData> to_index;
   uint64_t uploaded_bytes = 0;
   size_t failures = 0;
@@ -796,7 +975,7 @@ bool CaptureStorageService::upload_adopted_round() {
   }
   // Uploaded, so gone from the dead spool: indexed now, or owed in
   // pending_index_ like any pack of this service's own.
-  index_or_owe(std::move(to_index), true);
+  index_or_owe(std::move(to_index), true, 0);
   return retryable == 0;
 }
 
@@ -867,44 +1046,79 @@ void CaptureStorageService::clear_dead_claim_staging(
   }
 }
 
-void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
-                                          std::vector<PackRefData>* unindexed) {
+size_t CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
+                                            std::vector<PackRefData>* unindexed,
+                                            uint64_t deadline_ns) {
   // Batches the indexer can take: at most max_packs, and halved again when the
   // rendered descriptors exceed max_estimated_bytes. The two bounds are
   // independent, so packs that each fit can still overflow together.
   const size_t max_packs =
       static_cast<size_t>(std::max(1, config_.indexer.max_packs));
+  // A stack, the next batch at the back. The chunks go on it in reverse, so
+  // the pass runs them front to back and its first batch is a full one:
+  // past a flush's deadline that batch is the only one, and the remainder
+  // chunk can be a single pack. A split pushes its halves the same way.
   std::vector<std::vector<PackRefData>> work;
-  for (size_t i = 0; i < refs.size(); i += max_packs) {
-    work.emplace_back(refs.begin() + i,
-                      refs.begin() + std::min(refs.size(), i + max_packs));
+  for (size_t chunk = (refs.size() + max_packs - 1) / max_packs; chunk-- > 0;) {
+    const size_t begin = chunk * max_packs;
+    work.emplace_back(refs.begin() + begin,
+                      refs.begin() + std::min(refs.size(), begin + max_packs));
   }
+  // What is still queued, in the order it would have run.
+  const auto drain_queued = [&](uint64_t* count) {
+    for (auto queued = work.rbegin(); queued != work.rend(); ++queued) {
+      *count += queued->size();
+      unindexed->insert(unindexed->end(), queued->begin(), queued->end());
+    }
+    work.clear();
+  };
   // A batch that threw indexed nothing, and neither did anything still queued.
   const auto give_up = [&](std::vector<PackRefData>& failed,
                            const std::string& message) {
     uint64_t count = failed.size();
     unindexed->insert(unindexed->end(), failed.begin(), failed.end());
-    for (std::vector<PackRefData>& queued : work) {
-      count += queued.size();
-      unindexed->insert(unindexed->end(), queued.begin(), queued.end());
-    }
-    work.clear();
+    drain_queued(&count);
     record_error(message);
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_.index_failures += count;
   };
+  // Left owed and not counted as failed: a cancel or the deadline cut the
+  // pass short.
+  size_t deferred = 0;
+  const auto defer = [&](std::vector<PackRefData>& cut) {
+    uint64_t count = cut.size();
+    unindexed->insert(unindexed->end(), cut.begin(), cut.end());
+    drain_queued(&count);
+    deferred += static_cast<size_t>(count);
+  };
+  bool first = true;
   while (!work.empty()) {
+    // Once the reads are cut -- stop(), or a flush one request timeout
+    // past its deadline -- no batch starts, the first included: it could
+    // read nothing, and would only send catalog statements (the replay
+    // guard) whose answer is thrown away, and which stop() waits for.
+    // Past the deadline no batch starts but the first: the pass overruns
+    // it by one batch at most, never by the rest of its work, however many
+    // batches that is. Catalog statements are never cut, so this is where
+    // the pass can stop.
+    if (read_cancel_.cancelled() ||
+        (!first && deadline_ns != 0 && steady_ns() >= deadline_ns)) {
+      std::vector<PackRefData> none;
+      defer(none);
+      break;
+    }
+    first = false;
     std::vector<PackRefData> batch = std::move(work.back());
     work.pop_back();
     IndexResultData result;
     try {
       // The lease lock for the catalog phases only. Between them the pass
       // reads its packs from the object store, where a stalled GET is bound
-      // only by the S3 client's own timeouts, and must not keep the lease
-      // thread from renewing meanwhile. Nothing here stamps a renewal: the
-      // schedule follows the lease itself (renew_lease_if_due), which only
-      // a claim that confirmed moves -- a pass that published nothing, over
-      // packs already committed, renewed nothing.
+      // by the S3 client's own timeouts and read_cancel_, and must not keep
+      // the lease thread from renewing meanwhile. Nothing here stamps a
+      // renewal: the schedule follows the lease itself (renew_lease_if_due),
+      // which only a claim that confirmed moves -- a pass that published
+      // nothing, over packs already committed, renewed nothing.
       IndexPlan plan;
       {
         LeaseScope lease(this);
@@ -913,6 +1127,19 @@ void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
       indexer_.read(&plan);
       LeaseScope lease(this);
       result = indexer_.commit(&plan);
+    } catch (const StoreUnavailableError& exc) {
+      // The object store did not answer for a pack. Every later read of
+      // the pass would cost the client's timeouts and fail alike, so the
+      // pass ends here, like a batch that threw: this batch and the rest
+      // stay owed, and nothing counts against the packs themselves, since
+      // an outage is no fault of theirs. A read a cancel cut -- stop(), or
+      // a flush out of time -- is not a failure at all.
+      if (exc.cancelled()) {
+        defer(batch);
+        return deferred;
+      }
+      give_up(batch, std::string("index failed: ") + exc.what());
+      return deferred;
     } catch (const CatalogError& exc) {
       if (exc.kind() == CatalogError::Kind::kBatchTooLarge && batch.size() > 1) {
         const size_t middle = batch.size() / 2;
@@ -932,10 +1159,10 @@ void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
       const bool lease_lost = is_lease_refusal(exc);
       give_up(batch, std::string("index failed: ") + exc.what());
       if (lease_lost) throw;
-      return;
+      return deferred;
     } catch (const std::exception& exc) {
       give_up(batch, std::string("index failed: ") + exc.what());
-      return;
+      return deferred;
     }
     // A failure the indexer reports for one pack is that pack's own (it was
     // read and refused), unlike a batch that threw, which an outage explains.
@@ -962,6 +1189,7 @@ void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
     state_.indexed_rows += result.indexed_rows;
     state_.index_failures += result.failed_packs;
   }
+  return deferred;
 }
 
 void CaptureStorageService::reject(const PackRefData& ref,
@@ -975,20 +1203,23 @@ void CaptureStorageService::reject(const PackRefData& ref,
   ++state_.index_failures;
 }
 
-void CaptureStorageService::reconcile() {
+bool CaptureStorageService::reconcile() {
   // List every pack under the prefix, ask the catalog which it already
   // committed, and HEAD only the rest -- so a steady-state pass over a large
   // bucket costs listing pages and one catalog query per page, not a HEAD per
-  // object.
+  // object. stop() ends it between requests: what it has not reached is
+  // still in the bucket, for the next pass.
   std::string token;
   uint64_t found = 0;
   uint64_t skipped = 0;
   uint64_t head_errors = 0;
   do {
+    if (upload_cancel_.cancelled()) return false;
     dmi_store::ListResult page;
     std::string error;
     if (!s3_.ListObjects(config_.reconcile_prefix, "", 1000, token, &page,
                          &error)) {
+      if (read_cancel_.cancelled()) return false;  // stop() cut it
       throw std::runtime_error("reconcile: listing failed: " + error);
     }
     token = page.truncated ? page.next_token : "";
@@ -1006,6 +1237,8 @@ void CaptureStorageService::reconcile() {
       packs.push_back(&object);
     }
     if (packs.empty()) continue;
+    // A listing answered just as stop() came: nothing after it can be read.
+    if (upload_cancel_.cancelled()) return false;
     std::set<PackIdentity> committed;
     {
       LeaseScope lease(this);
@@ -1015,9 +1248,11 @@ void CaptureStorageService::reconcile() {
     std::vector<PackRefData> missing;
     for (size_t i = 0; i < packs.size(); ++i) {
       if (committed.count(identities[i]) != 0) continue;
+      if (upload_cancel_.cancelled()) return false;
       const dmi_store::ListedObject& object = *packs[i];
       std::string head_error;
       const dmi_store::ObjectHead head = s3_.HeadObject(object.key, &head_error);
+      if (!head_error.empty() && read_cancel_.cancelled()) return false;
       if (!head_error.empty()) {
         // Unread, not foreign: the object may well be a pack, so the pass
         // reports it rather than counting it as skipped. The next pass
@@ -1061,6 +1296,7 @@ void CaptureStorageService::reconcile() {
   state_.reconciled_packs += found;
   state_.reconcile_skipped_objects += skipped;
   state_.reconcile_head_errors += head_errors;
+  return true;
 }
 
 void CaptureStorageService::keep_lease() {

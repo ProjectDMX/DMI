@@ -532,6 +532,16 @@ class _Switch:
         self._delay_by = None
 
     def close(self):
+        """Refuse new connections and drop the live ones. Closing the
+        listener does not wake a thread blocked in accept(), which still
+        takes one more queued connection: the stall settings go first, so
+        that connection is refused rather than held open for its client's
+        whole timeout (a stop()'s lease release after a stall() did)."""
+        self._stalled = False
+        self._stall_if = None
+        self._slow_once = None
+        self._delay_by = None
+        self._late_by = 0.0
         self.cut()
         self._listener.close()
 
@@ -866,6 +876,956 @@ def test_flush_returns_on_time_when_the_catalog_stops_answering(
         finally:
             switch.close()  # releases the stalled connections
             service.stop()
+
+
+def test_a_flush_against_a_black_hole_catalog_overruns_by_one_request(
+        fake_s3, tmp_path):
+    """A flush's own cycle ran the periodic reconcile when it fell due: past
+    the index pass that failed on a catalog that accepts connections and
+    never answers, it listed the bucket and asked the catalog again, one
+    more request timeout past the deadline. A flush cycle skips the
+    reconcile now (the loop runs it), and its catalog requests, each
+    bounded, are never cut mid-flight: flush(1.0) returns within one second
+    plus the one request in flight at the deadline."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    request_timeout = 4.0
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(
+            fake_s3, catalog.table_prefix,
+            clickhouse_port=switch.port)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="black-hole-test",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            # Every cycle is due a reconcile.
+            reconcile_interval_ns=1_000_000,
+            # No renewal falls due while the test runs.
+            lease_ttl_ns=30_000_000_000, publish_timeout_ns=5_000_000_000,
+            clickhouse_request_timeout_s=request_timeout)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            _stage(spool_root, range(2))
+            switch.stall()
+            started = time.monotonic()
+            drained = service.flush(1.0)
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+        finally:
+            switch.close()  # releases the stalled connections
+            service.stop()
+
+    assert drained is False
+    assert snapshot["reconcile_passes"] == 0, snapshot
+    assert elapsed < 1.0 + request_timeout + 1.0, elapsed
+
+
+def test_the_stop_after_a_flush_runs_no_further_cycle(fake_s3, tmp_path):
+    """close() runs flush(budget) and then stop(). A loop that woke while
+    the flush held the cycle lock took the lock the moment the flush let
+    go -- before stop() could say anything -- and ran a whole cycle of its
+    own, which stop() then joined: against a catalog that accepts
+    connections and never answers, one more request timeout on top of the
+    flush's and the lease release's. The loop now waits out its interval
+    from the end of the last cycle, anyone's, so a stop() right after a
+    flush finds it waiting and it leaves at once."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    request_timeout = 4.0
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(
+            fake_s3, catalog.table_prefix,
+            clickhouse_port=switch.port)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="stop-after-flush",
+            # Wakes while the flush below holds the cycle lock.
+            poll_interval_ns=3_000_000_000, reconcile_on_start=False,
+            # No renewal falls due while the test runs (a third of the TTL).
+            lease_ttl_ns=60_000_000_000, publish_timeout_ns=5_000_000_000,
+            clickhouse_request_timeout_s=request_timeout)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        stopped = False
+        try:
+            # Right after one of the loop's cycles, so that it next wakes
+            # while the flush's cycle waits on the catalog.
+            _wait_for(lambda: service.snapshot()["cycles"] >= 1,
+                      timeout_s=10.0)
+            _stage(spool_root, range(2))
+            switch.stall()
+            started = time.monotonic()
+            drained = service.flush(1.0)
+            flushed = time.monotonic() - started
+            cycles = service.snapshot()["cycles"]
+            started = time.monotonic()
+            service.stop()
+            stopped = True
+            stop_s = time.monotonic() - started
+            snapshot = service.snapshot()
+        finally:
+            switch.close()  # releases the stalled connections
+            if not stopped:
+                service.stop()
+
+    assert drained is False
+    assert flushed < 1.0 + request_timeout + 1.0, flushed
+    # No cycle after the flush's: stop() waited for the lease release
+    # alone, one request timeout against this catalog, not two.
+    assert snapshot["cycles"] == cycles, (cycles, stop_s, snapshot)
+    assert stop_s < request_timeout + 1.5, (stop_s, snapshot)
+
+
+def test_a_flush_out_of_time_does_not_hash_the_spool(fake_s3, tmp_path):
+    """Past its deadline a flush's cycle starts no upload, but it still
+    listed the spool through the uploader, and a listing re-hashes every
+    staged pack: flush(0) -- what flush_and_wait and close() pass once the
+    sink's flush has spent the budget -- held its caller for as long as
+    hashing the whole backlog took. A listing already cancelled now stops
+    before the first pack's hash. One sparse 1 GiB pack stands in for a
+    backlog."""
+    import hashlib
+
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    size = 1 << 30
+    digest = hashlib.sha256()
+    zeros = bytes(1 << 24)
+    for _ in range(size // len(zeros)):
+        digest.update(zeros)
+    spool_root = tmp_path / "spool"
+    spool_root.mkdir()
+    ready = spool_root / (f"{uuid.uuid4()}.1.1.{digest.hexdigest()}"
+                          ".dmi-pack.ready")
+    with open(ready, "wb") as sparse:
+        sparse.truncate(size)  # no blocks on disk
+    with _catalog() as (_client, catalog):
+        native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="flush-out-of-time",
+            # The loop sleeps through the test, and nothing uploads.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            sweep_spool_on_start=False,
+            uploader_max_in_flight_bytes=2 * size)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            started = time.monotonic()
+            drained = service.flush(0.0)
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+
+    assert drained is False  # a pack is staged
+    assert elapsed < 0.25, (elapsed, snapshot)
+    assert snapshot["uploaded_packs"] == 0, snapshot
+    # Not tried, so not cancelled either: it was never listed.
+    assert snapshot["cancelled_uploads"] == 0, snapshot
+    assert ready.exists()
+
+
+def _sparse_backlog(spool_root: Path, packs: int, size: int) -> list:
+    """`packs` ready packs of `size` zero bytes, sparse on disk and named
+    for their checksum. Listing the spool hashes every byte of them, so
+    they stand in for a backlog without taking its disk."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    zeros = bytes(1 << 20)
+    for _ in range(size // len(zeros)):
+        digest.update(zeros)
+    spool_root.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for _ in range(packs):
+        ready = spool_root / (f"{uuid.uuid4()}.1.1.{digest.hexdigest()}"
+                              ".dmi-pack.ready")
+        with open(ready, "wb") as sparse:
+            sparse.truncate(size)
+        paths.append(ready)
+    return sorted(paths)
+
+
+def test_stop_cuts_a_listing_that_hashes_a_backlog(fake_s3, tmp_path):
+    """A cycle lists the spool before it uploads, and a listing re-hashes
+    every staged pack: about 0.8 s a GiB here, over a backlog an outage
+    can grow to the spool's limit (a TiB by default). stop() waited for
+    the loop's listing to end before its cancel could turn a single
+    upload away. The listing stops between packs once cancelled now, so
+    stop() waits for one pack's hash at most, and nothing was tried. 16
+    sparse packs of 256 MiB take the listing about 3 s."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    backlog = _sparse_backlog(spool_root, 16, 256 << 20)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="listing-stop",
+            poll_interval_ns=20_000_000, reconcile_on_start=False,
+            sweep_spool_on_start=False,
+            uploader_max_in_flight_bytes=1 << 30)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        stopped = False
+        try:
+            time.sleep(0.5)  # the loop's first cycle is listing the backlog
+            started = time.monotonic()
+            service.stop()
+            stopped = True
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+        finally:
+            if not stopped:
+                service.stop()
+
+    assert elapsed < 1.0, (elapsed, snapshot)
+    assert snapshot["uploaded_packs"] == 0, snapshot
+    # Never listed to the end, so never tried: nothing to cancel.
+    assert snapshot["cancelled_uploads"] == 0, snapshot
+    assert _ready(spool_root) == backlog
+
+
+def test_a_flush_cuts_the_listing_its_deadline_passes_in(fake_s3, tmp_path):
+    """A flush whose deadline passes while its cycle lists the spool gave
+    up only once the listing had hashed the whole backlog, and then turned
+    every pack away. The listing stops at the deadline now."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    backlog = _sparse_backlog(spool_root, 16, 256 << 20)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="listing-flush",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            sweep_spool_on_start=False,
+            uploader_max_in_flight_bytes=1 << 30)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            started = time.monotonic()
+            drained = service.flush(0.5)
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+
+    assert drained is False
+    assert elapsed < 1.2, (elapsed, snapshot)
+    assert snapshot["uploaded_packs"] == 0, snapshot
+    assert snapshot["cancelled_uploads"] == 0, snapshot
+    assert _ready(spool_root) == backlog
+
+
+def _put(request: bytes) -> bool:
+    return request.startswith(b"PUT ")
+
+
+def test_a_flush_returns_on_time_while_an_upload_stalls(fake_s3, tmp_path):
+    """The flush's cycle uploads through an object store that accepted the
+    PUT and never answers. It waited out the S3 read timeout on every
+    attempt; its deadline now cancels the upload, and the pack stays in the
+    spool, which is where a pack waits for a store that is not answering."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="stalled-upload-flush",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            s3_read_timeout_s=30)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            s3.stall_requests(_put)
+            tensors = _stage(spool_root, range(2))
+            outcome = {}
+
+            def _flush():
+                started = time.monotonic()
+                outcome["drained"] = service.flush(1.0)
+                outcome["elapsed"] = time.monotonic() - started
+
+            waiter = threading.Thread(target=_flush, daemon=True)
+            waiter.start()
+            waiter.join(timeout=15.0)
+            assert not waiter.is_alive(), "flush(1.0) still blocked after 15 s"
+            assert s3.stalled, "the upload never reached the store"
+            assert outcome["drained"] is False
+            assert outcome["elapsed"] < 3.0, outcome
+            assert len(_ready(spool_root)) == 1
+            snapshot = service.snapshot()
+            # Cut short, not failed: nothing for the backoff to count.
+            assert snapshot["upload_failures"] == 0, snapshot
+            assert snapshot["cancelled_uploads"] == 1, snapshot
+            assert snapshot["uploaded_packs"] == 0, snapshot
+
+            s3.restore()
+            assert service.flush(30.0)
+            # A flush out of time uploads nothing, but still finds a drained
+            # spool drained.
+            assert service.flush(0.0)
+        finally:
+            s3.close()
+            service.stop()
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_a_flush_that_cuts_a_multipart_upload_waits_for_its_abort(
+        fake_s3, tmp_path):
+    """The one overrun of a flush's deadline that no catalog request
+    timeout bounds: a multipart upload the deadline cuts is then aborted,
+    one request of up to 5 s that nothing cuts, after up to about a second
+    for the stalled transfer to see the cancel (libcurl's progress poll).
+    With clickhouse_request_timeout_s at 2 s -- the config allows it -- that
+    outlasts the request timeout. Here the store holds the part and the
+    abort both, so the flush pays the whole bound, and no more. The pack is
+    a sparse file of zeros named for its checksum, over the client's
+    64 MiB multipart threshold; it stays staged."""
+    import hashlib
+
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    size = 65 << 20
+    digest = hashlib.sha256()
+    zeros = bytes(1 << 20)
+    for _ in range(size // len(zeros)):
+        digest.update(zeros)
+    spool_root = tmp_path / "spool"
+    spool_root.mkdir()
+    ready = spool_root / (f"{uuid.uuid4()}.1.1.{digest.hexdigest()}"
+                          ".dmi-pack.ready")
+    with open(ready, "wb") as sparse:
+        sparse.truncate(size)
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="multipart-abort-flush",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            clickhouse_request_timeout_s=2.0,
+            publish_timeout_ns=1_000_000_000, s3_read_timeout_s=30)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            s3.stall_requests(_multipart_part_or_abort)
+            started = time.monotonic()
+            drained = service.flush(1.0)
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+        finally:
+            s3.close()
+            service.stop()
+
+    assert drained is False
+    assert len(s3.stalled) == 2, s3.stalled  # the part, then the abort
+    # The deadline, up to a second for the cut, and the 5 s abort.
+    assert elapsed < 1.0 + 1.0 + 5.0 + 1.0, (elapsed, snapshot)
+    assert snapshot["cancelled_uploads"] == 1, snapshot
+    assert snapshot["upload_failures"] == 0, snapshot
+    assert _ready(spool_root) == [ready]
+
+
+def test_stop_returns_promptly_while_an_upload_stalls(fake_s3, tmp_path):
+    """stop() joined a loop whose cycle was inside a PUT the store never
+    answers, so it waited out the S3 read timeout on every attempt, with the
+    lease held. It cancels the upload now: the pack stays in the spool, the
+    lease is released, and the next process uploads the pack."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="stalled-upload-stop",
+            poll_interval_ns=20_000_000, reconcile_on_start=False,
+            s3_read_timeout_s=60)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        stopper = None
+        try:
+            s3.stall_requests(_put)
+            tensors = _stage(spool_root, range(2))
+            _wait_for(lambda: s3.stalled, timeout_s=10.0)
+            outcome = {}
+
+            def _stop():
+                started = time.monotonic()
+                service.stop()
+                outcome["elapsed"] = time.monotonic() - started
+
+            stopper = threading.Thread(target=_stop, daemon=True)
+            stopper.start()
+            stopper.join(timeout=15.0)
+            assert not stopper.is_alive(), "stop() still blocked after 15 s"
+            assert outcome["elapsed"] < 3.0, outcome
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "released", snapshot
+            assert snapshot["upload_failures"] == 0, snapshot
+            assert snapshot["cancelled_uploads"] == 1, snapshot
+            assert len(_ready(spool_root)) == 1
+        finally:
+            s3.close()  # releases the stalled PUT
+            # Never a second stop() beside one still running.
+            if stopper is None:
+                service.stop()
+            else:
+                stopper.join(timeout=120.0)
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        successor = _service(direct, spool_root)
+        successor.start()
+        try:
+            successor.flush(30.0)
+        finally:
+            successor.stop()
+        assert _ready(spool_root) == []
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_a_flush_returns_on_time_while_the_index_reads_stall(
+        fake_s3, tmp_path):
+    """The store takes the PUTs, then stops answering GETs. The flush's
+    cycle indexed what it had uploaded through a client no cancel could
+    cut, and a pack whose read failed only moved the pass on to the next
+    pack: 3 packs cost 3 x (4 attempts x s3_read_timeout_s + backoff), 40 s
+    at a 3 s read timeout and 8 minutes a pack at the defaults. The reads
+    are cut one request timeout past the deadline now, and the pass ends at
+    the first read the store does not answer: the packs stay owed, none is
+    counted against or set aside, and they index once the store answers."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    request_timeout = 4.0
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="stalled-read-flush",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            s3_read_timeout_s=3,
+            clickhouse_request_timeout_s=request_timeout)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(6))  # three packs
+            s3.stall_requests(_ranged_get)  # only the indexer's reads
+            outcome = {}
+
+            def _flush():
+                started = time.monotonic()
+                outcome["drained"] = service.flush(1.0)
+                outcome["elapsed"] = time.monotonic() - started
+
+            waiter = threading.Thread(target=_flush, daemon=True)
+            waiter.start()
+            waiter.join(timeout=90.0)
+            assert not waiter.is_alive(), "flush(1.0) still blocked after 90 s"
+            snapshot = service.snapshot()
+            assert outcome["drained"] is False
+            assert outcome["elapsed"] < 1.0 + request_timeout + 1.5, (
+                outcome, snapshot)
+            # One read's attempts, not every pack's.
+            assert 1 <= len(s3.stalled) <= 2, (s3.stalled, snapshot)
+            assert snapshot["uploaded_packs"] == 3, snapshot
+            assert snapshot["pending_index"] == 3, snapshot
+            assert snapshot["indexed_packs"] == 0, snapshot
+            # Cut short by the deadline, not the packs' fault.
+            assert snapshot["index_failures"] == 0, snapshot
+            assert snapshot["rejected_packs"] == 0, snapshot
+            assert _ready(spool_root) == []
+
+            s3.cut()  # releases the stalled reads
+            s3.restore()
+            assert service.flush(30.0)
+        finally:
+            s3.close()
+            service.stop()
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_stop_returns_promptly_while_the_index_reads_stall(fake_s3, tmp_path):
+    """stop() cancelled the uploads but joined a cycle whose index pass
+    read, through the uncancellable client, every pack it had uploaded: a
+    GET the store never answers cost 4 attempts x s3_read_timeout_s each.
+    stop() cuts the reads too now. The packs it leaves unindexed are in the
+    bucket, where the next start's reconcile finds them."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="stalled-read-stop",
+            poll_interval_ns=20_000_000, reconcile_on_start=False,
+            s3_read_timeout_s=3)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        stopper = None
+        try:
+            s3.stall_requests(_ranged_get)
+            tensors = _stage(spool_root, range(6))
+            _wait_for(lambda: s3.stalled, timeout_s=10.0)
+            outcome = {}
+
+            def _stop():
+                started = time.monotonic()
+                service.stop()
+                outcome["elapsed"] = time.monotonic() - started
+
+            stopper = threading.Thread(target=_stop, daemon=True)
+            stopper.start()
+            stopper.join(timeout=90.0)
+            assert not stopper.is_alive(), "stop() still blocked after 90 s"
+            snapshot = service.snapshot()
+            assert outcome["elapsed"] < 3.0, (outcome, snapshot)
+            assert snapshot["lease_state"] == "released", snapshot
+            assert snapshot["rejected_packs"] == 0, snapshot
+        finally:
+            s3.close()  # releases the stalled reads
+            if stopper is None:
+                service.stop()
+            else:
+                stopper.join(timeout=120.0)
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        successor = _service(direct, spool_root)  # reconciles at start
+        successor.start()
+        try:
+            successor.flush(30.0)
+        finally:
+            successor.stop()
+        assert _ready(spool_root) == []
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_stop_sends_no_catalog_request_for_packs_it_cannot_index(
+        fake_s3, tmp_path):
+    """stop() cuts the index reads for good, but a cycle whose uploads it
+    cut still began the index pass over the packs it had uploaded: the
+    first batch's replay guard, a catalog SELECT under the lease lock, went
+    out after stop(), and its answer was thrown away when the read that
+    followed was refused. stop() waited for that statement too, up to a
+    request timeout against a slow catalog. No batch starts once the reads
+    are cut now; the packs stay owed, as the read would have left them.
+    Two of the four packs upload, the third's PUT is held, and the
+    catalog answers the replay guard 3 s late."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    puts = []
+    guard_reads = []
+
+    def _third_put_on(request: bytes) -> bool:
+        if not _put(request):
+            return False
+        puts.append(time.monotonic())
+        return len(puts) >= 3
+
+    def _slow_guard(request: bytes) -> float:
+        if not _replay_guard_read(request):
+            return 0.0
+        guard_reads.append(time.monotonic())
+        return 3.0
+
+    with _catalog() as (_client, catalog):
+        native = _storage_config(
+            s3.url, catalog.table_prefix,
+            clickhouse_port=switch.port)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="stop-no-replay-guard",
+            poll_interval_ns=20_000_000, reconcile_on_start=False,
+            uploader_max_workers=1, s3_read_timeout_s=30)
+        # Staged first, so the loop's first cycle lists all four.
+        tensors = _stage(spool_root, range(8))
+        s3.stall_requests(_third_put_on)
+        switch.delay_requests(_slow_guard)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        stopper = None
+        try:
+            _wait_for(lambda: s3.stalled, timeout_s=10.0)
+            outcome = {}
+
+            def _stop():
+                outcome["started"] = time.monotonic()
+                service.stop()
+                outcome["elapsed"] = time.monotonic() - outcome["started"]
+
+            stopper = threading.Thread(target=_stop, daemon=True)
+            stopper.start()
+            stopper.join(timeout=30.0)
+            assert not stopper.is_alive(), "stop() still blocked after 30 s"
+            snapshot = service.snapshot()
+        finally:
+            s3.close()  # releases the held PUT
+            switch.close()
+            if stopper is None:
+                service.stop()
+            else:
+                stopper.join(timeout=120.0)
+
+        late = [t for t in guard_reads if t >= outcome["started"]]
+        assert late == [], (late, outcome, snapshot)
+        assert outcome["elapsed"] < 2.0, (outcome, snapshot)
+        assert snapshot["lease_state"] == "released", snapshot
+        assert snapshot["uploaded_packs"] == 2, snapshot
+        assert snapshot["pending_index"] == 2, snapshot
+        assert snapshot["index_failures"] == 0, snapshot
+        assert len(_ready(spool_root)) == 2
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        successor = _service(direct, spool_root)  # reconciles at start
+        successor.start()
+        try:
+            successor.flush(30.0)
+        finally:
+            successor.stop()
+        assert _ready(spool_root) == []
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_an_object_store_read_outage_sets_no_pack_aside(fake_s3, tmp_path):
+    """A read the store never answered counted against the pack, as if the
+    pack itself were unreadable: after max_index_attempts cycles of an
+    outage the pack was set aside for good -- left in the bucket, out of
+    the flush boundary, and reported by flush() as never indexable. A pass
+    that meets an unanswered read now ends there and counts nothing
+    against the pack."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="read-outage",
+            poll_interval_ns=20_000_000, max_backoff_ns=200_000_000,
+            reconcile_on_start=False, s3_read_timeout_s=1,
+            s3_max_attempts=1, max_index_attempts=2)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            s3.stall_requests(_ranged_get)
+            tensors = _stage(spool_root, range(2))  # one pack
+            # Three passes over the pack, each ended by an unanswered read.
+            _wait_for(lambda: service.snapshot()["index_failures"] >= 3,
+                      timeout_s=30.0)
+            snapshot = service.snapshot()
+            assert snapshot["rejected_packs"] == 0, snapshot
+            assert snapshot["pending_index"] == 1, snapshot
+
+            s3.cut()
+            s3.restore()
+            assert service.flush(30.0)  # raised "set aside" before
+            snapshot = service.snapshot()
+            assert snapshot["indexed_packs"] == 1, snapshot
+            assert snapshot["rejected_packs"] == 0, snapshot
+        finally:
+            s3.close()
+            service.stop()
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_a_flush_against_a_slow_catalog_indexes_one_batch_past_its_deadline(
+        fake_s3, tmp_path):
+    """A flush's cycle checked its deadline only while uploading: past it,
+    it still indexed everything it had uploaded, batch after batch. Against
+    a catalog that answers slowly but inside the request timeout no request
+    fails, so the overrun grew with the batches -- 8 one-pack batches at
+    0.4 s a statement ran a 1 s flush for 59 s. Past the deadline a flush
+    then started no further batch, and left the rest of what it had
+    uploaded owed: gone from the spool, and remembered only by the service
+    -- so close(), which stops the service after its flush, dropped it,
+    and only a later start's reconcile could find those packs in the
+    bucket; with reconcile_on_start off, none did. A cycle now uploads a
+    chunk of indexer_max_packs at a time and indexes it before the next, so
+    past the deadline it indexes the one chunk it uploaded and leaves the
+    rest in the spool, which any later start uploads. (Its index reads are
+    cut one request timeout past the deadline too; the request timeout
+    here outlasts the batch, so that is not what ends it.)"""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    request_timeout = 60.0
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(
+            fake_s3, catalog.table_prefix,
+            clickhouse_port=switch.port)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="slow-catalog-flush",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            indexer_max_packs=1,
+            clickhouse_request_timeout_s=request_timeout)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(16))  # eight packs
+            switch.delay_requests(_slow_catalog(0.4, 0.4))
+            # close()'s order: a flush on the budget, then stop().
+            started = time.monotonic()
+            drained = service.flush(1.0)
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+            switch.close()
+
+        # One batch past the deadline -- about 7 s of statements at 0.4 s
+        # each, the lease's included -- not eight (59 s before).
+        assert elapsed < 1.0 + 12.0, (elapsed, snapshot)
+        assert drained is False
+        assert snapshot["uploaded_packs"] == 1, snapshot
+        assert snapshot["indexed_packs"] == 1, snapshot
+        # Nothing owed for stop() to drop: the rest never left the spool.
+        assert snapshot["pending_index"] == 0, snapshot
+        assert snapshot["index_failures"] == 0, snapshot
+        assert len(_ready(spool_root)) == 7
+
+        # A successor that does not reconcile -- a shared bucket's setting
+        # -- still gets every capture into the catalog.
+        direct = _storage_config(fake_s3, catalog.table_prefix,
+                                 reconcile_on_start=False)
+        successor = _service(direct, spool_root)
+        successor.start()
+        try:
+            successor.flush(60.0)
+        finally:
+            successor.stop()
+        assert _ready(spool_root) == []
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_a_close_whose_budget_ends_mid_upload_leaves_nothing_owed(
+        fake_s3, tmp_path):
+    """close() flushes the service on what is left of its budget, then
+    stops it. The flush's cycle uploaded pack after pack until the
+    deadline, each deleted from the spool once its upload was verified,
+    and past the deadline indexed one batch of them: the rest were owed,
+    in memory only, and stop() dropped them -- in the bucket, out of the
+    spool and out of the catalog, for a later start's reconcile alone to
+    find. A cycle uploads a chunk of indexer_max_packs at a time now and
+    indexes it before the next, so at the deadline at most the chunk in
+    flight is owed, and the flush indexes it; the rest stays in the spool.
+    Here uploads take about 0.3 s a pack, one at a time, so a 2 s budget
+    runs out a few packs into the twelve."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="close-mid-upload",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            uploader_max_workers=1, indexer_max_packs=4)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(24))  # twelve packs
+            s3.delay_requests(lambda request: 0.3 if _put(request) else 0.0)
+            # close()'s order: a flush on the budget, then stop().
+            drained = service.flush(2.0)
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+            s3.close()
+
+        assert drained is False
+        assert 0 < snapshot["uploaded_packs"] < 12, snapshot
+        assert snapshot["pending_index"] == 0, snapshot
+        assert snapshot["indexed_packs"] == snapshot["uploaded_packs"], snapshot
+        assert len(_ready(spool_root)) == 12 - snapshot["uploaded_packs"]
+
+        # A successor that does not reconcile -- a shared bucket's setting
+        # -- still gets every capture into the catalog.
+        direct = _storage_config(fake_s3, catalog.table_prefix,
+                                 reconcile_on_start=False)
+        successor = _service(direct, spool_root)
+        successor.start()
+        try:
+            successor.flush(60.0)
+        finally:
+            successor.stop()
+        assert _ready(spool_root) == []
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_the_one_batch_past_a_flushs_deadline_is_a_full_one(fake_s3,
+                                                           tmp_path):
+    """Past its deadline a flush starts no index batch but the first. The
+    pass cut its packs into batches of indexer_max_packs from the front and
+    then took them from the back, so that first batch was the remainder:
+    three packs in batches of two indexed one, and a remainder of one pack
+    is what a flush out of time made progress by however many it owed. The
+    first batch is a full one now."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(
+            fake_s3, catalog.table_prefix,
+            clickhouse_port=switch.port)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="full-batch-flush",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            indexer_max_packs=2, clickhouse_request_timeout_s=60.0)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(6))  # three packs
+            # Slow enough that one batch outlasts the 1 s deadline.
+            switch.delay_requests(_slow_catalog(0.4, 0.4))
+            drained = service.flush(1.0)
+            snapshot = service.snapshot()
+            assert drained is False
+            assert snapshot["indexed_packs"] == 2, snapshot
+            assert snapshot["index_failures"] == 0, snapshot
+
+            switch.restore()
+            assert service.flush(60.0)
+            assert service.snapshot()["indexed_packs"] == 3
+        finally:
+            switch.close()
+            service.stop()
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_only_the_loop_reconciles_never_a_flush(fake_s3, tmp_path):
+    """A flush's cycles skip the periodic reconcile, which lists the whole
+    bucket and asks the catalog about every page -- work no deadline
+    bounds; the loop runs it. A reconcile is due on every cycle here, and
+    the loop's first wake is 2 s off: the flush drains without one, and the
+    loop's first cycle runs it."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    with _catalog() as (_client, catalog):
+        native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="flush-no-reconcile",
+            poll_interval_ns=2_000_000_000, reconcile_on_start=False,
+            reconcile_interval_ns=1_000_000)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(2))
+            assert service.flush(30.0)
+            snapshot = service.snapshot()
+            assert snapshot["indexed_packs"] == 1, snapshot
+            assert snapshot["reconcile_passes"] == 0, snapshot
+            _wait_for(lambda: service.snapshot()["reconcile_passes"] >= 1,
+                      timeout_s=10.0)
+        finally:
+            service.stop()
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_a_service_started_again_after_stop_uploads_again(fake_s3, tmp_path):
+    """stop() cancels the service's uploads and reads for good, and start()
+    clears that: without it, a service object stopped and started again
+    would cancel every upload from then on, its flushes returning False
+    with the packs piling up in the spool."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    with _catalog() as (_client, catalog):
+        native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
+        native.update(spool_root=str(spool_root), holder="restarted",
+                      reconcile_on_start=False)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        service.stop()
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(2))
+            assert service.flush(10.0), service.snapshot()
+            snapshot = service.snapshot()
+            assert snapshot["cancelled_uploads"] == 0, snapshot
+            assert snapshot["indexed_packs"] == 1, snapshot
+        finally:
+            service.stop()
+        assert service.snapshot()["lease_state"] == "released"
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_stop_cuts_a_reconcile_whose_listing_stalls(fake_s3, tmp_path):
+    """The loop's periodic reconcile lists the bucket through the client
+    the index reads use. A listing the store never answers held stop() for
+    s3_read_timeout_s on each of the client's attempts; stop() cuts it now,
+    and the pass ends quietly, to run again on the next start."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="stalled-reconcile-stop",
+            poll_interval_ns=20_000_000, reconcile_on_start=False,
+            reconcile_interval_ns=1_000_000, s3_read_timeout_s=30)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        stopper = None
+        try:
+            s3.stall_requests(_listing)
+            _wait_for(lambda: s3.stalled, timeout_s=10.0)
+            outcome = {}
+
+            def _stop():
+                started = time.monotonic()
+                service.stop()
+                outcome["elapsed"] = time.monotonic() - started
+
+            stopper = threading.Thread(target=_stop, daemon=True)
+            stopper.start()
+            stopper.join(timeout=60.0)
+            assert not stopper.is_alive(), "stop() still blocked after 60 s"
+            snapshot = service.snapshot()
+            assert outcome["elapsed"] < 3.0, (outcome, snapshot)
+            assert snapshot["lease_state"] == "released", snapshot
+            assert snapshot["reconcile_passes"] == 0, snapshot
+            # Quietly: a listing stop() cut is no failed pass.
+            assert "reconcile" not in snapshot["last_error"], snapshot
+            assert len(s3.stalled) == 1, s3.stalled
+        finally:
+            s3.close()  # releases the stalled listing
+            if stopper is None:
+                service.stop()
+            else:
+                stopper.join(timeout=120.0)
 
 
 def test_dropping_a_running_service_does_not_hold_the_gil(fake_s3, tmp_path):
@@ -1827,13 +2787,36 @@ def test_the_lease_renews_while_start_reconciles(
             assert sorted(captures) == sorted(tensors)
 
 
+def _multipart_part_or_abort(request: bytes) -> bool:
+    line = request.partition(b"\r\n")[0]
+    return ((line.startswith(b"PUT ") and b"partNumber=" in line)
+            or (line.startswith(b"DELETE ") and b"uploadId=" in line))
+
+
 def test_the_lease_renews_until_the_loops_last_cycle_is_done(
         fake_s3, tmp_path):
     """stop() woke the loop and the lease thread together, and the lease
-    thread left at once while the loop's last cycle still ran: a pass
-    reading a pack then found its lease abandoned at the commit, and the
-    snapshot said "held" over a dead row until then. The lease thread now
-    stops only after the loop has."""
+    thread left at once while the loop's last cycle still ran: the snapshot
+    said "held" over a row that had expired meanwhile, and stop() found its
+    lease abandoned instead of releasing it. The lease thread now stops only
+    after the loop has.
+
+    stop() cuts the cycle's object-store requests short, so the cycle needs
+    something to do that no cancel cuts, outside the lease lock (inside it,
+    each request renews the lease when due). A multipart upload that stop()
+    cuts is aborted with a request of its own, one attempt of up to 5 s --
+    here held for all of it, past the 3 s lease -- while the lease thread
+    must go on renewing. (It used to be an index read held past the lease
+    deadline; stop() cuts reads now.) The pack is a sparse file of zeros
+    named for its checksum, over the client's 64 MiB multipart threshold:
+    it is only ever uploaded, and stays staged."""
+    import hashlib
+
+    size = 65 << 20
+    digest = hashlib.sha256()
+    zeros = bytes(1 << 20)
+    for _ in range(size // len(zeros)):
+        digest.update(zeros)
     spool_root = tmp_path / "spool"
     s3 = _Switch.to_url(fake_s3)
     with _catalog() as (client, catalog):
@@ -1842,30 +2825,32 @@ def test_the_lease_renews_until_the_loops_last_cycle_is_done(
                                  publish_timeout_s=1)
         service = _service(config, spool_root)
         service.start()
-        reads = []
-
-        def _first_read(request: bytes) -> bool:
-            if _ranged_get(request):
-                reads.append(time.monotonic())
-                return True
-            return False
-
         try:
-            s3.slow_once(_first_read, 4.0)  # past the lease deadline
-            tensors = _stage(spool_root, range(2))
-            _wait_for(lambda: reads, timeout_s=10.0)
+            s3.stall_requests(_multipart_part_or_abort)
+            ready = spool_root / (f"{uuid.uuid4()}.1.1.{digest.hexdigest()}"
+                                  ".dmi-pack.ready")
+            with open(ready, "wb") as sparse:
+                sparse.truncate(size)
+            _wait_for(lambda: s3.stalled, timeout_s=10.0)  # a part, held
+            started = time.monotonic()
             log = _sample_during(service.stop, service, client,
                                  catalog.table_prefix)
+            elapsed = time.monotonic() - started
             snapshot = service.snapshot()
         finally:
             service.stop()
             s3.close()
 
         assert not _held_but_dead(log), log
-        assert snapshot["indexed_packs"] == 1, snapshot
-        assert snapshot["lease_state"] == "released", snapshot
-        captures = _read_all(_storage_config(fake_s3, catalog.table_prefix))
-        assert sorted(captures) == sorted(tensors)
+        assert snapshot["lease_state"] == "released", (snapshot, log)
+        # The part was cut and the abort held to its 5 s bound: the loop's
+        # last cycle outlived the lease, which kept renewing throughout.
+        assert len(s3.stalled) == 2, s3.stalled
+        assert 4.5 < elapsed < 9.0, (elapsed, snapshot)
+        assert snapshot["lease_renewals"] >= 3, snapshot
+        assert snapshot["cancelled_uploads"] == 1, snapshot
+        assert snapshot["upload_failures"] == 0, snapshot
+        assert _ready(spool_root) == [ready]
 
 
 def _slow_catalog(insert_s: float, read_s: float):

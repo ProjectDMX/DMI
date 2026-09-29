@@ -18,9 +18,17 @@
 //   {"op":"upload_one"|"upload_pending",...,"root":"...",
 //    "owner_lock":"take"|"held_by_caller" (optional, take by default)}
 //     open the spool at root, owner lock included, for the one op;
-//     upload_pending's failures carry pack_id, object_key, attempts, error
-//     and retryable.
+//     upload_pending's failures carry pack_id, object_key, attempts, error,
+//     cancelled and retryable.
 // Errors: {"ok":false,"what":"..."}.
+//
+// Any op may carry "cancel_after_ms":N: the client (and the uploader) get a
+// Cancellation, cancelled N ms after the op starts unless it has finished,
+// and the response says whether that fired ("cancelled"; for upload_one,
+// whether the cancel ended the upload, and per failure for upload_pending).
+// With "cancel_uploader_only":true only the uploader gets it, so a request
+// the cancel comes in during runs to its own end, as one whose answer
+// lands in the gap before libcurl next asks the Cancellation would.
 
 #include "s3_client.h"
 
@@ -28,9 +36,13 @@
 #include "spool.h"
 #include "uploader.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 
@@ -155,10 +167,47 @@ dmi_store::UploaderConfig ReadUploaderConfig(const std::string& line) {
   // attempt (like botocore), and only its exhaustion surfaces here.
   const int64_t attempts = Integer(line, "upload_max_attempts");
   if (attempts > 0) config.max_attempts = static_cast<int>(attempts);
+  // The uploader's own backoff between attempts, base * 2^attempt capped
+  // at max_backoff_s: long enough, a cancel shows whether it wakes it.
+  const int64_t backoff_ms = Integer(line, "upload_base_backoff_ms");
+  if (backoff_ms > 0) config.base_backoff_s = backoff_ms / 1000.0;
   config.store_id = jc::FindString(line, "store_id");
   if (config.store_id.empty()) config.store_id = "s3";
   return config;
 }
+
+// Cancels `cancel` a set time after Arm(), unless Finish() comes first.
+struct Canceller {
+  dmi_store::Cancellation cancel;
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool done = false;
+  bool fired = false;
+  std::thread thread;
+
+  void Arm(int64_t after_ms) {
+    thread = std::thread([this, after_ms] {
+      std::unique_lock<std::mutex> lock(mutex);
+      if (!cv.wait_for(lock, std::chrono::milliseconds(after_ms),
+                       [this] { return done; })) {
+        fired = true;
+        cancel.Cancel();
+      }
+    });
+  }
+
+  bool Finish() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      done = true;
+    }
+    cv.notify_all();
+    if (thread.joinable()) thread.join();
+    return fired;
+  }
+
+  ~Canceller() { Finish(); }
+};
 
 int main() {
   std::string line;
@@ -176,6 +225,8 @@ int main() {
     g_out_of_range.clear();
     const std::string op = jc::FindString(line, "op");
     const std::string key = jc::FindString(line, "key");
+    const int64_t cancel_after_ms = Integer(line, "cancel_after_ms");
+    Canceller canceller;  // outlives the client, which points at it
     dmi_store::S3Client client(ReadConfig(line));
     // Before any request goes out: a timeout or attempt count that cannot be
     // represented must not be replaced by the default.
@@ -183,6 +234,15 @@ int main() {
       refuse_out_of_range();
       continue;
     }
+    const bool armed = cancel_after_ms > 0;
+    if (armed) {
+      if (!jc::FindBool(line, "cancel_uploader_only")) {
+        client.set_cancellation(&canceller.cancel);
+      }
+      canceller.Arm(cancel_after_ms);
+    }
+    bool upload_cancelled = false;
+    bool upload_op = false;
     std::string error;
     std::string out = "{\"ok\":";
     if (op == "put") {
@@ -321,10 +381,13 @@ int main() {
           continue;
         }
         dmi_store::SpoolUploader uploader(&spool, &client, uploader_config);
+        if (armed) uploader.set_cancellation(&canceller.cancel);
         dmi_store::PackRef ref;
         int attempts = 0;
         std::string error;
-        const bool ok = uploader.UploadOne(staged, &ref, &attempts, &error);
+        upload_op = true;
+        const bool ok = uploader.UploadOne(staged, &ref, &attempts, &error,
+                                           &upload_cancelled);
         out += ok ? "true" : "false";
         if (ok) {
           out += ",\"ref\":";
@@ -367,9 +430,11 @@ int main() {
           continue;
         }
         dmi_store::SpoolUploader uploader(&spool, &client, uploader_config);
+        if (armed) uploader.set_cancellation(&canceller.cancel);
         const dmi_store::UploadBatchResult result =
             uploader.UploadPending(limit < 0 ? -1 : static_cast<int>(limit));
-        out += "true,\"refs\":[";
+        out += std::string("true,\"listing_cancelled\":") +
+               (result.listing_cancelled ? "true" : "false") + ",\"refs\":[";
         bool first = true;
         for (const auto& ref : result.refs) {
           if (!first) out.push_back(',');
@@ -387,6 +452,8 @@ int main() {
           out += ",\"attempts\":" + std::to_string(failure.attempts);
           out += ",\"error\":";
           jc::EscapeJson(failure.error, &out);
+          out += std::string(",\"cancelled\":") +
+                 (failure.cancelled ? "true" : "false");
           out += std::string(",\"retryable\":") +
                  (failure.retryable ? "true" : "false");
           out += "}";
@@ -397,7 +464,8 @@ int main() {
                std::to_string(snap.attempted_packs) + ",\"uploaded_packs\":" +
                std::to_string(snap.uploaded_packs) + ",\"uploaded_bytes\":" +
                std::to_string(snap.uploaded_bytes) + ",\"failed_packs\":" +
-               std::to_string(snap.failed_packs) + ",\"retries\":" +
+               std::to_string(snap.failed_packs) + ",\"cancelled_packs\":" +
+               std::to_string(snap.cancelled_packs) + ",\"retries\":" +
                std::to_string(snap.retries) + ",\"peak_active_uploads\":" +
                std::to_string(snap.peak_active_uploads) +
                ",\"peak_in_flight_bytes\":" +
@@ -407,6 +475,11 @@ int main() {
       }
     } else {
       out += "false,\"what\":\"unknown op\"";
+    }
+    if (armed) {
+      const bool fired = canceller.Finish();
+      out += std::string(",\"cancelled\":") +
+             ((upload_op ? upload_cancelled : fired) ? "true" : "false");
     }
     out += ",\"attempts\":" + std::to_string(client.last_attempts()) + "}\n";
     std::cout << out;
