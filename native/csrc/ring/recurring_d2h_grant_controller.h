@@ -32,6 +32,9 @@ struct D2HWindowAdmission {
 class D2HGrantController {
   public:
     virtual ~D2HGrantController() = default;
+    // Called only by the drain thread between transfer batches.
+    virtual void suspend_learning() {}
+    virtual void resume_learning() {}
     virtual std::optional<D2HWindowAdmission>
     poll(D2HWindowAvailability availability) = 0;
     virtual bool commit(const D2HWindowAdmission& admission,
@@ -54,6 +57,8 @@ class RecurringD2HGrantController final : public D2HGrantController {
     void cancel_pending(D2HWindowPackedProgressLayout::Version version) noexcept;
     void reset_for_version_reuse();
     void cancel_pending_for_fallback() noexcept;
+    void suspend_learning() override;
+    void resume_learning() override;
     bool record_capacity_forced_flush(uint64_t count_reset_interval_periods);
 
     std::optional<D2HWindowAdmission>

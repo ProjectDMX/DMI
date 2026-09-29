@@ -86,6 +86,26 @@ void RecurringD2HGrantController::cancel_pending_for_fallback() noexcept {
     pending_bundles_.clear();
 }
 
+void RecurringD2HGrantController::suspend_learning() {
+    if (current_bundle_)
+        for (auto& window : current_bundle_->windows) window.timing.reset();
+}
+
+void RecurringD2HGrantController::resume_learning() {
+    // Terminal fallback must never be reactivated by a phase transition.
+    if (mode_.mode() == D2HWindowMode::ENABLED_FALLBACK) return;
+    // A previously queued training pattern reset can have finished while
+    // suspended. Activate it without observing the evaluation time gap.
+    reconcile_progress();
+    suspend_learning();
+    if (!current_bundle_ || !cached_progress_ ||
+        cached_progress_->version != current_bundle_->version) return;
+    const auto matched = current_bundle_->matcher.match(cached_progress_->counter);
+    if (matched)
+        current_bundle_->windows.at(matched->window_index).missed_open_occurrence =
+            matched->occurrence;
+}
+
 bool RecurringD2HGrantController::record_capacity_forced_flush(
     uint64_t count_reset_interval_periods) {
     const auto observed = progress_.load();

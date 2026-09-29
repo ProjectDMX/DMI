@@ -229,6 +229,8 @@ public:
         std::vector<ring::D2HWindowOffset> windows,
         std::optional<uint64_t> initial_counter = std::nullopt);
     bool recurring_d2h_windows_enabled() const;
+    void set_d2h_window_suspended(bool suspended, uint64_t timeout_ms = 600000);
+    bool d2h_window_suspended() const;
     at::Tensor d2h_window_device_progress_tensor() const;
     at::Tensor d2h_window_cpu_visible_progress_tensor() const;
     uint8_t d2h_window_progress_kind() const;

@@ -1059,7 +1059,202 @@ static void test_legacy_engine_rejects_recurring_window_configuration() {
     EXPECT(rejected);
 }
 
+static void test_suspended_window_uses_batched_threshold(uint64_t entries) {
+    banner(entries == 1 ? "suspension uses one-entry batching" : "suspension retains batched tail until resume");
+    ring::RingConfig cfg = make_config();
+    cfg.recurring_d2h_windows.fallback_entry_threshold = entries;
+    ring::D2HWindowModeController mode(3);
+    mode.record_pattern_version_activation();
+    OneAdmissionController controller(32);
+    controller.enabled = false;
+    DrainHarness h(cfg, &controller, &mode);
+    const auto source = pattern(32, 13);
+    auto* device = upload(source, h.stream);
+    h.drain->reserve(32, 1);
+    // Enter evaluation with an unpublished reservation: entry must not flush/wait.
+    EXPECT(h.drain->set_window_suspended_until(true, 1,
+        std::chrono::steady_clock::now() + std::chrono::seconds(2)));
+    EXPECT(h.drain->window_suspended());
+    const auto polls = controller.polls.load();
+    ring::launch_producer_static(h.allocated.state(), device, source.size(), 0, h.stream);
+    CUDA_CHECK(cudaStreamSynchronize(h.stream));
+    h.drain->notify();
+    if (entries == 1) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (h.drain->cpu_payload_tail_committed() != 32 && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        EXPECT(h.drain->cpu_payload_tail_committed() == 32);
+    } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        EXPECT(h.drain->cpu_payload_tail_committed() == 0);
+    }
+    EXPECT(controller.polls.load() == polls);
+    EXPECT(h.drain->set_window_suspended_until(false, 1,
+        std::chrono::steady_clock::now() + std::chrono::seconds(2)));
+    EXPECT(!h.drain->window_suspended());
+    EXPECT(h.drain->cpu_payload_tail_committed() == 32);
+    EXPECT(mode.mode() == ring::D2HWindowMode::ENABLED_ACTIVE);
+    const auto n = h.drain->wait_for_tasks();
+    EXPECT(n == 1);
+    std::vector<ring::DrainTask> tasks;
+    h.drain->pop_tasks(n, tasks);
+    EXPECT(task_bytes(tasks.front()) == source);
+    h.release(tasks.front());
+    CUDA_CHECK(cudaFree(device));
+}
+
+static void test_suspend_resume_does_not_flush_sink() {
+    banner("window phase switch never flushes the storage sink");
+    ring_py::RingConfig cfg;
+    cfg.payload_ring_bytes = cfg.pinned_staging_bytes = 4096;
+    auto& w = cfg.recurring_d2h_windows;
+    w.enabled = true;
+    w.minimum_record_probe_retry_interval_occurrences = 1;
+    w.timing_revalidation_retry_interval_occurrences = 1;
+    w.capacity_flush_fallback_threshold = 2;
+    auto sink = std::make_shared<TrackingRecordSink>();
+    ring_py::RingEnginePy engine(cfg, sink);
+    engine.init(); engine.start();
+    engine.set_d2h_window_suspended(true, 1000);
+    engine.set_d2h_window_suspended(true, 1000);
+    EXPECT(engine.d2h_window_suspended());
+    engine.set_d2h_window_suspended(false, 1000);
+    EXPECT(!engine.d2h_window_suspended());
+    EXPECT(sink->flushes == 0);
+    EXPECT(engine.d2h_window_runtime_snapshot().mode == ring::D2HWindowMode::ENABLED_NO_PATTERN);
+    engine.stop();
+}
+
+static void test_resume_rejects_missing_publication() {
+    banner("resume rejects an unpublished reservation and stays suspended");
+    ring::RingConfig cfg = make_config();
+    ring::D2HWindowModeController mode(3);
+    OneAdmissionController controller(32);
+    controller.enabled = false;
+    DrainHarness h(cfg, &controller, &mode);
+    EXPECT(h.drain->set_window_suspended_until(true, 0,
+        std::chrono::steady_clock::now() + std::chrono::seconds(2)));
+    h.drain->reserve(32, 1);
+    bool threw = false;
+    try {
+        h.drain->set_window_suspended_until(false, 1,
+            std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    } catch (const std::runtime_error& error) {
+        threw = std::string(error.what()).find("incomplete producer") != std::string::npos;
+    }
+    EXPECT(threw);
+    EXPECT(h.drain->window_suspended());
+}
+
+static void test_window_fallback_default_and_zero_bytes(bool terminal) {
+    banner(terminal ? "terminal fallback drains one zero-byte entry" : "no-pattern fallback drains one zero-byte entry");
+    ring::RingConfig cfg = make_config();
+    ring::D2HWindowModeController mode(1);
+    if (terminal) {
+        mode.record_pattern_version_activation();
+        mode.record_capacity_forced_flush(false);
+    }
+    OneAdmissionController controller(0);
+    controller.enabled = false;
+    DrainHarness h(cfg, &controller, &mode);
+    h.drain->reserve(0, 1);
+    ring::launch_producer_static(h.allocated.state(), nullptr, 0, 0, h.stream);
+    CUDA_CHECK(cudaStreamSynchronize(h.stream));
+    h.drain->notify();
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (h.drain->cpu_task_tail_committed() != 1 && std::chrono::steady_clock::now() < end)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT(h.drain->cpu_task_tail_committed() == 1);
+    if (h.drain->cpu_task_tail_committed() != 1) return;
+    const auto n = h.drain->wait_for_tasks();
+    EXPECT(n == 1);
+    std::vector<ring::DrainTask> tasks;
+    h.drain->pop_tasks(n, tasks);
+    EXPECT(tasks.front().tensor_total_bytes == 0);
+    h.release(tasks.front());
+    EXPECT(mode.mode() == (terminal ? ring::D2HWindowMode::ENABLED_FALLBACK : ring::D2HWindowMode::ENABLED_NO_PATTERN));
+}
+
+static void test_suspended_capacity_flush_does_not_count() {
+    banner("evaluation capacity flush leaves training fallback count unchanged");
+    ring::RingConfig cfg = make_config();
+    cfg.recurring_d2h_windows.fallback_entry_threshold = 0;
+    ring::D2HWindowModeController mode(1);
+    mode.record_pattern_version_activation();
+    OneAdmissionController controller(32);
+    controller.enabled = false;
+    std::atomic<int> callbacks{0};
+    DrainHarness h(cfg, &controller, &mode, [&] {
+        ++callbacks;
+        mode.record_capacity_forced_flush(false);
+    });
+    EXPECT(h.drain->set_window_suspended_until(true, 0,
+        std::chrono::steady_clock::now() + std::chrono::seconds(2)));
+    auto* device = upload(pattern(32, 17), h.stream);
+    h.drain->reserve(32, 1);
+    ring::launch_producer_static(h.allocated.state(), device, 32, 0, h.stream);
+    CUDA_CHECK(cudaStreamSynchronize(h.stream));
+    h.drain->force_flush_and_wait(true);
+    EXPECT(callbacks == 0);
+    EXPECT(mode.snapshot().capacity_forced_flush_count == 0);
+    const auto n = h.drain->wait_for_tasks();
+    std::vector<ring::DrainTask> tasks;
+    h.drain->pop_tasks(n, tasks);
+    for (const auto& task : tasks) h.release(task);
+    EXPECT(h.drain->set_window_suspended_until(false, 1,
+        std::chrono::steady_clock::now() + std::chrono::seconds(2)));
+    EXPECT(mode.mode() == ring::D2HWindowMode::ENABLED_ACTIVE);
+    CUDA_CHECK(cudaFree(device));
+}
+
+static void test_window_switch_timeout_under_staging_pressure() {
+    banner("phase-switch timeout under host backpressure remains stopped safely");
+    auto cfg = make_config(64);
+    ring::D2HWindowModeController mode(3);
+    OneAdmissionController controller(64);
+    controller.enabled = false;
+    DrainHarness h(cfg, &controller, &mode);
+    EXPECT(h.drain->set_window_suspended_until(true, 0,
+        std::chrono::steady_clock::now() + std::chrono::seconds(2)));
+    auto* device = upload(pattern(64, 7), h.stream);
+    h.drain->reserve(64, 1);
+    ring::launch_producer_static(h.allocated.state(), device, 64, 0, h.stream);
+    CUDA_CHECK(cudaStreamSynchronize(h.stream));
+    h.drain->notify();
+    auto n = h.drain->wait_for_tasks();
+    std::vector<ring::DrainTask> held;
+    h.drain->pop_tasks(n, held); // Keep all staging bytes busy.
+    h.drain->reserve(64, 1);
+    ring::launch_producer_static(h.allocated.state(), device, 64, 0, h.stream);
+    CUDA_CHECK(cudaStreamSynchronize(h.stream));
+    h.drain->notify();
+    bool timed_out = false;
+    try {
+        timed_out = !h.drain->set_window_suspended_until(false, 2,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
+    } catch (const std::runtime_error& error) {
+        timed_out = std::string(error.what()).find("timed out") != std::string::npos;
+    }
+    EXPECT(timed_out);
+    EXPECT(h.drain->window_suspended());
+    bool failed = false;
+    try { h.drain->rethrow_drain_failure(); }
+    catch (const std::runtime_error&) { failed = true; }
+    EXPECT(failed);
+    h.drain->stop(); // Must unblock a drain waiting for staging, even on failure.
+    for (const auto& task : held) h.release(task);
+    CUDA_CHECK(cudaFree(device));
+}
+
 int main() {
+    test_suspended_capacity_flush_does_not_count();
+    test_window_switch_timeout_under_staging_pressure();
+    test_window_fallback_default_and_zero_bytes(false);
+    test_window_fallback_default_and_zero_bytes(true);
+    test_suspended_window_uses_batched_threshold(1);
+    test_suspended_window_uses_batched_threshold(4);
+    test_suspend_resume_does_not_flush_sink();
+    test_resume_rejects_missing_publication();
     setbuf(stdout, nullptr);
     ring::set_ring_null_mode(false);
     CUDA_CHECK(cudaDeviceSynchronize());

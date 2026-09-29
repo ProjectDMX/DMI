@@ -661,6 +661,31 @@ void RingEnginePy::flush_and_wait() {
     impl_->engine.drain_thread().force_flush_and_wait();
 }
 
+void RingEnginePy::set_d2h_window_suspended(bool suspended, uint64_t timeout_ms) {
+    if (!impl_->engine.recurring_d2h_windows_enabled())
+        throw std::logic_error("D2H policy switch requires recurring windows");
+    if (timeout_ms == 0) throw std::invalid_argument("D2H policy timeout must be positive");
+    auto& drain = impl_->engine.drain_thread();
+    drain.rethrow_drain_failure();
+    drain.rethrow_record_reclaim_failure();
+    if (drain.window_suspended() == suspended) return;
+    const auto deadline = record_flush_deadline(timeout_ms);
+    const auto stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStreamCaptureStatus capture_status;
+    check_flush_cuda(cudaStreamIsCapturing(stream, &capture_status), "cudaStreamIsCapturing");
+    if (capture_status != cudaStreamCaptureStatusNone)
+        throw std::logic_error("D2H policy switch cannot run inside CUDA graph capture");
+    const auto target = drain.cpu_task_head();
+    if (!suspended && !wait_for_stream_prefix_until(stream, deadline))
+        throw std::runtime_error("D2H resume timed out waiting for producers; do not reuse runtime");
+    if (!drain.set_window_suspended_until(suspended, target, deadline))
+        throw std::runtime_error("D2H policy switch timed out; do not reuse runtime");
+}
+
+bool RingEnginePy::d2h_window_suspended() const {
+    return impl_->engine.drain_thread().window_suspended();
+}
+
 bool RingEnginePy::define_d2h_window_pattern(
     uint64_t period,
     std::vector<ring::D2HWindowOffset> windows,

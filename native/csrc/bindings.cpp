@@ -630,6 +630,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<ring::RecurringD2HWindowConfig>(m, "RecurringD2HWindowConfig")
       .def(py::init<>())
       .def_readwrite("enabled", &ring::RecurringD2HWindowConfig::enabled)
+      .def_readwrite("fallback_entry_threshold",
+                     &ring::RecurringD2HWindowConfig::fallback_entry_threshold)
       .def_readwrite("progress", &ring::RecurringD2HWindowConfig::progress)
       .def_readwrite("grant_policy",
                      &ring::RecurringD2HWindowConfig::grant_policy)
@@ -889,6 +891,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("initial_counter") = std::nullopt)
       .def("_recurring_d2h_windows_enabled",
            &ring_py::RingEnginePy::recurring_d2h_windows_enabled)
+      .def("set_d2h_window_suspended", &ring_py::RingEnginePy::set_d2h_window_suspended,
+           py::arg("suspended"), py::arg("timeout_ms") = 600000,
+           py::call_guard<py::gil_scoped_release>())
+      .def("d2h_window_suspended", &ring_py::RingEnginePy::d2h_window_suspended)
       .def("_d2h_window_device_progress_tensor",
            &ring_py::RingEnginePy::d2h_window_device_progress_tensor)
       .def("_d2h_window_cpu_visible_progress_tensor",

@@ -113,6 +113,8 @@ void DrainThread::stop() {
         if (!running_.exchange(false)) return;
     }
     cv_.notify_all();
+    flush_done_cv_.notify_all();
+    staging_cv_.notify_all();
     if (thread_.joinable()) thread_.join();
 }
 
@@ -209,6 +211,78 @@ void DrainThread::resume(DrainPauseToken token) {
         pause_resumed_generation_ = token.generation;
     }
     cv_.notify_one();
+}
+
+bool DrainThread::set_window_suspended_until(
+    bool suspended, uint64_t target_task_head,
+    std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (drain_failure_) std::rethrow_exception(drain_failure_);
+    if (!running_) throw std::runtime_error("D2H policy switch on a stopped drain");
+    if (window_request_generation_ != window_ack_generation_)
+        throw std::logic_error("D2H policy switch already pending");
+    if (window_suspended_.load() == suspended) return true;
+    window_requested_suspended_ = suspended;
+    window_target_task_head_ = target_task_head;
+    window_request_deadline_ = deadline;
+    const auto generation = ++window_request_generation_;
+    notified_ = true;
+    cv_.notify_one();
+    const bool ready = flush_done_cv_.wait_until(lk, deadline, [&] {
+        return window_ack_generation_ >= generation || drain_failure_ || !running_;
+    });
+    if (drain_failure_) std::rethrow_exception(drain_failure_);
+    if (!running_) throw std::runtime_error("drain stopped during D2H policy switch");
+    if (!ready) {
+        lk.unlock();
+        record_drain_failure(std::make_exception_ptr(
+            std::runtime_error("D2H policy switch timed out; runtime cannot be reused")));
+        return false;
+    }
+    return true;
+}
+
+void DrainThread::process_window_request() {
+    uint64_t generation, target;
+    bool suspended;
+    std::chrono::steady_clock::time_point deadline;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (window_request_generation_ == window_ack_generation_) return;
+        generation = window_request_generation_;
+        suspended = window_requested_suspended_;
+        target = window_target_task_head_;
+        deadline = window_request_deadline_;
+    }
+    if (suspended) {
+        if (grant_controller_) grant_controller_->suspend_learning();
+        window_suspended_.store(true);
+    } else {
+        // Still suspended. This entire command runs between drain batches,
+        // so no separate externally-held pause (or resume waiter) is needed.
+        do_full_flush(deadline);
+        rethrow_record_reclaim_failure();
+        apply_pending_record_reclaims();
+        {
+            std::lock_guard<std::mutex> lk(mgmt_mu_);
+            if (cpu_task_head_ != target || cpu_task_tail_ != target ||
+                !pending_task_reclaims_.empty() || pending_entries_ != 0 ||
+                cpu_payload_head_ != cpu_payload_tail_committed_)
+                throw std::runtime_error("D2H resume found incomplete producer publications");
+        }
+        // A caller timeout latches a failure; never resume learning afterwards.
+        std::lock_guard<std::mutex> lk(mu_);
+        if (drain_failure_) std::rethrow_exception(drain_failure_);
+        if (!running_ || std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error("D2H resume stopped or timed out");
+        if (grant_controller_) grant_controller_->resume_learning();
+        window_suspended_.store(false);
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        window_ack_generation_ = generation;
+    }
+    flush_done_cv_.notify_all();
 }
 
 void DrainThread::record_drain_failure(std::exception_ptr failure) {
@@ -418,7 +492,7 @@ void DrainThread::submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes
 // ---------------------------------------------------------------------------
 // do_full_flush -- drain all pending entries.  Called by drain thread only.
 // ---------------------------------------------------------------------------
-bool DrainThread::do_full_flush() {
+bool DrainThread::do_full_flush(std::chrono::steady_clock::time_point deadline) {
     bool moved_data = false;
     for (;;) {
         uint64_t flush_count = 0, flush_bytes = 0;
@@ -437,7 +511,16 @@ bool DrainThread::do_full_flush() {
         }
         {
             std::unique_lock<std::mutex> lk(staging_mu_);
-            staging_cv_.wait(lk, [&] { return staging_.free_bytes() >= flush_bytes; });
+            if (deadline == std::chrono::steady_clock::time_point::max()) {
+                staging_cv_.wait(lk, [&] {
+                    return staging_.free_bytes() >= flush_bytes || !running_;
+                });
+                if (!running_) throw std::runtime_error("D2H flush stopped waiting for staging");
+            } else if (!staging_cv_.wait_until(lk, deadline, [&] {
+                           return staging_.free_bytes() >= flush_bytes || !running_;
+                       }) || !running_) {
+                throw std::runtime_error("D2H resume waiting for staging stopped or timed out");
+            }
         }
         enqueue_d2h(flush_bytes);
         sync_stream();
@@ -456,6 +539,7 @@ bool DrainThread::do_full_flush() {
 }
 
 bool DrainThread::do_window_decision() {
+    if (window_suspended_.load()) return false;
     if (!grant_controller_ || !mode_controller_) return false;
 
     const D2HWindowMode before = mode_controller_->mode();
@@ -580,7 +664,7 @@ void DrainThread::loop() {
             bool moved_data = false;
             try {
                 moved_data = do_full_flush();
-                if (moved_data && counts_for_fallback &&
+                if (moved_data && counts_for_fallback && !window_suspended_.load() &&
                     capacity_flush_callback_) {
                     capacity_flush_callback_();
                 }
@@ -609,10 +693,12 @@ void DrainThread::loop() {
         }
 
         try {
+            process_window_request();
             if (do_window_decision()) {
                 std::unique_lock<std::mutex> lk(mu_);
                 auto pred = [this] {
                     return notified_ ||
+                        window_request_generation_ > window_ack_generation_ ||
                         flush_requested_generation_ >
                             flush_completed_generation_ ||
                         pause_requested_generation_ >
@@ -663,8 +749,9 @@ void DrainThread::loop() {
                 {
                     std::unique_lock<std::mutex> lk(staging_mu_);
                     staging_cv_.wait(lk, [&] {
-                        return staging_.free_bytes() >= flush_bytes;
+                        return staging_.free_bytes() >= flush_bytes || !running_;
                     });
+                    if (!running_) throw std::runtime_error("D2H drain stopped waiting for staging");
                 }
 
                 enqueue_d2h(flush_bytes);
@@ -689,6 +776,7 @@ void DrainThread::loop() {
             std::unique_lock<std::mutex> lk(mu_);
             auto pred = [this] {
                 return notified_ ||
+                       window_request_generation_ > window_ack_generation_ ||
                        flush_requested_generation_ >
                            flush_completed_generation_ ||
                        pause_requested_generation_ >
@@ -789,7 +877,14 @@ bool DrainThread::should_flush() const {
         fe >= static_cast<uint64_t>(fc.task_ratio * task_cap)) return true;
     if (fc.payload_ratio > 0.0f &&
         fb >= static_cast<uint64_t>(fc.payload_ratio * payload_cap)) return true;
-    if (fc.entry_threshold > 0 && fe >= fc.entry_threshold) return true;
+    // Fallback uses the same batched drain, with a default one-entry threshold.
+    // Active-window capacity thresholds and ordinary batching stay unchanged.
+    const bool fallback = mode_controller_ &&
+        (window_suspended_.load() || !mode_controller_->window_scheduling_in_effect());
+    const auto fallback_entries = cfg_.recurring_d2h_windows.fallback_entry_threshold;
+    const auto entry_threshold = fallback && fallback_entries > 0
+        ? fallback_entries : fc.entry_threshold;
+    if (entry_threshold > 0 && fe >= entry_threshold) return true;
     if (fc.byte_threshold > 0 && fb >= fc.byte_threshold) return true;
     if (fc.timeout_us > 0 && has_complete_time_) {
         auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(

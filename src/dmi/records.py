@@ -265,6 +265,14 @@ class RecordRuntime(Generic[MetadataT]):
             initial_counter=initial_counter,
         )
 
+    def set_d2h_window_suspended(self, suspended: bool, *, timeout_s: float = 600.0) -> None:
+        """Temporarily use window fallback without discarding learned grants.
+
+        Entry does not flush. Return waits for producers and D2H, not storage.
+        Call outside graph capture on the stream ordering the producer prefix.
+        """
+        self._transport.set_d2h_window_suspended(suspended, timeout_s=timeout_s)
+
     def advance_boundary(self) -> None:
         """Publish one ordered boundary for the active D2H pattern."""
 

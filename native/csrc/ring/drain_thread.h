@@ -76,6 +76,12 @@ public:
     DrainPauseToken pause_after_flush_and_wait() override;
     void resume(DrainPauseToken token) override;
 
+    // Entry is non-flushing. Return flushes/checks the producer prefix first;
+    // caller must await its framework stream before requesting return.
+    bool set_window_suspended_until(bool suspended, uint64_t target_task_head,
+                                   std::chrono::steady_clock::time_point deadline);
+    bool window_suspended() const noexcept { return window_suspended_.load(); }
+
     // Submit a CPU-direct tensor to drain -> p2p pipeline.
     // The tensor is already in pageable CPU memory; skips D2H and staging.
     void submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes);
@@ -163,6 +169,12 @@ private:
     uint64_t                pause_resumed_generation_{0};    // guarded by mu_
     std::exception_ptr      drain_failure_;                  // guarded by mu_
     std::condition_variable flush_done_cv_;
+    uint64_t window_request_generation_{0}; // guarded by mu_
+    uint64_t window_ack_generation_{0};     // guarded by mu_
+    bool window_requested_suspended_{false};
+    uint64_t window_target_task_head_{0};
+    std::chrono::steady_clock::time_point window_request_deadline_{};
+    std::atomic<bool> window_suspended_{false};
 
     std::deque<DrainTask>   task_queue_;
     std::mutex              queue_mu_;
@@ -178,8 +190,10 @@ private:
 
     // Drain all pending entries -- called by the drain thread for an
     // outstanding flush generation.  Flushes repeatedly until empty.
-    bool do_full_flush();
+    bool do_full_flush(std::chrono::steady_clock::time_point deadline =
+                          std::chrono::steady_clock::time_point::max());
     bool do_window_decision();
+    void process_window_request();
 
     // Called under mgmt_mu_:
     void scan_ready();

@@ -443,6 +443,16 @@ class RingTransport:
             self._d2h_window_pattern_defined = True
         return accepted
 
+    def set_d2h_window_suspended(self, suspended: bool, *, timeout_s: float = 600.0) -> None:
+        """Suspend without flushing; resume after checked D2H-only completion."""
+        import math
+
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("D2H policy timeout must be finite and positive")
+        if self._d2h_window_marker is None:
+            raise RuntimeError("recurring D2H windows are not enabled")
+        self._ring_engine.set_d2h_window_suspended(bool(suspended), max(1, math.ceil(timeout_s * 1000)))
+
     def advance_boundary(self) -> None:
         """Publish one ordered framework boundary."""
 

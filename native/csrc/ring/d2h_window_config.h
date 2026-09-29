@@ -19,6 +19,8 @@ struct D2HWindowOffset {
 
 struct RecurringD2HWindowConfig {
     bool enabled{false};
+    // Batched fallback: one ready entry by default; 0 uses ordinary thresholds.
+    uint64_t fallback_entry_threshold{1};
     D2HWindowProgressKind progress{D2HWindowProgressKind::PACKED_VERSION_COUNTER};
     D2HWindowGrantPolicyKind grant_policy{D2HWindowGrantPolicyKind::BINARY_ADAPTIVE};
     uint64_t minimum_record_probe_retry_interval_occurrences{0};

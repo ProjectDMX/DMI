@@ -683,9 +683,69 @@ void test_pending_pattern_queue_cancels_only_the_requested_version() {
     EXPECT(admission.has_value() && admission->version == 3);
 }
 
+void test_suspend_discards_only_incomplete_timing() {
+    FakeProgress progress;
+    ring::D2HWindowModeController mode(3);
+    auto log = std::make_shared<PolicyLog>();
+    int created = 0;
+    auto factory = [&]() -> std::unique_ptr<ring::D2HWindowGrantPolicy> {
+        ++created;
+        return std::make_unique<TrackingPolicy>(log);
+    };
+    ManualClock clock;
+    ring::RecurringD2HGrantController controller(
+        progress, mode, factory, nullptr, [&] { return clock.now; });
+    controller.install_pending(1, 10, {{1, 4}});
+    progress.snapshot = {1, 1};
+    clock.set_nanoseconds(0);
+    auto admission = controller.poll(available(32, 32));
+    EXPECT(admission.has_value());
+    EXPECT(controller.commit(*admission, 32));
+    clock.set_nanoseconds(2);
+    progress.snapshot.counter = 2;
+    controller.complete(*admission, 32);
+    EXPECT(log->attempts.size() == 1);
+    controller.suspend_learning();
+    // Evaluation takes a long time; pending training markers can still complete.
+    clock.set_nanoseconds(1000000000);
+    controller.resume_learning();
+    EXPECT(created == 1);
+    EXPECT(log->attempts.size() == 1);
+    EXPECT(!controller.poll(available(32, 32)).has_value()); // occurrence spent
+    progress.snapshot.counter = 4;
+    controller.poll(available(0, std::nullopt));
+    EXPECT(log->timing_estimates.empty());
+    progress.snapshot.counter = 11;
+    admission = controller.poll(available(32, 32));
+    EXPECT(admission.has_value());
+    EXPECT(controller.commit(*admission, 32));
+    clock.set_nanoseconds(1000000002);
+    progress.snapshot.counter = 12;
+    controller.complete(*admission, 32);
+    clock.set_nanoseconds(1000000004);
+    progress.snapshot.counter = 14;
+    controller.poll(available(0, std::nullopt));
+    EXPECT(log->timing_estimates.size() == 1);
+    EXPECT(created == 1);
+    // A real training version queued before suspension is activated on return.
+    controller.install_pending(2, 8, {{1, 3}});
+    controller.suspend_learning();
+    progress.snapshot = {2, 1};
+    controller.resume_learning();
+    EXPECT(created == 2);
+    EXPECT(controller.poll(available(32, 32)).has_value());
+    mode.record_capacity_forced_flush(false);
+    mode.record_capacity_forced_flush(false);
+    mode.record_capacity_forced_flush(false);
+    controller.suspend_learning();
+    controller.resume_learning();
+    EXPECT(mode.mode() == ring::D2HWindowMode::ENABLED_FALLBACK);
+}
+
 }  // namespace
 
 int main() {
+    test_suspend_discards_only_incomplete_timing();
     test_packed_layout();
     test_pattern_matcher();
     test_binary_grant_search_and_contradictions();

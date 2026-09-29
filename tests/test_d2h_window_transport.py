@@ -87,3 +87,19 @@ def test_terminal_fallback_return_does_not_accept_a_pattern():
     with pytest.raises(RuntimeError, match="has not been defined"):
         transport.advance_boundary()
     assert calls == [("define", (10, ((1, 4),), None))]
+
+
+@pytest.mark.parametrize("seconds, milliseconds", [(0.0001, 1), (1.25, 1250)])
+def test_window_suspend_forwards_checked_deadline(seconds, milliseconds):
+    transport, calls = _transport_for_window_methods()
+    transport._ring_engine.set_d2h_window_suspended = lambda *a: calls.append(a)
+    transport.set_d2h_window_suspended(True, timeout_s=seconds)
+    transport.set_d2h_window_suspended(False, timeout_s=seconds)
+    assert calls == [(True, milliseconds), (False, milliseconds)]
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_window_suspend_rejects_invalid_timeout(timeout):
+    transport, _ = _transport_for_window_methods()
+    with pytest.raises(ValueError):
+        transport.set_d2h_window_suspended(True, timeout_s=timeout)
