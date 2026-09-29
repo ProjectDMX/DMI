@@ -81,15 +81,21 @@ struct SpoolConfig {
   bool allow_shared_filesystem = false;
   // The root is a rank directory of the section 2.3 layout, and what its
   // SIBLING rank directories hold (ready packs and temp files) counts
-  // against max_bytes as well -- except a sibling another live process
-  // holds, which is that process's own budget. A sibling nobody holds is a
-  // dead incarnation's, waiting to be adopted; one THIS process holds is
-  // being adopted by its service. Every process start gets a fresh rank
-  // directory, so without this each crash-restart while uploads are
-  // blocked would add a whole max_bytes to the node's spool; before the
-  // layout every restart reused one directory and one budget. The charge is
-  // refreshed wherever the committed account is (Open, and before a stage
-  // is refused), so the capacity comes back as adoption drains them.
+  // against max_bytes as well, while an adoption by this process's storage
+  // service can drain it: a sibling nobody holds (a dead incarnation's,
+  // waiting to be adopted), and one this process holds through an adoption
+  // (SpoolOwner::adopting). Not charged: a sibling another live process
+  // holds, which is that process's own budget; one this process holds for
+  // its own writing -- an earlier engine's claim kept owned while its
+  // unsealed sink may still stage -- which no adoption here drains until
+  // the process exits; and one an adopter left blocked (SpoolOwner::
+  // blocked), or that this process could not take and empty at all. Every
+  // process start gets a fresh rank directory, so without this each
+  // crash-restart while uploads are blocked would add a whole max_bytes to
+  // the node's spool; before the layout every restart reused one directory
+  // and one budget. The charge is refreshed wherever the committed account
+  // is (Open, and before a stage is refused), so the capacity comes back as
+  // adoption drains them.
   bool charge_dead_siblings = false;
 };
 
@@ -160,17 +166,24 @@ void SetFdinfoHidesLocksForTesting(bool hide);
 // which a remover can unlink it. An empty function removes the hook.
 void SetLockOpenHookForTesting(std::function<void(const std::string&)> hook);
 
-// The holder recorded in a directory's owner lock file.
+// The record in a directory's owner lock file: its last holder, which
+// wrote it on taking the lock, and why it held the directory. Read with
+// the lock free, it is the last holder's, whom the kernel has let go of.
 struct SpoolOwner {
   std::string host;
   int64_t pid = 0;
+  // Taken by an adopter (SpoolOwnerLock::TryAdopt), to drain a dead
+  // directory, rather than by the process writing it.
+  bool adopting = false;
+  // Why an adopter left the directory for good (MarkBlocked), or empty.
+  std::string blocked;
 };
 
 // Whether <dir>'s owner lock is held right now (by any process, this one
-// included) -- its lock file's, or the directory's own -- and if so who
-// recorded themselves in the lock file. A holder that has locked but not
-// yet written its record, or whose lock file was replaced, reads as an
-// empty host and pid 0.
+// included) -- its lock file's, or the directory's own. Fills *owner with
+// the lock file's record either way (empty without one). A holder that has
+// locked but not yet written its record, or whose lock file was replaced,
+// reads as an empty host and pid 0.
 bool ReadSpoolOwner(const std::string& dir, SpoolOwner* owner);
 
 // Whether `name` is the staging copy of a directory SpoolOwnerLock::Acquire
@@ -225,10 +238,17 @@ class SpoolOwnerLock {
                              SpoolOwnerLock* out, std::string* error);
 
   // Adoption's try-lock: takes the lock of an EXISTING directory whose owner
-  // is gone, creating its lock file if it has none. kOwned while its owner
-  // lives; never creates the directory.
+  // is gone, creating its lock file if it has none, and records the take as
+  // an adoption (SpoolOwner::adopting). kOwned while its owner lives; never
+  // creates the directory.
   static SpoolStatus TryAdopt(const std::string& dir, SpoolOwnerLock* out,
                               std::string* error);
+
+  // Records in the lock file, while it is held, that the directory is left
+  // for good and why (SpoolOwner::blocked): an adopter that can never drain
+  // it lets go of it after this. The next take rewrites the record. Returns
+  // whether it was written.
+  bool MarkBlocked(const std::string& reason);
 
   bool held() const;
   // The canonical path of the directory, while held.
@@ -366,7 +386,7 @@ class Spool {
   // would exceed the cap is judged against the same durable truth.
   void ReconcileCommittedLocked();
   // charge_dead_siblings: the bytes of ready and temp files in the sibling
-  // rank directories no other live process holds.
+  // rank directories an adoption can drain (SpoolConfig).
   uint64_t ChargedSiblingBytes() const;
   // The kFull refusal of a stage of `n` bytes. `mutex_` must be held.
   std::string FullMessage(uint64_t n) const;

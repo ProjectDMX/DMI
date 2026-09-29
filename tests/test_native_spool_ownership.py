@@ -325,6 +325,39 @@ def test_a_dead_siblings_bytes_count_against_the_sinks_budget(tmp_path):
         claim.release()
 
 
+@pytest.mark.skipif(not SINK_BUILT, reason="the native sink module is not built")
+def test_a_directory_this_process_keeps_is_not_charged_to_its_next_sink(
+        tmp_path):
+    """An engine whose sink did not seal keeps its claim held until the
+    process exits (the sink may still stage), and the same process's next
+    create_record_runtime claims a fresh directory beside it. No adoption
+    in this process can drain the kept one -- its service reads it as live
+    -- so charging it cut every later sink's budget until exit, and its
+    refusal called the bytes "still to be adopted"."""
+    pytest.importorskip("torch")
+    from dmi.storage.native_capture import (
+        NativeSinkConfig, claim_spool_directory,
+    )
+
+    sink_config = NativeSinkConfig(spool_root=str(tmp_path / "root"))
+    kept = claim_spool_directory(sink_config, _config())
+    (Path(kept.directory) / "v1").mkdir()
+    (Path(kept.directory) / "v1" / "left.dmi-pack.ready").write_bytes(
+        b"\0" * (1 << 20))
+    budget = (1 << 20) + 256  # room for the kept bytes, not for a pack
+    claim = claim_spool_directory(sink_config, _config())
+    try:
+        assert _store().spool_owner(kept.directory)["pid"] == os.getpid()
+        sink = _sink(claim.directory, owner_lock="held_by_caller",
+                     spool_max_bytes=budget, max_pack_bytes=budget,
+                     charge_dead_siblings=True)
+        _stage_one(sink)  # the whole budget
+        del sink
+    finally:
+        claim.release()
+        kept.release()
+
+
 def test_a_claim_warns_of_packs_left_outside_the_layout(tmp_path, caplog):
     """Before the per-process layout the engine spooled into
     <spool_root>/v1/... and its next start swept and uploaded whatever a

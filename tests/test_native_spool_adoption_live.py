@@ -478,6 +478,14 @@ def test_a_dead_spool_this_service_can_never_upload_is_left_and_reported(
             assert snapshot["blocked_siblings"] == [str(blocked)], snapshot
             assert "in-flight byte limit" in snapshot["last_error"], snapshot
             assert sorted(blocked.rglob("*.dmi-pack.ready")) == blocked_packs
+            # Let go of, and marked in its lock file -- for a person, and for
+            # the sinks on the node, which charge a dead directory against
+            # their budgets only while an adoption can drain it.
+            assert _store().spool_owner(str(blocked)) is None
+            record = (blocked / ".owner.lock").read_text()
+            assert ("\nblocked: it holds a pack this service can never "
+                    "upload") in record, record
+            assert "in-flight byte limit" in record, record
             assert not adoptable.exists()
             # Not retried: no more failed uploads, and no backoff -- the
             # loop keeps its poll interval.

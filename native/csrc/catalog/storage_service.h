@@ -129,6 +129,8 @@ struct StorageServiceConfig {
   // Such a sibling is blocked: once the rest of its packs are up it is left
   // in place, with its lock let go, for a process that can adopt it (or a
   // person); it is reported once (last_error, snapshot blocked_siblings),
+  // and in its lock file's record (dmi_store::SpoolOwner::blocked), which
+  // keeps the sinks on the node from charging it against their budgets;
   // never retried or re-hashed by this service, and not owed. So is one
   // drained of packs that still holds other files. flush() covers this
   // process's records: a sibling still to adopt does not keep it from
@@ -350,8 +352,11 @@ class CaptureStorageService {
   // adopting_ holds no pack any more: removes the directory, or leaves a
   // blocked one.
   void finish_adoption();
-  // Leaves a dead sibling in place for good, reporting why.
-  void block_sibling(const std::string& directory, const std::string& reason);
+  // Leaves a dead sibling in place for good, reporting why -- and, given
+  // its held lock, marking why in it (SpoolOwnerLock::MarkBlocked) before
+  // letting go of it.
+  void block_sibling(const std::string& directory, const std::string& reason,
+                     dmi_store::SpoolOwnerLock* lock = nullptr);
   bool adoption_owed() const;  // requires cycle_mutex_
   bool stop_requested();
   // Removes the staging copies (dmi_store::IsSpoolClaimStagingName) that

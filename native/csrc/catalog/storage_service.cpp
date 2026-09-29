@@ -719,8 +719,7 @@ bool CaptureStorageService::begin_adoption(const std::string& directory) {
           dmi_store::SpoolStatus::kOk ||
       adoption->spool.Recover(&ready, &error) !=
           dmi_store::SpoolStatus::kOk) {
-    adoption.reset();  // lets go of its lock
-    block_sibling(directory, "cannot open it: " + error);
+    block_sibling(directory, "cannot open it: " + error, &adoption->lock);
     return true;
   }
   // Each pack's identity and object key come from the pack and its path in
@@ -788,9 +787,8 @@ void CaptureStorageService::finish_adoption() {
   std::unique_ptr<Adoption> adoption = std::move(adopting_);
   const std::string directory = adoption->directory;
   if (!adoption->blocked.empty()) {
-    const std::string reason = adoption->blocked;
-    adoption.reset();  // lets go of its lock; the directory stays
-    block_sibling(directory, reason);
+    // The directory stays, and its lock goes.
+    block_sibling(directory, adoption->blocked, &adoption->lock);
     return;
   }
   {
@@ -807,7 +805,17 @@ void CaptureStorageService::finish_adoption() {
 }
 
 void CaptureStorageService::block_sibling(const std::string& directory,
-                                          const std::string& reason) {
+                                          const std::string& reason,
+                                          dmi_store::SpoolOwnerLock* lock) {
+  if (lock != nullptr) {
+    // Said in its lock file, while this service still holds it, then let
+    // go of: for a person, and for the sinks on the node, which charge a
+    // dead directory against their budget only while an adoption can
+    // drain it (SpoolConfig::charge_dead_siblings). A later take -- by a
+    // process that can adopt it -- rewrites the mark.
+    lock->MarkBlocked(reason);
+    lock->Release();
+  }
   blocked_siblings_.insert(directory);
   record_error("dead spool " + directory + " is left in place, not to be "
                "adopted by this service: " + reason);

@@ -215,11 +215,14 @@ storage part of `capture_status()` reports the adoption (`adopted_spools`,
 service can never adopt -- one holding a pack it can never upload, such as one
 larger than its `uploader_max_in_flight_bytes` or one whose key already holds a
 different object, or one it cannot lock -- is left in place once the rest of
-its packs are up, listed in `blocked_siblings`, reported once in `last_error`,
-and neither retried nor owed. `spool_max_bytes` bounds the
-directory together with what those dead directories still hold (a live
-process's directory is its own budget), so restarts while uploads are blocked
-cannot each add a whole budget; the room comes back as they are adopted. The
+its packs are up, listed in `blocked_siblings`, reported once in `last_error`
+and in its `.owner.lock` (a `blocked: <why>` line), and neither retried nor
+owed. `spool_max_bytes` bounds the directory together with what the dead
+directories the service can adopt still hold, so restarts while uploads are
+blocked cannot each add a whole budget; the room comes back as they are
+adopted. A live process's directory is its own budget, and neither a blocked
+directory nor one this process keeps owned itself (an earlier engine's whose
+sink did not seal) is charged: no adoption here drains them. The
 spool root must be
 node-local: NFS, Lustre, BeeGFS, CIFS/SMB2, FUSE, GPFS, 9p, AFS and OrangeFS
 are refused (by statfs `f_type`) unless `NativeSinkConfig.spool_allow_shared_filesystem`, which a FUSE

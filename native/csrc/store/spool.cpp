@@ -329,27 +329,53 @@ void FsyncParent(const std::string& path) {
   FsyncDir(fs::path(path).parent_path().string(), nullptr);
 }
 
-// "<host> <pid>": whoever holds the lock records itself, so a refused
-// process can say who holds the directory.
-void WriteOwnerRecord(int fd) {
-  const std::string record =
-      Hostname() + " " + std::to_string(::getpid()) + "\n";
+// The record's roles, on the line after "<host> <pid>".
+constexpr const char* kAdoptingRole = "adopting";
+constexpr const char* kBlockedRole = "blocked: ";
+constexpr size_t kOwnerRecordBytes = 2048;
+
+// "<host> <pid>\n", then a role line when there is one ("adopting", or
+// "blocked: <why>"): whoever holds the lock records itself, so a refused
+// process can say who holds the directory, and a sink beside it whether
+// an adoption can drain it.
+void WriteOwnerRecord(int fd, const std::string& role = "") {
+  std::string record = Hostname() + " " + std::to_string(::getpid()) + "\n";
+  if (!role.empty()) {
+    std::string line = role.substr(0, kOwnerRecordBytes - record.size() - 2);
+    std::replace(line.begin(), line.end(), '\n', ' ');
+    record += line + "\n";
+  }
   if (::ftruncate(fd, 0) == 0) {
     (void)!::pwrite(fd, record.data(), record.size(), 0);
   }
 }
 
 void ReadOwnerRecord(int fd, SpoolOwner* owner) {
-  char buffer[512];
-  const ssize_t n = ::pread(fd, buffer, sizeof(buffer) - 1, 0);
-  owner->host.clear();
-  owner->pid = 0;
+  char buffer[kOwnerRecordBytes];
+  const ssize_t n = ::pread(fd, buffer, sizeof(buffer), 0);
+  *owner = SpoolOwner{};
   if (n <= 0) return;
   std::string record(buffer, static_cast<size_t>(n));
-  while (!record.empty() && std::isspace(static_cast<unsigned char>(
-                                record.back()))) {
-    record.pop_back();
+  const auto trim = [](std::string* text) {
+    while (!text->empty() && std::isspace(static_cast<unsigned char>(
+                                 text->back()))) {
+      text->pop_back();
+    }
+  };
+  const size_t newline = record.find('\n');
+  if (newline != std::string::npos) {
+    std::string role = record.substr(newline + 1);
+    record.resize(newline);
+    trim(&role);
+    const size_t blocked = std::strlen(kBlockedRole);
+    if (role == kAdoptingRole) {
+      owner->adopting = true;
+    } else if (role.compare(0, blocked, kBlockedRole) == 0) {
+      owner->blocked = role.substr(blocked);
+      if (owner->blocked.empty()) owner->blocked = "blocked";
+    }
   }
+  trim(&record);
   const size_t space = record.rfind(' ');
   if (space == std::string::npos) {
     owner->host = record;
@@ -579,7 +605,7 @@ bool ReadSpoolOwner(const std::string& dir, SpoolOwner* owner) {
       ::close(dir_fd);
     }
   }
-  if (held && owner != nullptr) {
+  if (owner != nullptr) {
     if (fd >= 0) {
       ReadOwnerRecord(fd, owner);
     } else {
@@ -803,8 +829,8 @@ SpoolStatus LockDirectory(const std::string& dir, HeldLock* lock,
 // has none, and the directory itself. Retries a lock lost to a remover's
 // unlink, and a refusal as brief as another process's ReadSpoolOwner
 // probe.
-SpoolStatus LockInPlace(const std::string& dir, HeldLock* out,
-                        std::string* error) {
+SpoolStatus LockInPlace(const std::string& dir, const char* role,
+                        HeldLock* out, std::string* error) {
   const std::string file = dir + "/" + kOwnerLockFile;
   for (int attempt = 0; attempt < 8; ++attempt) {
     HeldLock lock;
@@ -850,7 +876,7 @@ SpoolStatus LockInPlace(const std::string& dir, HeldLock* out,
       }
       return directory;
     }
-    WriteOwnerRecord(fd);
+    WriteOwnerRecord(fd, role);
     *out = lock;
     return SpoolStatus::kOk;
   }
@@ -929,7 +955,7 @@ SpoolStatus CreateLocked(const std::string& dir, HeldLock* out,
       ::unlink(file.c_str());
       ::rmdir(staging.c_str());
       if (failure == EEXIST || failure == ENOTEMPTY) {
-        return LockInPlace(dir, out, error);
+        return LockInPlace(dir, "", out, error);
       }
       if (error) {
         *error = "cannot create spool directory " + dir + ": " +
@@ -1033,7 +1059,7 @@ SpoolStatus SpoolOwnerLock::Acquire(const std::string& dir,
   const std::string lock_file = canonical + "/" + kOwnerLockFile;
   const bool had_lock_file = exists && fs::exists(lock_file, ec);
   HeldLock lock;
-  status = exists ? LockInPlace(canonical, &lock, error)
+  status = exists ? LockInPlace(canonical, "", &lock, error)
                   : CreateLocked(canonical, &lock, error);
   if (status != SpoolStatus::kOk) return status;
   out->Hold(lock.file_fd, lock.dir_fd, canonical);
@@ -1065,10 +1091,18 @@ SpoolStatus SpoolOwnerLock::TryAdopt(const std::string& dir,
     return SpoolStatus::kBadArgument;
   }
   HeldLock lock;
-  const SpoolStatus status = LockInPlace(resolved, &lock, error);
+  const SpoolStatus status =
+      LockInPlace(resolved, kAdoptingRole, &lock, error);
   if (status != SpoolStatus::kOk) return status;
   out->Hold(lock.file_fd, lock.dir_fd, resolved);
   return SpoolStatus::kOk;
+}
+
+bool SpoolOwnerLock::MarkBlocked(const std::string& reason) {
+  if (!held()) return false;
+  WriteOwnerRecord(fd_, kBlockedRole + (reason.empty() ? "blocked" : reason));
+  ::fsync(fd_);
+  return true;
 }
 
 bool SpoolOwnerLock::ReleaseAndRemoveIfEmpty(std::string* error) {
@@ -1287,6 +1321,17 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
   return SpoolStatus::kOk;
 }
 
+namespace {
+// Whether this process could take `dir`'s lock and empty it: write its lock
+// file (or create one), and unlink in it.
+bool CouldAdopt(const std::string& dir) {
+  const std::string file = dir + "/" + kOwnerLockFile;
+  if (::access(dir.c_str(), W_OK | X_OK) != 0) return false;
+  return ::access(file.c_str(), F_OK) != 0 ||
+         ::access(file.c_str(), R_OK | W_OK) == 0;
+}
+}  // namespace
+
 uint64_t Spool::ChargedSiblingBytes() const {
   const fs::path own(root_);
   uint64_t bytes = 0;
@@ -1303,9 +1348,20 @@ uint64_t Spool::ChargedSiblingBytes() const {
       continue;
     }
     const std::string sibling = it->path().string();
-    // Another live process's directory is its own budget.
-    if (ReadSpoolOwner(sibling, nullptr) &&
-        !SpoolOwnedByThisProcess(sibling)) {
+    // Only what adoption can drain: a dead directory, or one this process's
+    // adoption holds.
+    SpoolOwner owner;
+    if (ReadSpoolOwner(sibling, &owner)) {
+      // Another live process's directory is its own budget. One this
+      // process holds for its own writing -- an earlier engine's claim,
+      // kept owned while its unsealed sink may still stage -- no adoption
+      // here drains (its service reads it as live), until the process
+      // exits and the next one on the node adopts it.
+      if (!owner.adopting || !SpoolOwnedByThisProcess(sibling)) continue;
+    } else if (!owner.blocked.empty() || !CouldAdopt(sibling)) {
+      // Dead, but left for good by an adopter that could never drain it
+      // (its lock file says why), or not one this process could take and
+      // empty at all -- another user's, say.
       continue;
     }
     std::error_code walk_ec;
@@ -1409,8 +1465,9 @@ std::string Spool::FullMessage(uint64_t n) const {
       " > " + std::to_string(max_bytes_);
   if (sibling_bytes_ > 0) {
     message += " (" + std::to_string(sibling_bytes_) +
-               " bytes of it in the dead spool directories beside this one, "
-               "still to be adopted)";
+               " bytes of it in dead spool directories beside this one, "
+               "which this process's storage service adopts: the room "
+               "comes back as it drains them)";
   }
   return message;
 }

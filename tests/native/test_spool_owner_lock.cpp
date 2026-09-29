@@ -810,9 +810,10 @@ void TestANewDirectoryAppearsWithItsLockHeld() {
 // rank directory, so a spool that charged only its own directory let each
 // crash-restart add a full max_bytes while uploads were blocked. With
 // charge_dead_siblings, what the sibling rank directories hold counts
-// against max_bytes too -- unless another live process holds one (that is
-// its own budget); one this process holds, as its service does while it
-// adopts it, still counts.
+// against max_bytes too, while adoption can drain it: a dead one, or one
+// this process's adoption holds -- not one another live process holds
+// (that is its own budget), one this process holds for its own writing,
+// or one an adopter left blocked.
 void TestDeadSiblingsCountAgainstTheBudget() {
   const std::string base = FreshRoot("budget");
   std::string error;
@@ -891,25 +892,85 @@ void TestDeadSiblingsCountAgainstTheBudget() {
   int status = 0;
   ::waitpid(child, &status, 0);
 
-  // One THIS process holds -- its service adopting it -- still counts.
-  const std::string adopting = base + "/bbbbbbbbbbbb";
+  // Only what adoption can drain is charged. One THIS process holds for
+  // its own writing -- an earlier engine's claim, kept owned while its
+  // unsealed sink might still stage -- is drained by no adoption of this
+  // process's (its service reads it as live), so charging it left every
+  // later sink in the process that much less budget until exit.
+  const std::string mixed = base + "/bbbbbbbbbbbb";
+  const std::string sibling = mixed + "/r0-0000000f";
   SpoolOwnerLock held;
-  CHECK(SpoolOwnerLock::Acquire(adopting + "/r0-0000000f", false, &held,
-                                &error) == SpoolStatus::kOk);
+  CHECK(SpoolOwnerLock::Acquire(sibling, false, &held, &error) ==
+        SpoolStatus::kOk);
   {
-    SpoolConfig adopted{adopting + "/r0-0000000f", 1 << 20};
-    adopted.owner_lock = OwnerLock::kHeldByCaller;
+    SpoolConfig kept{sibling, 1 << 20};
+    kept.owner_lock = OwnerLock::kHeldByCaller;
     Spool writer;
-    CHECK(Spool::Open(adopted, &writer, &error) == SpoolStatus::kOk);
+    CHECK(Spool::Open(kept, &writer, &error) == SpoolStatus::kOk);
     for (int i = 1; i <= 3; ++i) {
       CHECK(StageOne(writer, i, &error) == SpoolStatus::kOk);
     }
   }
-  SpoolConfig own{adopting + "/r0-00000010", 450};
-  own.charge_dead_siblings = true;
-  Spool mine;
-  CHECK(Spool::Open(own, &mine, &error) == SpoolStatus::kOk);
-  CHECK(mine.Snapshot().sibling_bytes == 300);
+  const auto charged = [&]() {
+    SpoolConfig own{mixed + "/r0-00000010", 450};
+    own.charge_dead_siblings = true;
+    Spool mine;
+    CHECK(Spool::Open(own, &mine, &error) == SpoolStatus::kOk);
+    return mine.Snapshot().sibling_bytes;
+  };
+  CHECK(charged() == 0);
+  {
+    SpoolConfig own{mixed + "/r0-00000010", 450};
+    own.charge_dead_siblings = true;
+    Spool mine;
+    CHECK(Spool::Open(own, &mine, &error) == SpoolStatus::kOk);
+    for (int i = 4; i < 8; ++i) {
+      CHECK(StageOne(mine, i, &error) == SpoolStatus::kOk);
+    }
+  }
+  fs::remove_all(mixed + "/r0-00000010");
+
+  // One this process's adoption holds -- a dead one its service drains --
+  // still counts: the room comes back as the adoption drains it.
+  held.Release();
+  SpoolOwnerLock adopting;
+  CHECK(SpoolOwnerLock::TryAdopt(sibling, &adopting, &error) ==
+        SpoolStatus::kOk);
+  dmi_store::SpoolOwner record;
+  CHECK(dmi_store::ReadSpoolOwner(sibling, &record));
+  CHECK(record.adopting && record.blocked.empty());
+  CHECK(record.pid == ::getpid());
+  CHECK(charged() == 300);
+
+  // One an adopter left for good -- blocked, its lock let go -- is drained
+  // by nobody here, and is not charged either; its lock file says why.
+  CHECK(adopting.MarkBlocked("it holds a pack this service can never upload"));
+  adopting.Release();
+  CHECK(!dmi_store::ReadSpoolOwner(sibling, &record));
+  CHECK(record.blocked == "it holds a pack this service can never upload");
+  CHECK(!record.adopting);
+  CHECK(charged() == 0);
+  // A process that can adopt it after all takes it again, and the mark
+  // goes with its take.
+  CHECK(SpoolOwnerLock::TryAdopt(sibling, &adopting, &error) ==
+        SpoolStatus::kOk);
+  CHECK(dmi_store::ReadSpoolOwner(sibling, &record));
+  CHECK(record.adopting && record.blocked.empty());
+  CHECK(charged() == 300);
+  adopting.Release();
+  CHECK(charged() == 300);  // dead: still to adopt
+
+  // One this process cannot take and empty at all -- another user's -- is
+  // no adoption's here either.
+  fs::permissions(sibling + "/.owner.lock", fs::perms::owner_read);
+  fs::permissions(sibling, fs::perms::owner_read | fs::perms::owner_exec);
+  if (::access(sibling.c_str(), W_OK) != 0) {  // not as root
+    CHECK(charged() == 0);
+  }
+  fs::permissions(sibling, fs::perms::owner_all);
+  fs::permissions(sibling + "/.owner.lock",
+                  fs::perms::owner_read | fs::perms::owner_write);
+  CHECK(charged() == 300);
 }
 
 // (7) The layout: <base>/<catalog_key>/r<rank>-<incarnation>/.
