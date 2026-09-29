@@ -17,7 +17,8 @@
 //      GPFS, 9p, AFS and OrangeFS by statfs f_type, unless explicitly
 //      allowed (a test seam stands in for statfs).
 //   6. Adoption's try-lock never creates a directory, and a released
-//      directory that holds nothing but its lock file can be removed.
+//      directory that holds nothing but its lock file can be removed; an
+//      adopter's listing of a dead spool stops between packs on a cancel.
 //   7. The directory layout of the plan's section 2.3.
 //   8. The spool budget charges what dead sibling directories hold.
 //
@@ -38,6 +39,7 @@
 #include <string>
 #include <vector>
 
+#include "store/cancel.h"
 #include "store/spool.h"
 
 namespace fs = std::filesystem;
@@ -973,6 +975,66 @@ void TestANewDirectoryAppearsWithItsLockHeld() {
   CHECK(unheld == 0);
 }
 
+// (6e) An adopter lists a dead spool once, through Recover, which hashes
+// every pack of what may be a large backlog. The storage service hands it
+// the Cancellation stop() cancels, and a cancelled listing stops between
+// packs: nothing listed, *cut, every ready pack where it was (nothing is
+// lost, and nothing is uploaded from a cut listing), the account as it
+// was. The dead owner's stale .open file is swept by then. Not cancelled,
+// the same listing lists every pack.
+void TestAnAdoptersListingStopsOnACancel() {
+  const std::string dead =
+      FreshRoot("adopt-cut") + "/0123456789ab/r0-0000dead";
+  std::string error;
+  {
+    Spool gone;
+    CHECK(Spool::Open({dead, 1 << 20}, &gone, &error) == SpoolStatus::kOk);
+    for (int n = 1; n <= 3; ++n) {
+      CHECK(StageOne(gone, n, &error) == SpoolStatus::kOk);
+    }
+  }  // its owner died
+  const std::string stale =
+      dead + "/v1/.018f0000-0000-7000-8000-00000000dead.0badf00d.open";
+  std::ofstream(stale) << "half a pack";
+  const auto readies = [&dead] {
+    std::set<std::string> found;
+    for (const auto& entry : fs::recursive_directory_iterator(dead)) {
+      const std::string name = entry.path().filename().string();
+      if (name.size() > 6 && name.substr(name.size() - 6) == ".ready") {
+        found.insert(entry.path().string());
+      }
+    }
+    return found;
+  };
+  const std::set<std::string> staged_before = readies();
+  CHECK(staged_before.size() == 3);
+
+  SpoolOwnerLock adopter;
+  CHECK(SpoolOwnerLock::TryAdopt(dead, &adopter, &error) == SpoolStatus::kOk);
+  SpoolConfig config{dead, 1 << 20};
+  config.owner_lock = OwnerLock::kHeldByCaller;
+  Spool adopted;
+  CHECK(Spool::Open(config, &adopted, &error) == SpoolStatus::kOk);
+  const uint64_t bytes_before = adopted.Snapshot().bytes;
+
+  dmi_store::Cancellation cancel;
+  cancel.Cancel();
+  std::vector<dmi_store::StagedPack> listed;
+  bool cut = false;
+  CHECK(adopted.Recover(&listed, &error, &cancel, &cut) == SpoolStatus::kOk);
+  CHECK(cut);
+  CHECK(listed.empty());
+  CHECK(readies() == staged_before);
+  CHECK(!fs::exists(stale));
+  CHECK(adopted.Snapshot().bytes == bytes_before);
+
+  cancel.Reset();
+  CHECK(adopted.Recover(&listed, &error, &cancel, &cut) == SpoolStatus::kOk);
+  CHECK(!cut);
+  CHECK(listed.size() == 3);
+  CHECK(adopted.Snapshot().bytes == 300);
+}
+
 // (8) The budget across incarnations. Every process start gets a fresh
 // rank directory, so a spool that charged only its own directory let each
 // crash-restart add a full max_bytes while uploads were blocked. With
@@ -1224,6 +1286,7 @@ int main() {
   TestALockOnAnUnlinkedFileIsTakenAgain();
   TestAReplacedLockFileLeavesTheDirectoryOwned();
   TestANewDirectoryAppearsWithItsLockHeld();
+  TestAnAdoptersListingStopsOnACancel();
   TestTheDirectoryLayout();
   TestDeadSiblingsCountAgainstTheBudget();
   if (g_failures != 0) {

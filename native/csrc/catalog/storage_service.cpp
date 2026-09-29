@@ -640,60 +640,41 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
             }
           }
           const size_t end = std::min(staged.size(), next + chunk);
-          const dmi_store::UploadBatchResult batch = uploader_->UploadStaged(
+          ChunkOutcome sent = upload_chunk(
+              uploader_.get(),
               std::vector<dmi_store::StagedPack>(staged.begin() + next,
                                                  staged.begin() + end));
           next = end;
-          std::vector<PackRefData> to_index;
-          uint64_t uploaded_packs = 0;
-          uint64_t uploaded_bytes = 0;
-          size_t failed_uploads = 0;
-          size_t cancelled_uploads = 0;
-          for (size_t i = 0; i < batch.refs.size(); ++i) {
-            const dmi_store::PackRef& ref = batch.refs[i];
-            if (!ref.pack_id.empty()) {
-              to_index.push_back({ref.pack_id, ref.store_id, ref.object_key,
-                                  ref.object_bytes, ref.checksum,
-                                  ref.record_count});
-              ++uploaded_packs;
-              uploaded_bytes += ref.object_bytes;
-            } else if (i < batch.failures.size() &&
-                       batch.failures[i].cancelled) {
-              ++cancelled_uploads;  // still staged; not the pack's fault
-            } else {
-              // A failed upload stays in the spool, so a later cycle
-              // retries it.
-              ++failed_uploads;
-              if (i < batch.failures.size()) {
-                record_error("upload failed for " +
-                             batch.failures[i].object_key + ": " +
-                             batch.failures[i].error);
-              }
+          for (size_t i = 0; i < sent.batch.failures.size(); ++i) {
+            const dmi_store::UploadFailure& failure = sent.batch.failures[i];
+            // A failed upload stays in the spool, so a later cycle retries
+            // it; a cancelled one is still staged, and not the pack's fault.
+            if (!sent.batch.refs[i].pack_id.empty() || failure.cancelled) {
+              continue;
             }
+            record_error("upload failed for " + failure.object_key + ": " +
+                         failure.error);
           }
-          if (cancelled_uploads != 0) outcome.cut_short = true;
-          upload_failures += failed_uploads;
-          {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            state_.uploaded_packs += uploaded_packs;
-            state_.uploaded_bytes += uploaded_bytes;
-            state_.upload_failures += failed_uploads;
-            state_.cancelled_uploads += cancelled_uploads;
-          }
-          deferred += index_or_owe(std::move(to_index), catalog, deadline_ns);
+          if (sent.cancelled != 0) outcome.cut_short = true;
+          upload_failures += sent.failed;
+          deferred += index_or_owe(std::move(sent.to_index), true, deadline_ns);
         }
         uploaded_all = next == staged.size() && upload_failures == 0;
       }
     }
 
     // 3a. The loop's cycles adopt dead siblings, a slice at a time, under
-    //     the same rule as the uploads above: only with the lease, nothing
-    //     owed and nothing of our own failing. flush()'s cycles do not: a
-    //     dead backlog is not this process's records.
+    //     the same rule as the uploads above: only with the lease, every
+    //     staged pack of this process's up, nothing owed, and no cancel.
+    //     flush()'s cycles do not: a dead backlog is not this process's
+    //     records. Adoption uploads and indexes through the same chunks,
+    //     and the same Cancellations, as the service's own spool.
     bool adoption_failed = false;
-    if (adopt && config_.adopt_sibling_spools && catalog &&
-        pending_index_.empty() && upload_failures == 0) {
-      adoption_failed = !adopt_step();
+    if (adopt && config_.adopt_sibling_spools && uploaded_all &&
+        pending_index_.empty() && !upload_cancel_.cancelled()) {
+      bool adoption_cut = false;
+      adoption_failed = !adopt_step(deadline_ns, &deferred, &adoption_cut);
+      if (adoption_cut) outcome.cut_short = true;
     }
 
     // 4. Reconcile on its interval, or when the pass at start() lost the
@@ -774,9 +755,39 @@ size_t CaptureStorageService::index_or_owe(std::vector<PackRefData> refs,
   return deferred;
 }
 
+CaptureStorageService::ChunkOutcome CaptureStorageService::upload_chunk(
+    dmi_store::SpoolUploader* uploader,
+    std::vector<dmi_store::StagedPack> chunk) {
+  ChunkOutcome sent;
+  sent.batch = uploader->UploadStaged(std::move(chunk));
+  uint64_t uploaded_bytes = 0;
+  for (size_t i = 0; i < sent.batch.refs.size(); ++i) {
+    const dmi_store::PackRef& ref = sent.batch.refs[i];
+    if (!ref.pack_id.empty()) {
+      sent.to_index.push_back({ref.pack_id, ref.store_id, ref.object_key,
+                               ref.object_bytes, ref.checksum,
+                               ref.record_count});
+      uploaded_bytes += ref.object_bytes;
+    } else if (i < sent.batch.failures.size() &&
+               sent.batch.failures[i].cancelled) {
+      ++sent.cancelled;  // still staged; not the pack's fault
+    } else {
+      ++sent.failed;  // still staged too
+    }
+  }
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  state_.uploaded_packs += sent.to_index.size();
+  state_.uploaded_bytes += uploaded_bytes;
+  state_.upload_failures += sent.failed;
+  state_.cancelled_uploads += sent.cancelled;
+  return sent;
+}
+
 void CaptureStorageService::let_go_of_adoption() {
   // A sibling half adopted keeps what is left of it, for the next process
-  // on the node; what was uploaded from it was indexed, or is owed.
+  // on the node; what was uploaded from it was indexed, or is owed. Its
+  // directory is not removed: only finish_adoption() removes one, once no
+  // pack of it is left.
   adopting_.reset();
   adoption_queue_.clear();
   std::lock_guard<std::mutex> lock(state_mutex_);
@@ -793,7 +804,9 @@ bool CaptureStorageService::stop_requested() {
   return stop_requested_;
 }
 
-bool CaptureStorageService::adopt_step() {
+bool CaptureStorageService::adopt_step(uint64_t deadline_ns, size_t* deferred,
+                                       bool* cut_short) {
+  *cut_short = false;
   const uint64_t started = steady_ns();
   if (adopting_ == nullptr && adoption_queue_.empty()) {
     // Look at the siblings when that is owed (from start() on) or, while
@@ -807,11 +820,25 @@ bool CaptureStorageService::adopt_step() {
   }
   bool ok = true;
   while (!stop_requested()) {
+    // The service's uploads' Cancellation is adoption's too: stop() cuts
+    // it between rounds, and in a round (its listing, its uploads, and,
+    // through the reads' Cancellation, its index reads).
+    if (upload_cancel_.cancelled()) {
+      *cut_short = true;
+      break;
+    }
     if (adopting_ == nullptr) {
       if (adoption_queue_.empty()) break;
       const std::string next = adoption_queue_.front();
       adoption_queue_.pop_front();
-      if (!begin_adoption(next)) ok = false;
+      bool cut = false;
+      if (!begin_adoption(next, &cut)) ok = false;
+      if (cut) {
+        // Its listing was cut: it is looked at again, from the start.
+        adoption_queue_.push_front(next);
+        *cut_short = true;
+        break;
+      }
       continue;
     }
     if (adopting_->remaining.empty()) {
@@ -827,8 +854,13 @@ bool CaptureStorageService::adopt_step() {
       catalog = writer_.held_lease() != nullptr;
     }
     if (!catalog || !pending_index_.empty()) break;
-    if (!upload_adopted_round()) {
+    bool cut = false;
+    if (!upload_adopted_round(deadline_ns, deferred, &cut)) {
       ok = false;  // the failed packs stay in the dead spool
+      break;
+    }
+    if (cut) {
+      *cut_short = true;  // the cut packs stay in the dead spool
       break;
     }
     if (steady_ns() - started >= config_.adoption_slice_ns) break;
@@ -887,7 +919,9 @@ bool CaptureStorageService::scan_siblings() {
   return true;
 }
 
-bool CaptureStorageService::begin_adoption(const std::string& directory) {
+bool CaptureStorageService::begin_adoption(const std::string& directory,
+                                           bool* cut) {
+  *cut = false;
   auto adoption = std::make_unique<Adoption>();
   adoption->directory = directory;
   std::string error;
@@ -913,11 +947,16 @@ bool CaptureStorageService::begin_adoption(const std::string& directory) {
   std::vector<dmi_store::StagedPack> ready;
   if (dmi_store::Spool::Open(config, &adoption->spool, &error) !=
           dmi_store::SpoolStatus::kOk ||
-      adoption->spool.Recover(&ready, &error) !=
+      adoption->spool.Recover(&ready, &error, &upload_cancel_, cut) !=
           dmi_store::SpoolStatus::kOk) {
     block_sibling(directory, "cannot open it: " + error, &adoption->lock);
     return true;
   }
+  // Validating hashes every pack of a dead backlog; the uploads' cancel
+  // (stop()) stops it between packs, as it does the service's own listing.
+  // The directory is let go of whole, its lock with it: nothing of it was
+  // uploaded, and nothing is removed.
+  if (*cut) return true;
   // Each pack's identity and object key come from the pack and its path in
   // the dead directory, exactly as its owner would have uploaded it.
   adoption->remaining.assign(ready.begin(), ready.end());
@@ -925,57 +964,67 @@ bool CaptureStorageService::begin_adoption(const std::string& directory) {
   return true;
 }
 
-bool CaptureStorageService::upload_adopted_round() {
+bool CaptureStorageService::upload_adopted_round(uint64_t deadline_ns,
+                                                 size_t* deferred,
+                                                 bool* cut) {
+  *cut = false;
   Adoption& adoption = *adopting_;
-  const size_t round =
-      static_cast<size_t>(std::max(1, config_.uploader.max_workers));
+  // A round is a chunk of the service's own upload path (upload_chunk, then
+  // index_or_owe): uploaded, then indexed before the next is uploaded, so
+  // at most one chunk (indexer.max_packs) of it is out of the dead spool
+  // and not yet in the catalog. It is at most uploader.max_workers packs as
+  // well, since the adoption slice is checked between rounds.
+  const size_t round = static_cast<size_t>(std::min(
+      std::max(1, config_.uploader.max_workers),
+      std::max(1, config_.indexer.max_packs)));
   std::vector<dmi_store::StagedPack> entries;
   while (!adoption.remaining.empty() && entries.size() < round) {
     entries.push_back(std::move(adoption.remaining.front()));
     adoption.remaining.pop_front();
   }
-  dmi_store::SpoolUploader uploader(&adoption.spool, &s3_, config_.uploader);
-  const dmi_store::UploadBatchResult batch = uploader.UploadStaged(entries);
-  std::vector<PackRefData> to_index;
-  uint64_t uploaded_bytes = 0;
-  size_t failures = 0;
+  // Through the service's upload client and its Cancellation, so stop()
+  // cuts an adoption's transfers, retries and backoff as it does the
+  // service's own.
+  dmi_store::SpoolUploader uploader(&adoption.spool, &upload_s3_,
+                                    config_.uploader);
+  uploader.set_cancellation(&upload_cancel_);
+  ChunkOutcome sent = upload_chunk(&uploader, entries);
   size_t retryable = 0;
-  for (size_t i = 0; i < batch.refs.size(); ++i) {
-    const dmi_store::PackRef& ref = batch.refs[i];
-    if (ref.pack_id.empty()) {
-      // Still in the dead spool either way. One a later try could upload
-      // is retried by a later cycle; one no try by this service can is
-      // not, and blocks the directory once the rest are up.
-      ++failures;
-      const dmi_store::UploadFailure failure =
-          i < batch.failures.size() ? batch.failures[i]
-                                    : dmi_store::UploadFailure{};
-      const std::string what = failure.object_key + ": " + failure.error;
-      if (failure.retryable) {
-        ++retryable;
-        adoption.remaining.push_back(entries[i]);
-        record_error("adopting dead spool " + adoption.directory +
-                     ": upload failed for " + what);
-      } else if (adoption.blocked.empty()) {
-        adoption.blocked = "it holds a pack this service can never upload, " +
-                           what;
-      }
-      continue;
+  std::vector<dmi_store::StagedPack> cancelled;
+  for (size_t i = 0; i < sent.batch.refs.size(); ++i) {
+    if (!sent.batch.refs[i].pack_id.empty()) continue;
+    // Still in the dead spool either way. One a cancel cut short goes
+    // back to the front, as it was; one a later try could upload is
+    // retried by a later cycle; one no try by this service can is not,
+    // and blocks the directory once the rest are up.
+    const dmi_store::UploadFailure failure =
+        i < sent.batch.failures.size() ? sent.batch.failures[i]
+                                       : dmi_store::UploadFailure{};
+    const std::string what = failure.object_key + ": " + failure.error;
+    if (failure.cancelled) {
+      cancelled.push_back(entries[i]);
+    } else if (failure.retryable) {
+      ++retryable;
+      adoption.remaining.push_back(entries[i]);
+      record_error("adopting dead spool " + adoption.directory +
+                   ": upload failed for " + what);
+    } else if (adoption.blocked.empty()) {
+      adoption.blocked = "it holds a pack this service can never upload, " +
+                         what;
     }
-    to_index.push_back({ref.pack_id, ref.store_id, ref.object_key,
-                        ref.object_bytes, ref.checksum, ref.record_count});
-    uploaded_bytes += ref.object_bytes;
   }
+  adoption.remaining.insert(adoption.remaining.begin(), cancelled.begin(),
+                            cancelled.end());
   {
     std::lock_guard<std::mutex> state(state_mutex_);
-    state_.uploaded_packs += to_index.size();
-    state_.uploaded_bytes += uploaded_bytes;
-    state_.upload_failures += failures;
-    state_.adopted_packs += to_index.size();
+    state_.adopted_packs += sent.to_index.size();
   }
-  // Uploaded, so gone from the dead spool: indexed now, or owed in
-  // pending_index_ like any pack of this service's own.
-  index_or_owe(std::move(to_index), true, 0);
+  *cut = !cancelled.empty();
+  // Uploaded, so gone from the dead spool: indexed now, a cancel of the
+  // uploads or not, or owed in pending_index_ like any pack of this
+  // service's own. After the requeue above, since a lost lease throws out
+  // of here and the packs still in the dead spool must stay in remaining.
+  *deferred += index_or_owe(std::move(sent.to_index), true, deadline_ns);
   return retryable == 0;
 }
 

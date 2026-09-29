@@ -16,7 +16,9 @@ lock held -- is left alone.
 When the object store is down at start, the dead directory stays as it
 was (its packs are durable there), flush() does not report drained, and
 the loop adopts it once the store is back. A sibling whose owner is still
-alive at start and dies later is adopted by a later pass.
+alive at start and dies later is adopted by a later pass. stop() cuts an
+adoption as it cuts the service's own work -- its uploads, and its listing
+of a dead backlog -- and leaves the dead directory with every pack in it.
 
 Needs ClickHouse on 127.0.0.1:8123/9000 and the native sink and store
 modules: make -C native build/_dmi_native_sink build/_dmi_native_store
@@ -670,6 +672,132 @@ def test_flush_adopts_nothing_while_the_loop_is_idle(fake_s3, tmp_path):
             assert sorted(dead.rglob("*.dmi-pack.ready")) == staged
         finally:
             service.stop()
+        lock.release_and_remove_if_empty()
+
+
+def test_stop_cuts_an_adoption_stalled_on_its_uploads(fake_s3, tmp_path):
+    """An adoption uploads through the service's own upload client and
+    Cancellation, so stop() cuts it as it cuts the service's own uploads.
+    Here every PUT is held open and never answered: before, the adoption's
+    uploader went round a pack's retries on a client stop() did not cancel,
+    and stop() sat through read timeouts. Now stop() returns at once, every
+    pack of the dead spool is still in it (none was uploaded, none lost),
+    and the directory is left, unlocked, for the next incarnation -- which
+    adopts it."""
+    from tests.test_native_capture_storage_live import _Switch
+
+    base = tmp_path / "spool"
+    with _catalog() as prefix:
+        store = _Switch.to_url(fake_s3)
+        config = _storage_config(store.url, prefix, s3_read_timeout_s=30,
+                                 reconcile_on_start=False)
+        sibling = _claim(base, config)
+        dead = Path(sibling.directory)
+        _stage_into(sibling.directory, STAGED_BY_THE_DEAD)
+        sibling.release()  # its owner is gone
+        staged = sorted(dead.rglob("*.dmi-pack.ready"))
+        assert len(staged) == len(STAGED_BY_THE_DEAD) // RECORDS_PER_PACK
+        store.stall_requests(lambda request: request.startswith(b"PUT "))
+        lock = _claim(base, config)
+        service = _service(config, lock.directory)
+        service.start()
+        try:
+            _wait_for(lambda: store.stalled, 30.0)  # an adopted PUT in flight
+            stopping = time.monotonic()
+            service.stop()
+            assert time.monotonic() - stopping < 5.0
+            snapshot = service.snapshot()
+            assert snapshot["cancelled_uploads"] >= 1, snapshot
+            assert snapshot["upload_failures"] == 0, snapshot
+            assert snapshot["adopted_packs"] == 0, snapshot
+            assert "adopting dead spool" not in snapshot["last_error"], snapshot
+            assert sorted(dead.rglob("*.dmi-pack.ready")) == staged
+            assert _store().spool_owner(str(dead)) is None
+        finally:
+            service.stop()
+        lock.release_and_remove_if_empty()
+
+        store.restore()
+        successor_lock = _claim(base, config)
+        successor = _service(config, successor_lock.directory)
+        successor.start()
+        try:
+            _wait_for(_adopted(successor, 1), 60.0)
+            assert not dead.exists()
+            successor.flush(60.0)
+            expected = {
+                capture_id: tensor.contiguous().view(-1).numpy().tobytes()
+                for capture_id, tensor in _envelope(
+                    STAGED_BY_THE_DEAD).expected.items()}
+            assert _read_all(config) == expected
+        finally:
+            successor.stop()
+            store.close()
+        successor_lock.release_and_remove_if_empty()
+
+
+def _sparse_backlog(directory: Path, count: int, size: int) -> list[Path]:
+    """`count` ready packs of `size` zero bytes, sparse and named for their
+    checksum: validating them hashes every byte, which takes seconds, while
+    they take no disk."""
+    import hashlib
+    import uuid
+
+    digest = hashlib.sha256()
+    zeros = bytes(1 << 20)
+    for _ in range(size // len(zeros)):
+        digest.update(zeros)
+    packs = directory / "v1"
+    packs.mkdir(parents=True, exist_ok=True)
+    backlog = []
+    for _ in range(count):
+        ready = packs / f"{uuid.uuid4()}.1.1.{digest.hexdigest()}.dmi-pack.ready"
+        with open(ready, "wb") as sparse:
+            sparse.truncate(size)
+        backlog.append(ready)
+    return sorted(backlog)
+
+
+def test_stop_cuts_an_adoption_listing_a_dead_backlog(fake_s3, tmp_path):
+    """An adoption lists a dead spool once, validating every pack, which
+    over a backlog takes seconds: 32 sparse packs of 256 MiB, here. That
+    listing stops between packs once stop() cancels the uploads, as the
+    service's own listing does, so stop() does not wait for the rest of
+    it; the directory keeps every pack, and nothing of it was uploaded."""
+    from tests.test_native_capture_storage_live import _Switch
+
+    base = tmp_path / "spool"
+    with _catalog() as prefix:
+        store = _Switch.to_url(fake_s3)
+        config = _storage_config(store.url, prefix, reconcile_on_start=False)
+        sibling = _claim(base, config)
+        dead = Path(sibling.directory)
+        sibling.release()  # its owner is gone
+        backlog = _sparse_backlog(dead, 32, 256 << 20)
+        # Were the listing not cut, no pack may reach the fake store's
+        # memory: every PUT is held back, and stop() cuts those.
+        store.stall_requests(lambda request: request.startswith(b"PUT "))
+        lock = _claim(base, config)
+        service = _service(config, lock.directory)
+        service.start()
+        try:
+            # The loop's first cycle, which start() kicks, begins the
+            # listing; the whole of it takes several seconds.
+            _wait_for(lambda: _store().spool_owner(str(dead)) is not None,
+                      10.0)
+            time.sleep(0.3)
+            stopping = time.monotonic()
+            service.stop()
+            elapsed = time.monotonic() - stopping
+            assert elapsed < 2.5, elapsed
+            snapshot = service.snapshot()
+            assert snapshot["adopted_packs"] == 0, snapshot
+            assert store.stalled == [], store.stalled
+            assert sorted(dead.rglob("*.dmi-pack.ready")) == backlog
+            assert _store().spool_owner(str(dead)) is None
+        finally:
+            service.stop()
+            store.close()
         lock.release_and_remove_if_empty()
 
 

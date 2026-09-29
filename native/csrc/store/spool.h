@@ -354,6 +354,13 @@ class Spool {
   // lock keeps other processes out; writers in this process sharing it
   // (kHeldByCaller) are the caller's to order.
   SpoolStatus Recover(std::vector<StagedPack>* out, std::string* error);
+  // The same, but its validation stops between packs once `cancel` is
+  // cancelled, as ListPending's does: *cut then says so and *out is empty.
+  // The .open files are swept by then, and the account is left as it was.
+  // For an adopter's listing of a dead spool, whose backlog it would
+  // otherwise hash whole before a stop could take effect.
+  SpoolStatus Recover(std::vector<StagedPack>* out, std::string* error,
+                      const Cancellation* cancel, bool* cut);
 
   // Validate and list ready packs without deleting in-progress writes.
   SpoolStatus ListPending(std::vector<StagedPack>* out, std::string* error);

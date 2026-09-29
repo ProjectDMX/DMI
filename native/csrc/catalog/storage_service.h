@@ -139,10 +139,16 @@ struct StorageServiceConfig {
   // cycle probes the owner lock of every sibling rank directory, then works
   // through those whose owner is gone: it takes one's lock, sweeps its
   // .open files and validates its .ready packs once, and uploads and
-  // indexes them a round (uploader.max_workers packs) at a time -- under
-  // the cycle's upload rules, the lease and nothing owed to the catalog
-  // checked before every round -- until adoption_slice_ns has passed or a
-  // stop is requested. The sibling's lock and its remaining packs are kept
+  // indexes them a round at a time -- a chunk of the service's own upload
+  // path, at most uploader.max_workers and indexer.max_packs packs, each
+  // indexed before the next is uploaded -- under the cycle's upload rules,
+  // the lease and nothing owed to the catalog checked before every round,
+  // until adoption_slice_ns has passed or a stop is requested. Its
+  // listing, uploads and index reads go through the service's own clients
+  // and Cancellations, so stop() cuts an adoption as it cuts the service's
+  // own work: what it did not upload stays in the dead spool, which is let
+  // go of and never removed while a pack of it is left, for the next
+  // process on the node. The sibling's lock and its remaining packs are kept
   // between cycles, so a large backlog is hashed once, not on every cycle,
   // and neither a flush() nor the service's own uploads wait behind all of
   // it. A drained sibling is removed once nothing but its lock file is
@@ -355,7 +361,8 @@ class CaptureStorageService {
   // multipart upload it cut (one attempt, 5 s at most), and the lease
   // release, each catalog request bounded by the client's request timeout
   // (under the lease, by the lease deadline); the lease renews until the
-  // loop is done.
+  // loop is done. An adoption in flight is cut the same way, its dead
+  // sibling let go of with what it still holds (adopt_sibling_spools).
   void stop();
 
   StorageServiceSnapshot snapshot() const;
@@ -371,6 +378,16 @@ class CaptureStorageService {
     // A cancel left packs in the spool: neither drained nor a failure, so
     // it moves the backoff neither way.
     bool cut_short = false;
+  };
+
+  // One chunk of the upload path, the service's own spool's or a dead
+  // sibling's (upload_chunk): the batch, positional as UploadStaged returns
+  // it, what went up and is to be indexed, and how many were not.
+  struct ChunkOutcome {
+    dmi_store::UploadBatchResult batch;
+    std::vector<PackRefData> to_index;
+    size_t failed = 0;     // still staged; counted in upload_failures
+    size_t cancelled = 0;  // still staged: a cancel cut them short
   };
 
   // Holds lease_mutex_ for a stretch of catalog work, and bounds every
@@ -397,20 +414,26 @@ class CaptureStorageService {
   // thread renewing it. Requires cycle_mutex_.
   void sweep_and_reconcile_at_start();
   // One cycle's share of adoption (see adopt_sibling_spools): looks at the
-  // siblings when that is due, then adopts until the slice ends. False when
-  // an upload failed, so the cycle backs off. Requires cycle_mutex_. Only a
-  // lost lease propagates.
-  bool adopt_step();
+  // siblings when that is due, then adopts until the slice ends, a stop is
+  // requested or the uploads' Cancellation is cancelled -- which also cuts
+  // a round in flight, and *cut_short then says so. Adds what its index
+  // passes left owed through a cancel to *deferred (index_bounded). False
+  // when an upload failed, so the cycle backs off. Requires cycle_mutex_.
+  // Only a lost lease propagates.
+  bool adopt_step(uint64_t deadline_ns, size_t* deferred, bool* cut_short);
   // Probes every sibling rank directory's owner lock and queues the dead
   // ones. False when the directory cannot be listed. Requires cycle_mutex_.
   bool scan_siblings();
   // Takes a queued sibling's lock, sweeps it and lists its packs into
-  // adopting_; leaves adopting_ empty for a live or vanished one. False
-  // when it could not be locked or opened.
-  bool begin_adoption(const std::string& directory);
-  // Uploads and indexes one round of adopting_'s packs; false when an
-  // upload failed.
-  bool upload_adopted_round();
+  // adopting_; leaves adopting_ empty for a live or vanished one, and for
+  // one whose listing the uploads' Cancellation cut (*cut), whose lock it
+  // lets go of. False when it could not be locked or opened.
+  bool begin_adoption(const std::string& directory, bool* cut);
+  // Uploads and indexes one round of adopting_'s packs, one chunk of the
+  // service's upload path; *cut when a cancel left some in the dead spool,
+  // back at the front of adopting_. False when an upload failed.
+  bool upload_adopted_round(uint64_t deadline_ns, size_t* deferred,
+                            bool* cut);
   // adopting_ holds no pack any more: removes the directory, or leaves a
   // blocked one.
   void finish_adoption();
@@ -429,6 +452,13 @@ class CaptureStorageService {
   // claims killed before their rename left under the catalog key.
   void clear_dead_claim_staging(
       const std::vector<std::filesystem::path>& staging);
+  // Uploads one chunk -- packs a listing returned, in its order -- through
+  // `uploader`, the service's own or an adoption's over a dead spool, and
+  // books the outcome. The caller indexes to_index (index_or_owe) before it
+  // uploads another chunk, so at most one chunk is ever out of a spool and
+  // not yet in the catalog. Requires cycle_mutex_.
+  ChunkOutcome upload_chunk(dmi_store::SpoolUploader* uploader,
+                            std::vector<dmi_store::StagedPack> chunk);
   // Indexes refs that are gone from their spool, keeping whatever does not
   // index in pending_index_ -- the only record of it in-process. With no
   // catalog, keeps them all. Returns how many of those a cancel or the

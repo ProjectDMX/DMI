@@ -1757,6 +1757,11 @@ SpoolStatus Spool::Recover(std::vector<StagedPack>* out, std::string* error) {
   return Scan(out, true, error);
 }
 
+SpoolStatus Spool::Recover(std::vector<StagedPack>* out, std::string* error,
+                           const Cancellation* cancel, bool* cut) {
+  return Scan(out, true, error, cancel, cut);
+}
+
 SpoolStatus Spool::ListPending(std::vector<StagedPack>* out, std::string* error) {
   return Scan(out, false, error);
 }
