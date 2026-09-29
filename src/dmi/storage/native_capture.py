@@ -21,6 +21,12 @@ Deployment shape: the catalog has ONE publisher lease per (``database``,
 ``table_prefix``), so run one capture process per catalog. A second engine
 on the same catalog waits ``start_lease_wait_s`` for the lease, then fails
 at ``create_record_runtime`` with the lease held, naming the holder.
+
+Each spool directory has one owner process (an flock on its
+``.owner.lock``). The engine claims a fresh directory of its own under
+``spool_root`` (:func:`claim_spool_directory`) and its service adopts the
+spools of dead processes beside it, so a crashed run's packs reach the
+catalog through the next process on the node for the same catalog.
 """
 
 from __future__ import annotations
@@ -125,10 +131,15 @@ class NativeSinkConfig:
     never be admitted; ``validate_capture_bounds`` refuses such a bound at
     attach, before any forward runs.
 
-    ``spool_root`` must be node-local, and a spool directory has one owner
-    process, held by an flock on its ``.owner.lock``. A root on NFS or
-    Lustre is refused unless ``spool_allow_shared_filesystem``: flock there
-    does not keep out a process on another node.
+    ``spool_root`` must be node-local, and each spool directory has one
+    owner process, held by an flock on its ``.owner.lock``. With
+    ``capture_storage_config`` the engine spools into a directory of its own
+    under it, ``<spool_root>/<catalog_key>/r<rank>-<incarnation>/`` (see
+    :func:`claim_spool_directory`), and its storage service adopts the
+    directories of dead processes beside it. Without one, the sink owns
+    ``spool_root`` itself. A root on NFS or Lustre is refused unless
+    ``spool_allow_shared_filesystem``: flock there does not keep out a
+    process on another node.
     """
 
     spool_root: str
@@ -566,6 +577,76 @@ def validate_capture_bounds(
 SPOOL_OWNER_LOCKS = ("take", "held_by_caller")
 
 
+def _spool_producer_rank() -> int:
+    """The rank a spool directory is named for: torchrun's global ``RANK``,
+    0 for a single process or anything that is not a rank. It only labels
+    the directory; the incarnation is what keeps two processes apart."""
+    text = os.environ.get("RANK", "")
+    return int(text) if text.isdigit() else 0
+
+
+class SpoolClaim:
+    """This process's own spool directory, owned through its lock.
+
+    From :func:`claim_spool_directory`. Hold it for as long as anything in
+    the process writes or reads the directory -- the engine holds it from
+    before its storage service starts until the sink and the service are
+    done -- then :meth:`release` it.
+    """
+
+    def __init__(self, lock: Any) -> None:
+        self._lock = lock
+        self.directory: str = lock.directory
+
+    @property
+    def held(self) -> bool:
+        return bool(self._lock.held)
+
+    def release(self) -> bool:
+        """Let go of the directory, removing it if nothing but its lock
+        file is left. Whatever did not drain stays, and the next process on
+        the node for this catalog adopts it. Returns whether it was
+        removed."""
+        return bool(self._lock.release_and_remove_if_empty())
+
+
+def claim_spool_directory(
+    sink_config: NativeSinkConfig,
+    storage_config: NativeCaptureStorageConfig,
+) -> SpoolClaim:
+    """Create and lock this process's spool directory.
+
+    ``<spool_root>/<catalog_key>/r<rank>-<incarnation>/``: the catalog key is
+    the first 12 hex digits of sha256 of ``database/table_prefix/store_id``,
+    so every directory under it holds packs for this catalog and store; the
+    incarnation is fresh for every call, so no two processes -- two jobs on
+    one node, or a restart -- share a directory; the rank is torchrun's
+    ``RANK`` (0 when unset). The directory is created with its owner lock
+    already held. Raises ``SpoolOwnedError`` (a ``RuntimeError``) if another
+    process holds it, and ``ValueError`` for a shared filesystem or a
+    directory nested in another spool.
+    """
+    module = _load_native_store_extension()
+    directory = module.spool_rank_directory(
+        sink_config.spool_root, storage_config.database,
+        storage_config.table_prefix, storage_config.store_id,
+        _spool_producer_rank())
+    return SpoolClaim(module.SpoolOwnerLock(
+        directory,
+        allow_shared_filesystem=sink_config.spool_allow_shared_filesystem))
+
+
+def spool_owner_lock_beside(spool_root: str) -> str:
+    """The owner-lock mode for a second Spool on a directory: ``held_by_caller``
+    when this process already holds its lock (a sink the caller built took
+    it), else ``take``, which another process's lock refuses by name."""
+    owner = _load_native_store_extension().spool_owner(spool_root)
+    if (owner is not None and owner["pid"] == os.getpid()
+            and owner["host"] == socket.gethostname()):
+        return "held_by_caller"
+    return "take"
+
+
 class NativeCaptureStorage:
     """The in-process storage service: spool -> object store -> catalog.
 
@@ -645,10 +726,15 @@ class NativeCaptureStorage:
         """
         if not self._service.flush(float(timeout_s)):
             snapshot = self._service.snapshot()
+            # A dead process's spool this service has still to adopt keeps
+            # it undrained too (adopt_sibling_spools).
+            adopting = (", and a dead process's spool still to adopt"
+                        if snapshot.get("adoption_owed") else "")
             raise TimeoutError(
                 "timed out waiting for staged packs to reach the catalog "
-                f"({snapshot['pending_index']} uploaded but unindexed); last "
-                f"error: {snapshot['last_error'] or 'none'}")
+                f"({snapshot['pending_index']} uploaded but unindexed"
+                f"{adopting}); last error: "
+                f"{snapshot['last_error'] or 'none'}")
 
     def stop(self) -> None:
         """Stop the background thread and release the lease. No flush."""
@@ -861,5 +947,8 @@ __all__ = [
     "NativeCaptureSelection",
     "NativeCaptureStorage",
     "NativeCaptureStorageConfig",
+    "SpoolClaim",
+    "claim_spool_directory",
+    "spool_owner_lock_beside",
     "validate_capture_bounds",
 ]

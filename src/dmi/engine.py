@@ -162,6 +162,9 @@ class MonitoringEngine:
                                 "NativeCaptureStorageConfig")
         # The running storage service, while a record runtime is attached.
         self._capture_storage: Optional[Any] = None
+        # This process's own spool directory and its owner lock, held from
+        # before the service starts until the sink and the service are done.
+        self._spool_claim: Optional[Any] = None
         host_configured = host_engine is not None or db_config is not None
         if self._storage_backend == "in-memory" and not host_configured:
             raise ValueError(
@@ -422,7 +425,7 @@ class MonitoringEngine:
         # spool: its start sweeps a crashed sink's stale .open files, which
         # is safe only while nothing writes there. An explicit record_sink
         # may already hold the spool open, so it is left unswept.
-        storage = self._start_capture_storage(sweep_spool=record_sink is None)
+        storage = self._start_capture_storage(record_sink)
         try:
             runtime = self._attach_record_runtime(
                 record_format, record_schema, record_sink,
@@ -431,7 +434,10 @@ class MonitoringEngine:
         except BaseException:
             if storage is not None:
                 self._capture_storage = None
-                storage.stop()
+                try:
+                    storage.stop()
+                finally:
+                    self._release_spool_claim()
             raise
         return runtime
 
@@ -486,22 +492,74 @@ class MonitoringEngine:
             "NativePackSink (storage_backend='persistent', or record_sink=) "
             "to use a budget")
 
-    def _start_capture_storage(self, *, sweep_spool: bool) -> Optional[Any]:
+    def _start_capture_storage(self, record_sink: Optional[Any]) -> Optional[Any]:
+        """Start the storage service, and claim the spool it drains.
+
+        With the default sink, this process spools into a directory of its
+        own under ``capture_sink_config.spool_root`` --
+        ``<spool_root>/<catalog_key>/r<rank>-<incarnation>/``, fresh on every
+        start -- and owns it: its owner lock is taken here, before the
+        service opens it, and held until the sink and the service are done
+        (``_release_spool_claim``). The service and the sink both open it
+        ``held_by_caller``; two takes in one process refuse each other. The
+        service adopts the directories of dead processes beside it.
+
+        An explicit ``record_sink`` writes where it was built to: the
+        service drains ``spool_root`` itself, unswept and with no siblings
+        to adopt, beside the sink's lock if this process holds one.
+        """
         config = self._capture_storage_config
         if config is None or self._storage_backend != "persistent":
             return None
-        from .storage.native_capture import NativeCaptureStorage
+        from .storage.native_capture import (
+            NativeCaptureStorage,
+            claim_spool_directory,
+            spool_owner_lock_beside,
+        )
 
         sink_config = self._capture_sink_config
-        storage = NativeCaptureStorage(
-            config,
-            spool_root=sink_config.spool_root,
-            spool_max_bytes=sink_config.spool_max_bytes,
-            sweep_spool=sweep_spool,
-        )
-        storage.start()
+        shared = sink_config.spool_allow_shared_filesystem
+        if record_sink is not None:
+            storage = NativeCaptureStorage(
+                config,
+                spool_root=sink_config.spool_root,
+                spool_max_bytes=sink_config.spool_max_bytes,
+                sweep_spool=False,
+                spool_owner_lock=spool_owner_lock_beside(
+                    sink_config.spool_root),
+                spool_allow_shared_filesystem=shared,
+            )
+            storage.start()
+            self._capture_storage = storage
+            return storage
+        claim = claim_spool_directory(sink_config, config)
+        try:
+            storage = NativeCaptureStorage(
+                config,
+                spool_root=claim.directory,
+                spool_max_bytes=sink_config.spool_max_bytes,
+                sweep_spool=True,
+                spool_owner_lock="held_by_caller",
+                adopt_sibling_spools=True,
+                spool_allow_shared_filesystem=shared,
+            )
+            storage.start()
+        except BaseException:
+            claim.release()
+            raise
+        self._spool_claim = claim
         self._capture_storage = storage
         return storage
+
+    def _release_spool_claim(self) -> None:
+        """Let go of this process's spool directory, once nothing writes it.
+
+        A drained directory is removed; one still holding packs stays, for
+        the next process on the node for this catalog to adopt.
+        """
+        claim, self._spool_claim = self._spool_claim, None
+        if claim is not None:
+            claim.release()
 
     def _attach_record_runtime(
         self,
@@ -526,8 +584,13 @@ class MonitoringEngine:
         ):
             from .storage.capture.native_sink import create_native_pack_sink
 
+            # Into the directory the engine claimed for the service, under
+            # its lock; without a service the sink owns the spool root.
+            claim = self._spool_claim
             record_sink = create_native_pack_sink(
-                self._capture_sink_config
+                self._capture_sink_config,
+                spool_root=None if claim is None else claim.directory,
+                owner_lock="take" if claim is None else "held_by_caller",
             ).native_sink
 
         _native_engine = _native_module()
@@ -850,7 +913,12 @@ class MonitoringEngine:
         except Exception as exc:
             _LOG.warning("capture storage did not drain: %s", exc)
         finally:
-            storage.stop()
+            try:
+                storage.stop()
+            finally:
+                # Last: the ring is stopped and the sink sealed by now, and
+                # the service has stopped touching the directory.
+                self._release_spool_claim()
 
     def close(self) -> None:
         """Tear down backend resources."""

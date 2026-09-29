@@ -185,6 +185,24 @@ refuses the persistent backend with `ConfigurationError` rather than generating
 with nothing stored. The catalog
 takes one publisher per `(database, table_prefix)`, so a second engine on the
 same catalog is refused at `create_record_runtime`.
+The engine spools into a directory of its own under
+`capture_sink_config.spool_root`,
+`<spool_root>/<catalog_key>/r<rank>-<incarnation>/` (the key is the first 12
+hex digits of sha256 of `database/table_prefix/store_id`, the rank torchrun's
+`RANK`, 0 when unset, and the incarnation fresh on every
+`create_record_runtime`), and owns it: an flock on its `.owner.lock`, taken
+before the service starts and let go after the sink and the service are done,
+when a drained directory is removed. A second process on a directory is
+refused, naming the holder's pid and host. At start the service adopts the
+directories under the same catalog key whose owners have died: their stale
+`.open` files are swept, their ready packs uploaded and indexed, and the
+directory removed, so a crashed process's packs reach the catalog through the
+next one on the node, whatever run it belongs to. The spool root must be
+node-local: NFS and Lustre are refused unless
+`NativeSinkConfig.spool_allow_shared_filesystem`. Without
+`capture_storage_config` the sink owns `spool_root` itself. With an explicit
+`record_sink`, the service drains `spool_root` as that sink writes it,
+unswept and adopting nothing.
 To reach a secured catalog, set `clickhouse_scheme="https"` (and the server's
 TLS HTTP port, usually 8443) on `NativeCaptureStorageConfig`. The client always
 verifies the server's certificate and name, against libcurl's built-in CA
