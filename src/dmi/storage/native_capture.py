@@ -308,6 +308,17 @@ class NativeCaptureStorageConfig:
     # predating these knobs used) outlasts the default wait by 10 s.
     start_lease_wait_s: Optional[float] = None
 
+    # Every object-store request is bounded: each attempt by
+    # s3_read_timeout_s (whole seconds, connecting included), with up to
+    # s3_max_attempts attempts for a transport error, a timeout, a 429 or
+    # a 5xx, and a backoff of 0.2 s doubling between them. That is how
+    # long one read the store never answers can hold the service's
+    # background cycle -- 4 x 120 s + 1.4 s on these defaults -- and a
+    # reader's request. stop() and a flush's deadline cut the service's
+    # requests short regardless (see close_flush_timeout_s).
+    s3_read_timeout_s: int = 120
+    s3_max_attempts: int = 4
+
     def __post_init__(self) -> None:
         for name in ("s3_endpoint", "s3_bucket", "s3_access_key",
                      "s3_secret_key", "store_id", "database", "table_prefix",
@@ -342,6 +353,12 @@ class NativeCaptureStorageConfig:
                                  "s3_endpoint")
         if type(self.clickhouse_port) is not int or not 0 < self.clickhouse_port < 65536:
             raise ValueError("clickhouse_port must be in 1..65535")
+        # The native client takes both as C ints; a bool is not a count.
+        for name, most in (("s3_read_timeout_s", 86_400),
+                           ("s3_max_attempts", 1_000)):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 < value <= most:
+                raise ValueError(f"{name} must be an int in 1..{most}")
         _positive("poll_interval_s", self.poll_interval_s, float)
         # The native wait is int(poll_interval_s * 1e9) ns; a zero wait spins.
         if self.poll_interval_s < 0.001:
@@ -483,6 +500,8 @@ class NativeCaptureStorageConfig:
             "s3_allow_insecure_http": self.s3_allow_insecure_http,
             "s3_ca_file": self.s3_ca_file,
             "s3_ca_path": self.s3_ca_path,
+            "s3_read_timeout_s": self.s3_read_timeout_s,
+            "s3_max_attempts": self.s3_max_attempts,
             "store_id": self.store_id,
             "clickhouse_scheme": self.clickhouse_scheme,
             "clickhouse_host": self.clickhouse_host,

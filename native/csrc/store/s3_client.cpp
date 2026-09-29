@@ -423,8 +423,9 @@ ObjectHead S3Client::HeadObject(const std::string& key, std::string* error) {
 
 bool S3Client::GetRange(const std::string& key, uint64_t offset,
                         uint64_t length, std::vector<uint8_t>* out,
-                        std::string* error) {
+                        std::string* error, bool* unavailable) {
   out->clear();
+  if (unavailable) *unavailable = false;
   if (length == 0) return true;
   std::map<std::string, std::string> headers;
   headers["Range"] = "bytes=" + std::to_string(offset) + "-" +
@@ -432,10 +433,13 @@ bool S3Client::GetRange(const std::string& key, uint64_t offset,
   S3Response response = Exchange("GET", key, {}, headers, nullptr, 0,
                                  Sha256Hex(""));
   if (!response.ok) {
+    if (unavailable) *unavailable = true;
     if (error) *error = response.error;
     return false;
   }
   if (response.http_status != 200 && response.http_status != 206) {
+    // Retried until the attempts ran out: the store, not the object.
+    if (unavailable) *unavailable = IsRetryableStatus(response.http_status);
     if (error) {
       *error = "GetObject returned HTTP " +
                std::to_string(response.http_status);

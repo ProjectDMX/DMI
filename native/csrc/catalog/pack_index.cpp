@@ -33,6 +33,15 @@ constexpr uint64_t kMaxLayerNumber = 0x7FFFFFFFull;  // 2^31 - 1
   throw CatalogError(CatalogError::Kind::kValue, what);
 }
 
+// A range read that failed: the store's answer about the pack, or no
+// answer at all (StoreUnavailableError). A failure while the client's
+// Cancellation is in force is taken for the cancel's.
+[[noreturn]] void range_read_failed(const std::string& what, bool unavailable,
+                                    const dmi_store::S3Client* s3) {
+  if (unavailable) throw StoreUnavailableError(what, s3->cancelled());
+  throw CatalogError(CatalogError::Kind::kValue, what);
+}
+
 // `CaptureMetadata.from_mapping` wraps every ValueError `__post_init__`
 // raises as `invalid capture metadata: {exc}`, so the refusals that come
 // from the metadata model's own bounds carry that prefix and the ones that
@@ -433,10 +442,10 @@ std::vector<std::string> read_pack_descriptor_rows(
   std::vector<uint8_t> trailer;
   const uint64_t trailer_offset = ref.object_bytes - kTrailerSize;
   if (charge) charge(kTrailerSize);
+  bool unavailable = false;
   if (!s3->GetRange(ref.object_key, trailer_offset, kTrailerSize, &trailer,
-                   &error)) {
-    throw CatalogError(CatalogError::Kind::kValue,
-                       "pack trailer read failed: " + error);
+                   &error, &unavailable)) {
+    range_read_failed("pack trailer read failed: " + error, unavailable, s3);
   }
   if (trailer.size() != kTrailerSize) format_error("pack trailer is truncated");
   const auto read_u64 = [&](size_t at) {
@@ -482,9 +491,8 @@ std::vector<std::string> read_pack_descriptor_rows(
   // about to be read -- not the object's size, which only bounds it.
   if (charge) charge(footer_length);
   if (!s3->GetRange(ref.object_key, footer_offset, footer_length, &footer,
-                   &error)) {
-    throw CatalogError(CatalogError::Kind::kValue,
-                       "pack footer read failed: " + error);
+                   &error, &unavailable)) {
+    range_read_failed("pack footer read failed: " + error, unavailable, s3);
   }
   if (dmi_pack::Crc32(footer.data(), footer.size()) != footer_crc) {
     throw CatalogError(CatalogError::Kind::kValue, "footer checksum mismatch");

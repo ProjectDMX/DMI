@@ -14,8 +14,25 @@
 #include <vector>
 
 #include "../store/s3_client.h"
+#include "lease_coordinator.h"
 
 namespace dmi_catalog {
+
+// read_pack_descriptor_rows could not get the object store's answer about
+// the pack: a transport error or timeout, a retryable status on every
+// attempt, or the S3 client's Cancellation (cancelled() says which). It says
+// nothing about the pack itself, unlike every other refusal the read makes.
+// A CatalogError of kind kValue like those, so a caller that treats every
+// unreadable pack alike still does.
+class StoreUnavailableError : public CatalogError {
+ public:
+  StoreUnavailableError(const std::string& what, bool cancelled)
+      : CatalogError(Kind::kValue, what), cancelled_(cancelled) {}
+  bool cancelled() const { return cancelled_; }
+
+ private:
+  bool cancelled_;
+};
 
 struct PackRefData {
   std::string pack_id;
@@ -29,7 +46,8 @@ struct PackRefData {
 // Reads the pack the ref names and renders one descriptor VALUES row per
 // record — the 33 capture_raw columns in schema order, without
 // index_version (the batch's own version). Throws CatalogError (kValue)
-// on any format violation, mirroring PackFormatError / PackIntegrityError.
+// on any format violation, mirroring PackFormatError / PackIntegrityError,
+// and StoreUnavailableError when the store did not answer a range read.
 // The bucket is the S3Client's own config; a bucket parameter here would
 // only invite a caller to believe passing a different one redirects the
 // read.

@@ -125,9 +125,14 @@ class S3Client {
 
   // GET /bucket/key, optionally Range: bytes=offset-(offset+length-1).
   // length==0 returns empty without a request (matches read_range).
-  // Short/oversized bodies are errors, not truncations.
+  // Short/oversized bodies are errors, not truncations. On failure,
+  // *unavailable (when given) says whether the store never answered for
+  // the object: a transport error or timeout, a retryable status on every
+  // attempt, or a cancel -- as against an answer about it (a 404, a 403, a
+  // short body), which says something about the object itself.
   bool GetRange(const std::string& key, uint64_t offset, uint64_t length,
-                std::vector<uint8_t>* out, std::string* error);
+                std::vector<uint8_t>* out, std::string* error,
+                bool* unavailable = nullptr);
 
   // PUT /bucket/key with x-amz-content-sha256 over the exact bytes plus the
   // DMI metadata headers. Over multipart_threshold_bytes the call becomes

@@ -57,16 +57,24 @@
 // keep timing out say which knobs bound them (snapshot().lease_timeout_error). The constructor refuses a clock skew
 // that leaves a renewal too little time to finish.
 //
-// Cancelled uploads. The uploads go through an S3 client of their own that
-// shares one Cancellation with the uploader: stop() cancels it for good,
-// and a flush arms its deadline on it for the cycle the flush runs. A
-// cancel starts no further pack, aborts a transfer in flight (a multipart
-// upload is aborted with it) and ends a retry backoff; the pack stays in
-// the spool. Nothing else is cut: the index pass reads packs already
-// uploaded, which only the catalog can now keep, through the other client,
-// and catalog statements are never cut mid-flight -- each is bounded by the
-// client's request timeout, or under the lease by the lease deadline, and
-// an index pass stops at its first failure.
+// Cancelled object-store work. The uploads go through an S3 client of their
+// own that shares one Cancellation with the uploader; the index reads and
+// the reconcile go through the other client, which has a Cancellation of
+// its own. stop() cancels both for good. A flush arms a deadline on both
+// for the cycle it runs: the uploads' at the flush deadline, the reads'
+// one catalog request timeout past it, since a pack cut short on upload
+// stays in the durable spool but one uploaded and not yet indexed is owed,
+// and only this process remembers it. A cancel starts no further request,
+// aborts a transfer in flight (a multipart upload is then aborted, one
+// attempt bounded by 5 s) and ends a retry backoff; a cancelled upload
+// leaves its pack in the spool, a cancelled read leaves its pack owed.
+// Catalog statements are never cut mid-flight: each is bounded by the
+// client's request timeout, or under the lease by the lease deadline.
+// An index pass ends at its first failure: a batch that threw, or a pack
+// the object store did not answer for (a transport error, a timeout, a
+// retryable status on every attempt), which leaves the rest of the pass
+// owed without counting against the packs. Only a pack the store answered
+// for and the indexer refused counts towards max_index_attempts.
 #pragma once
 
 #include <atomic>
@@ -229,23 +237,27 @@ class CaptureStorageService {
   // skip the reconcile (the loop runs it), and at the deadline their
   // uploads are cancelled, each pack cut short left in the spool. What a
   // cycle has uploaded it still indexes, since until then only this
-  // process remembers it, and a catalog statement is never cut mid-flight.
-  // So a flush overruns its deadline by the catalog work in flight at it:
-  // a pass that stops at its first failure, each request bounded by the
-  // client's request timeout (under the lease, by the lease deadline) --
-  // against a catalog that stopped answering, one request timeout. A
-  // stalled object-store read of that pass is bounded by the S3 client's
-  // timeouts. At zero it still runs one cycle, which indexes what earlier
-  // cycles owe and uploads nothing.
+  // process remembers it: its object-store reads are cut one catalog
+  // request timeout past the deadline, leaving what they did not read
+  // owed, and a catalog statement is never cut mid-flight, each bounded by
+  // the client's request timeout (under the lease, by the lease deadline).
+  // A pass ends at its first failure, so against a catalog or an object
+  // store that stopped answering a flush overruns its deadline by about
+  // one request timeout. At zero it still runs one cycle, which indexes
+  // what earlier cycles owe and uploads nothing.
   // Throws, once, if packs were set aside since the last flush: they are in
   // the object store but can never reach the catalog.
   bool flush(double timeout_s);
 
   // Stop the background cycle and release the lease. Does not flush. Its
-  // uploads are cancelled first: an upload in flight is aborted, its pack
-  // left in the spool for the next start, a retry backoff ends, and the
-  // reconcile stops between requests; a cycle in flight still indexes what
-  // it had uploaded, the lease renewing until it is done.
+  // object-store work is cancelled first: an upload in flight is aborted,
+  // its pack left in the spool for the next start; an index read in flight
+  // is cut, its pack left owed -- which stop() drops, so it waits in the
+  // bucket for a start's reconcile (reconcile_on_start); a retry backoff
+  // ends, and so does the reconcile. What stop() still waits for is the
+  // catalog work in flight, never cut mid-flight, and the lease release,
+  // each request bounded by the client's request timeout (under the lease,
+  // by the lease deadline); the lease renews until the loop is done.
   void stop();
 
   StorageServiceSnapshot snapshot() const;
@@ -290,9 +302,11 @@ class CaptureStorageService {
   // periodic and the owed reconcile. Requires cycle_mutex_.
   CycleOutcome run_cycle(uint64_t deadline_ns, bool allow_reconcile);
   // Indexes refs in bounded batches, appending every ref that did not index
-  // to *unindexed. Only a lost lease propagates; other failures are recorded.
-  void index_bounded(std::vector<PackRefData> refs,
-                     std::vector<PackRefData>* unindexed);
+  // to *unindexed. Only a lost lease propagates; other failures are
+  // recorded. Returns how many of *unindexed a cancel left there: owed,
+  // but not failed.
+  size_t index_bounded(std::vector<PackRefData> refs,
+                       std::vector<PackRefData>* unindexed);
   // False when stop() cut it short, between two of its requests.
   bool reconcile();
   void keep_lease();          // the lease thread's body
@@ -332,8 +346,11 @@ class CaptureStorageService {
   // Cancels the uploads: stop() for good, a flush's cycle at its deadline.
   // Before the clients that point at it.
   dmi_store::Cancellation upload_cancel_;
-  // Indexing and the reconcile read through s3_, which no cancel cuts; the
-  // uploader writes through upload_s3_, which upload_cancel_ does.
+  // Cancels the index reads and the reconcile's requests: stop() for good,
+  // a flush's cycle one catalog request timeout past its deadline.
+  dmi_store::Cancellation read_cancel_;
+  // Indexing and the reconcile read through s3_, which read_cancel_ cuts;
+  // the uploader writes through upload_s3_, which upload_cancel_ does.
   dmi_store::S3Client s3_;
   dmi_store::S3Client upload_s3_;
   std::shared_ptr<const ClickHouseClient> clickhouse_;
