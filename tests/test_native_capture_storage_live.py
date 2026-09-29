@@ -1349,7 +1349,10 @@ def test_stop_returns_promptly_while_an_upload_stalls(fake_s3, tmp_path):
     """stop() joined a loop whose cycle was inside a PUT the store never
     answers, so it waited out the S3 read timeout on every attempt, with the
     lease held. It cancels the upload now: the pack stays in the spool, the
-    lease is released, and the next process uploads the pack."""
+    lease is released, and the next process uploads the pack. The uploader
+    is allowed eight attempts: one whose own retries and backoff stop() did
+    not cut, on a client stop() did, would sleep out about 26 s of backoff
+    (four attempts' 1.75 s fit under the bound)."""
     from dmi.storage.native_capture import _load_native_store_extension
 
     spool_root = tmp_path / "spool"
@@ -1360,7 +1363,7 @@ def test_stop_returns_promptly_while_an_upload_stalls(fake_s3, tmp_path):
             spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
             holder="stalled-upload-stop",
             poll_interval_ns=20_000_000, reconcile_on_start=False,
-            s3_read_timeout_s=60)
+            s3_read_timeout_s=60, uploader_max_attempts=8)
         service = _load_native_store_extension().StorageService(native)
         service.start()
         stopper = None

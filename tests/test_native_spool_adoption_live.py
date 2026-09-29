@@ -684,7 +684,10 @@ def test_stop_cuts_an_adoption_stalled_on_its_uploads(fake_s3, tmp_path):
     and stop() sat through read timeouts. Now stop() returns at once, every
     pack of the dead spool is still in it (none was uploaded, none lost),
     and the directory is left, unlocked, for the next incarnation -- which
-    adopts it."""
+    adopts it. The uploader is allowed eight attempts: an adoption uploader
+    whose own retries and backoff stop() did not cut, on a client stop()
+    did, would sleep out about 26 s of backoff (four attempts' 1.75 s fit
+    under the bound)."""
     from tests.test_native_capture_storage_live import _Switch
 
     base = tmp_path / "spool"
@@ -700,7 +703,14 @@ def test_stop_cuts_an_adoption_stalled_on_its_uploads(fake_s3, tmp_path):
         assert len(staged) == len(STAGED_BY_THE_DEAD) // RECORDS_PER_PACK
         store.stall_requests(lambda request: request.startswith(b"PUT "))
         lock = _claim(base, config)
-        service = _service(config, lock.directory)
+        native = config._native_dict()
+        native.update(
+            spool_root=lock.directory, spool_max_bytes=1 << 30,
+            holder="adoption-stall-stop", poll_interval_ns=50_000_000,
+            sweep_spool_on_start=True, reconcile_on_start=False,
+            spool_owner_lock="held_by_caller", adopt_sibling_spools=True,
+            uploader_max_attempts=8, **config._lease_native())
+        service = _store().StorageService(native)
         service.start()
         try:
             _wait_for(lambda: store.stalled, 30.0)  # an adopted PUT in flight
