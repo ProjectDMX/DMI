@@ -237,13 +237,16 @@ class CaptureStorageService {
   // skip the reconcile (the loop runs it), and at the deadline their
   // uploads are cancelled, each pack cut short left in the spool. What a
   // cycle has uploaded it still indexes, since until then only this
-  // process remembers it: its object-store reads are cut one catalog
-  // request timeout past the deadline, leaving what they did not read
-  // owed, and a catalog statement is never cut mid-flight, each bounded by
-  // the client's request timeout (under the lease, by the lease deadline).
-  // A pass ends at its first failure, so against a catalog or an object
-  // store that stopped answering a flush overruns its deadline by about
-  // one request timeout. At zero it still runs one cycle, which indexes
+  // process remembers it -- but past the deadline no index batch starts
+  // after the first: that batch's object-store reads are cut one catalog
+  // request timeout past the deadline, and its catalog statements are
+  // never cut mid-flight, each bounded by the client's request timeout
+  // (under the lease, by the lease deadline). What it leaves unindexed
+  // stays owed, for the loop or a later flush. A pass ends at its first
+  // failure, so a flush overruns its deadline by about one request
+  // timeout against a catalog or an object store that stopped answering,
+  // and by one batch of statements against a slow catalog that still
+  // answers. At zero it still runs one cycle, which indexes one batch of
   // what earlier cycles owe and uploads nothing.
   // Throws, once, if packs were set aside since the last flush: they are in
   // the object store but can never reach the catalog.
@@ -303,10 +306,12 @@ class CaptureStorageService {
   CycleOutcome run_cycle(uint64_t deadline_ns, bool allow_reconcile);
   // Indexes refs in bounded batches, appending every ref that did not index
   // to *unindexed. Only a lost lease propagates; other failures are
-  // recorded. Returns how many of *unindexed a cancel left there: owed,
-  // but not failed.
+  // recorded. A non-zero deadline_ns (steady ns) starts no batch past it
+  // but the first. Returns how many of *unindexed a cancel or the deadline
+  // left there: owed, but not failed.
   size_t index_bounded(std::vector<PackRefData> refs,
-                       std::vector<PackRefData>* unindexed);
+                       std::vector<PackRefData>* unindexed,
+                       uint64_t deadline_ns = 0);
   // False when stop() cut it short, between two of its requests.
   bool reconcile();
   void keep_lease();          // the lease thread's body

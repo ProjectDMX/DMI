@@ -1139,6 +1139,63 @@ def test_an_object_store_read_outage_sets_no_pack_aside(fake_s3, tmp_path):
         assert sorted(_read_all(direct)) == sorted(tensors)
 
 
+def test_a_flush_against_a_slow_catalog_indexes_one_batch_past_its_deadline(
+        fake_s3, tmp_path):
+    """A flush's cycle checked its deadline only while uploading: past it,
+    it still indexed everything it had uploaded, batch after batch. Against
+    a catalog that answers slowly but inside the request timeout no request
+    fails, so the overrun grew with the batches -- 8 one-pack batches at
+    0.4 s a statement ran a 1 s flush for 59 s. Past the deadline a
+    flush now starts no further batch: it finishes the one in flight (or
+    indexes one batch of what it uploaded) and leaves the rest owed, for
+    the loop, or a later flush, to index. (Its index reads are cut one
+    request timeout past the deadline too, which ends the pass; the request
+    timeout here outlasts all eight batches, so that is not what ends it.)"""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    request_timeout = 60.0
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(
+            fake_s3, catalog.table_prefix,
+            clickhouse_port=switch.port)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="slow-catalog-flush",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            indexer_max_packs=1,
+            clickhouse_request_timeout_s=request_timeout)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(16))  # eight packs
+            switch.delay_requests(_slow_catalog(0.4, 0.4))
+            started = time.monotonic()
+            drained = service.flush(1.0)
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+            # One batch past the deadline -- about 7 s of statements at
+            # 0.4 s each, the lease's included -- not eight (59 s before).
+            assert elapsed < 1.0 + 12.0, (elapsed, snapshot)
+            assert drained is False
+            assert snapshot["uploaded_packs"] == 8, snapshot
+            assert snapshot["indexed_packs"] == 1, snapshot
+            assert snapshot["pending_index"] == 7, snapshot
+            # Left owed by the deadline: neither failed nor set aside.
+            assert snapshot["index_failures"] == 0, snapshot
+
+            switch.restore()
+            assert service.flush(60.0)
+            assert service.snapshot()["indexed_packs"] == 8
+        finally:
+            switch.close()
+            service.stop()
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
 def test_dropping_a_running_service_does_not_hold_the_gil(fake_s3, tmp_path):
     """A service collected without stop() stops itself in its destructor,
     joining a cycle that may be waiting on the catalog. That ran with the

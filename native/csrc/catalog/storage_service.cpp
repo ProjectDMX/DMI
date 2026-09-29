@@ -464,9 +464,10 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
   }
   // Indexes refs, keeping whatever does not index owed: it is already gone
   // from the spool, so pending_index_ is the only record of it in-process.
-  // Those a cancel left owed are counted in `deferred` (index_bounded).
+  // Those a cancel or the deadline left owed are counted in `deferred`
+  // (index_bounded).
   size_t deferred = 0;
-  const auto index_or_owe = [this, catalog,
+  const auto index_or_owe = [this, catalog, deadline_ns,
                              &deferred](std::vector<PackRefData> refs) {
     if (!catalog) {
       pending_index_.insert(pending_index_.end(), refs.begin(), refs.end());
@@ -474,7 +475,9 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
     }
     std::vector<PackRefData> unindexed;
     try {
-      if (!refs.empty()) deferred += index_bounded(std::move(refs), &unindexed);
+      if (!refs.empty()) {
+        deferred += index_bounded(std::move(refs), &unindexed, deadline_ns);
+      }
     } catch (...) {
       pending_index_.insert(pending_index_.end(), unindexed.begin(),
                             unindexed.end());
@@ -487,7 +490,8 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
     // 1. Retry what earlier cycles uploaded but could not index. While any
     //    of it is still owed, the catalog is down or refusing: upload
     //    nothing new, so new packs stay in the durable spool rather than
-    //    joining a list that only this process remembers.
+    //    joining a list that only this process remembers. Past a flush's
+    //    deadline no batch starts but the first (index_bounded).
     if (catalog && !pending_index_.empty()) {
       std::vector<PackRefData> owed;
       owed.swap(pending_index_);
@@ -546,8 +550,11 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
 
     // 3. Index them, a cancel of the uploads or not: they are gone from
     //    the spool, so until the catalog has them only this process
-    //    remembers them. Their reads end at stop(), or one request timeout
-    //    past a flush's deadline, leaving what they did not read owed.
+    //    remembers them. Past a flush's deadline, one batch of them: the
+    //    rest stay owed, for the loop or a later flush, so that the flush
+    //    returns on time however many it uploaded. Their reads end at
+    //    stop(), or one request timeout past a flush's deadline, leaving
+    //    what they did not read owed.
     index_or_owe(std::move(to_index));
 
     // 4. Reconcile on its interval, or when the pass at start() lost the
@@ -573,7 +580,7 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
     // would be re-hashed on every cycle of an outage.
     // Without the lease nothing can be confirmed in the catalog, so the
     // cycle is not drained, and it counts towards the backoff. Packs a
-    // cancel left owed make it cut short, not failed.
+    // cancel or the deadline left owed make it cut short, not failed.
     if (deferred != 0) outcome.cut_short = true;
     outcome.failed =
         !catalog || upload_failures != 0 || pending_index_.size() > deferred;
@@ -617,8 +624,9 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
   return outcome;
 }
 
-size_t CaptureStorageService::index_bounded(
-    std::vector<PackRefData> refs, std::vector<PackRefData>* unindexed) {
+size_t CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
+                                            std::vector<PackRefData>* unindexed,
+                                            uint64_t deadline_ns) {
   // Batches the indexer can take: at most max_packs, and halved again when the
   // rendered descriptors exceed max_estimated_bytes. The two bounds are
   // independent, so packs that each fit can still overflow together.
@@ -643,7 +651,8 @@ size_t CaptureStorageService::index_bounded(
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_.index_failures += count;
   };
-  // Left owed and not counted as failed: a cancel cut the pass short.
+  // Left owed and not counted as failed: a cancel or the deadline cut the
+  // pass short.
   size_t deferred = 0;
   const auto defer = [&](std::vector<PackRefData>& cut) {
     deferred += cut.size();
@@ -654,7 +663,18 @@ size_t CaptureStorageService::index_bounded(
     }
     work.clear();
   };
+  bool first = true;
   while (!work.empty()) {
+    // Past the deadline no batch starts but the first: the pass overruns
+    // it by one batch at most, never by the rest of its work, however many
+    // batches that is. Catalog statements are never cut, so this is where
+    // the pass can stop.
+    if (!first && deadline_ns != 0 && steady_ns() >= deadline_ns) {
+      std::vector<PackRefData> none;
+      defer(none);
+      break;
+    }
+    first = false;
     std::vector<PackRefData> batch = std::move(work.back());
     work.pop_back();
     IndexResultData result;
