@@ -90,7 +90,7 @@ def _claim(base: Path, config):
     """What the engine does first: a fresh rank directory, locked."""
     store = _store()
     directory = store.spool_rank_directory(
-        str(base), config.database, config.table_prefix, config.store_id, 0)
+        str(base), config._spool_destination(), 0)
     return store.SpoolOwnerLock(directory)
 
 
@@ -261,12 +261,15 @@ def test_a_dead_spool_waits_in_place_while_the_object_store_is_down(
 
     base = tmp_path / "spool"
     with _catalog() as prefix:
-        child, dead = _spawn_dead_process(base, fake_s3, prefix)
+        # Both processes reach the store through the switch: the endpoint is
+        # part of the catalog key, so a successor spelling it differently
+        # would not see the dead directory as its sibling.
+        switch = _Switch.to_url(fake_s3)
+        child, dead = _spawn_dead_process(base, switch.url, prefix)
         _sigkill(child)
         staged = sorted(dead.rglob("*.dmi-pack.ready"))
         assert staged
 
-        switch = _Switch.to_url(fake_s3)
         switch.cut()
         config = _storage_config(switch.url, prefix)
         lock = _claim(base, config)

@@ -508,6 +508,20 @@ class NativeCaptureStorageConfig:
             "uploader_max_in_flight_bytes": self.uploader_max_in_flight_bytes,
         }
 
+    def _spool_destination(self) -> dict[str, Any]:
+        """Where the packs go, as the spool's catalog key hashes it: the
+        catalog's server and names, and the store's endpoint, bucket and
+        id (native/csrc/store/spool.h, SpoolDestination)."""
+        return {
+            "clickhouse_host": self.clickhouse_host,
+            "clickhouse_port": self.clickhouse_port,
+            "database": self.database,
+            "table_prefix": self.table_prefix,
+            "s3_endpoint": self.s3_endpoint,
+            "s3_bucket": self.s3_bucket,
+            "store_id": self.store_id,
+        }
+
     def _native_reader_dict(self) -> dict[str, Any]:
         """The reader's native config: the reader account, when one is set."""
         native = self._native_dict()
@@ -630,8 +644,11 @@ def claim_spool_directory(
     """Create and lock this process's spool directory.
 
     ``<spool_root>/<catalog_key>/r<rank>-<incarnation>/``: the catalog key is
-    the first 12 hex digits of sha256 of ``database/table_prefix/store_id``,
-    so every directory under it holds packs for this catalog and store; the
+    the first 12 hex digits of a sha256 of where the packs go -- the
+    ClickHouse host and port, ``database``, ``table_prefix``, the S3 endpoint
+    and bucket, and ``store_id`` -- so every directory under it holds packs
+    for this catalog and store, and two deployments that share the default
+    names but not a server never adopt each other's directories; the
     incarnation is fresh for every call, so no two processes -- two jobs on
     one node, or a restart -- share a directory; the rank is torchrun's
     ``RANK`` (0 when unset). The directory is created with its owner lock
@@ -641,8 +658,7 @@ def claim_spool_directory(
     """
     module = _load_native_store_extension()
     directory = module.spool_rank_directory(
-        sink_config.spool_root, storage_config.database,
-        storage_config.table_prefix, storage_config.store_id,
+        sink_config.spool_root, storage_config._spool_destination(),
         _spool_producer_rank())
     return SpoolClaim(module.SpoolOwnerLock(
         directory,

@@ -188,7 +188,9 @@ same catalog is refused at `create_record_runtime`.
 The engine spools into a directory of its own under
 `capture_sink_config.spool_root`,
 `<spool_root>/<catalog_key>/r<rank>-<incarnation>/` (the key is the first 12
-hex digits of sha256 of `database/table_prefix/store_id`, the rank torchrun's
+hex digits of a sha256 of where the packs go -- the ClickHouse host and port,
+`database`, `table_prefix`, the S3 endpoint and bucket, and `store_id`, as
+spelled in the config -- the rank torchrun's
 `RANK`, 0 when unset, and the incarnation fresh on every
 `create_record_runtime`), and owns it: an flock on its `.owner.lock`, taken
 before the service starts and let go after the sink and the service are done,

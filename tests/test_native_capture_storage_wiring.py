@@ -489,8 +489,8 @@ def _capture_engine(monkeypatch, tmp_path, *, fail_ring=False,
         locks.append(lock)
         return lock
 
-    def _rank_directory(base, database, table_prefix, store_id, rank):
-        events.append(("layout", database, table_prefix, store_id, rank))
+    def _rank_directory(base, destination, rank):
+        events.append(("layout", destination, rank))
         return RANK_DIRECTORY.format(base=base, rank=rank)
 
     def _load_named_extension(name):
@@ -580,8 +580,7 @@ def test_the_service_starts_before_the_sink_opens_the_spool(monkeypatch, tmp_pat
     directory = RANK_DIRECTORY.format(base=tmp_path / "spool", rank=0)
     storage = _storage_config()
     assert events[:5] == [
-        ("layout", storage.database, storage.table_prefix, storage.store_id,
-         0),
+        ("layout", storage._spool_destination(), 0),
         ("lock", "acquire", directory),
         ("service", "construct"),
         ("service", "start"),

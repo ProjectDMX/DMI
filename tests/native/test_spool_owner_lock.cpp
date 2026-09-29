@@ -589,14 +589,43 @@ void TestANewDirectoryAppearsWithItsLockHeld() {
 }
 
 // (7) The layout: <base>/<catalog_key>/r<rank>-<incarnation>/.
+dmi_store::SpoolDestination Destination() {
+  dmi_store::SpoolDestination destination;
+  destination.clickhouse_host = "ch";
+  destination.clickhouse_port = 8123;
+  destination.database = "db";
+  destination.table_prefix = "prefix";
+  destination.s3_endpoint = "http://s3:9000";
+  destination.s3_bucket = "bucket";
+  destination.store_id = "s3";
+  return destination;
+}
+
 void TestTheDirectoryLayout() {
-  const std::string key = dmi_store::SpoolCatalogKey("db", "prefix", "s3");
-  CHECK(key == Sha256Hex("db/prefix/s3").substr(0, 12));
+  const std::string key = dmi_store::SpoolCatalogKey(Destination());
+  CHECK(key == Sha256Hex("db/prefix/s3\nclickhouse ch:8123\n"
+                         "s3 http://s3:9000/bucket").substr(0, 12));
   CHECK(dmi_store::IsSpoolCatalogKey(key));
   CHECK(!dmi_store::IsSpoolCatalogKey("0123456789aB"));
   CHECK(!dmi_store::IsSpoolCatalogKey("0123456789a"));
-  CHECK(dmi_store::SpoolCatalogKey("db", "prefix", "s3") !=
-        dmi_store::SpoolCatalogKey("db", "prefix", "s4"));
+  // Every part of where the packs go is in the key: two deployments that
+  // share a spool_root and the default names, but not a server, never
+  // adopt each other's directories.
+  std::set<std::string> keys{key};
+  for (int field = 0; field < 7; ++field) {
+    dmi_store::SpoolDestination other = Destination();
+    switch (field) {
+      case 0: other.clickhouse_host = "ch2"; break;
+      case 1: other.clickhouse_port = 8124; break;
+      case 2: other.database = "db2"; break;
+      case 3: other.table_prefix = "prefix2"; break;
+      case 4: other.s3_endpoint = "http://s3b:9000"; break;
+      case 5: other.s3_bucket = "bucket2"; break;
+      case 6: other.store_id = "s4"; break;
+    }
+    keys.insert(dmi_store::SpoolCatalogKey(other));
+  }
+  CHECK(keys.size() == 8);
 
   CHECK(dmi_store::SpoolRankDirectoryName(3, "0a1b2c3d") == "r3-0a1b2c3d");
   uint64_t rank = 0;
@@ -617,8 +646,7 @@ void TestTheDirectoryLayout() {
     seen.insert(fresh);
   }
   CHECK(seen.size() == 64);
-  CHECK(dmi_store::SpoolRankDirectory("/b", "db", "prefix", "s3", 2,
-                                      "0a1b2c3d") ==
+  CHECK(dmi_store::SpoolRankDirectory("/b", Destination(), 2, "0a1b2c3d") ==
         "/b/" + key + "/r2-0a1b2c3d");
 }
 

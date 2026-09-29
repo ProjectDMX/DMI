@@ -103,8 +103,9 @@ struct StorageServiceConfig {
   // Adopt the spools of dead processes bound for this catalog. spool_root
   // must then be a rank directory of the plan's section 2.3 layout,
   //   <base>/<catalog_key>/r<producer_rank>-<incarnation>/
-  // under THIS catalog's key (SpoolCatalogKey of writer.database,
-  // writer.table_prefix and uploader.store_id), or construction throws.
+  // under THIS catalog's key (SpoolCatalogKey of clickhouse.host and
+  // .port, writer.database and .table_prefix, s3.endpoint and .bucket, and
+  // uploader.store_id), or construction throws.
   // start(), after the lease and the sweep of its own directory, tries the
   // owner lock of every sibling rank directory; each one whose owner is
   // gone has its .open files swept, its .ready packs uploaded and indexed,

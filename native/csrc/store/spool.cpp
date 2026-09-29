@@ -868,10 +868,12 @@ bool SpoolOwnerLock::ReleaseAndRemoveIfEmpty(std::string* error) {
   return removed;
 }
 
-std::string SpoolCatalogKey(const std::string& database,
-                            const std::string& table_prefix,
-                            const std::string& store_id) {
-  const std::string text = database + "/" + table_prefix + "/" + store_id;
+std::string SpoolCatalogKey(const SpoolDestination& destination) {
+  const std::string text =
+      destination.database + "/" + destination.table_prefix + "/" +
+      destination.store_id + "\nclickhouse " + destination.clickhouse_host +
+      ":" + std::to_string(destination.clickhouse_port) + "\ns3 " +
+      destination.s3_endpoint + "/" + destination.s3_bucket;
   unsigned char digest[SHA256_DIGEST_LENGTH];
   SHA256(reinterpret_cast<const unsigned char*>(text.data()), text.size(),
          digest);
@@ -927,15 +929,13 @@ std::string NewSpoolIncarnation() {
 }
 
 std::string SpoolRankDirectory(const std::string& base,
-                               const std::string& database,
-                               const std::string& table_prefix,
-                               const std::string& store_id,
+                               const SpoolDestination& destination,
                                uint64_t producer_rank,
                                const std::string& incarnation) {
   std::string root = base;
   while (root.size() > 1 && root.back() == '/') root.pop_back();
-  return root + "/" + SpoolCatalogKey(database, table_prefix, store_id) +
-         "/" + SpoolRankDirectoryName(producer_rank, incarnation);
+  return root + "/" + SpoolCatalogKey(destination) + "/" +
+         SpoolRankDirectoryName(producer_rank, incarnation);
 }
 
 SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {

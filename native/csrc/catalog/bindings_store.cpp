@@ -90,6 +90,27 @@ dmi_store::OwnerLock owner_lock(const std::string& text) {
   return mode;
 }
 
+// Where a spool's packs go (store/spool.h); every field is required.
+dmi_store::SpoolDestination spool_destination(const py::dict& d) {
+  for (const char* key : {"clickhouse_host", "clickhouse_port", "database",
+                          "table_prefix", "s3_endpoint", "s3_bucket",
+                          "store_id"}) {
+    if (!d.contains(key)) {
+      throw py::key_error(std::string("spool destination needs '") + key +
+                          "'");
+    }
+  }
+  dmi_store::SpoolDestination out;
+  out.clickhouse_host = d["clickhouse_host"].cast<std::string>();
+  out.clickhouse_port = d["clickhouse_port"].cast<uint64_t>();
+  out.database = d["database"].cast<std::string>();
+  out.table_prefix = d["table_prefix"].cast<std::string>();
+  out.s3_endpoint = d["s3_endpoint"].cast<std::string>();
+  out.s3_bucket = d["s3_bucket"].cast<std::string>();
+  out.store_id = d["store_id"].cast<std::string>();
+  return out;
+}
+
 dc::StorageServiceConfig service_config(const py::dict& d) {
   dc::StorageServiceConfig c;
   c.spool_root = get<std::string>(d, "spool_root", "");
@@ -388,11 +409,16 @@ PYBIND11_MODULE(_dmi_native_store, m) {
         py::arg("directory"),
         "Who holds a spool directory's owner lock, or None when nothing "
         "does.");
-  m.def("spool_catalog_key", &dmi_store::SpoolCatalogKey, py::arg("database"),
-        py::arg("table_prefix"), py::arg("store_id"));
+  m.def("spool_catalog_key",
+        [](const py::dict& destination) {
+          return dmi_store::SpoolCatalogKey(spool_destination(destination));
+        },
+        py::arg("destination"),
+        "The catalog key of a destination dict (clickhouse_host, "
+        "clickhouse_port, database, table_prefix, s3_endpoint, s3_bucket, "
+        "store_id).");
   m.def("spool_rank_directory",
-        [](const std::string& base, const std::string& database,
-           const std::string& table_prefix, const std::string& store_id,
+        [](const std::string& base, const py::dict& destination,
            uint64_t producer_rank, std::optional<std::string> incarnation) {
           const std::string fresh =
               incarnation ? *incarnation : dmi_store::NewSpoolIncarnation();
@@ -404,11 +430,10 @@ PYBIND11_MODULE(_dmi_native_store, m) {
             throw py::value_error("incarnation must be 8 lowercase hex "
                                   "digits");
           }
-          return dmi_store::SpoolRankDirectory(base, database, table_prefix,
-                                               store_id, producer_rank, fresh);
+          return dmi_store::SpoolRankDirectory(
+              base, spool_destination(destination), producer_rank, fresh);
         },
-        py::arg("base"), py::arg("database"), py::arg("table_prefix"),
-        py::arg("store_id"), py::arg("producer_rank"),
+        py::arg("base"), py::arg("destination"), py::arg("producer_rank"),
         py::arg("incarnation") = py::none(),
         "<base>/<catalog_key>/r<producer_rank>-<incarnation>, the section "
         "2.3 spool layout; a fresh incarnation when none is given.");

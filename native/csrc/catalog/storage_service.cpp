@@ -169,9 +169,15 @@ CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
     // under this catalog's key: a directory under another catalog's key
     // would index that catalog's packs here.
     const std::filesystem::path own(spool_.root());
-    const std::string key = dmi_store::SpoolCatalogKey(
-        config_.writer.database, config_.writer.table_prefix,
-        config_.uploader.store_id);
+    dmi_store::SpoolDestination destination;
+    destination.clickhouse_host = config_.clickhouse.host;
+    destination.clickhouse_port = config_.clickhouse.port;
+    destination.database = config_.writer.database;
+    destination.table_prefix = config_.writer.table_prefix;
+    destination.s3_endpoint = config_.s3.endpoint;
+    destination.s3_bucket = config_.s3.bucket;
+    destination.store_id = config_.uploader.store_id;
+    const std::string key = dmi_store::SpoolCatalogKey(destination);
     uint64_t rank = 0;
     std::string incarnation;
     if (!dmi_store::ParseSpoolRankDirectoryName(own.filename().string(),
@@ -180,7 +186,8 @@ CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
       throw std::invalid_argument(
           "storage service: adopt_sibling_spools needs spool_root to be a "
           "rank directory <base>/" + key + "/r<rank>-<incarnation> (this "
-          "catalog's key for database, table_prefix and store_id), got " +
+          "catalog's key for its ClickHouse host and port, database, "
+          "table_prefix, S3 endpoint, bucket and store_id), got " +
           spool_.root());
     }
   }

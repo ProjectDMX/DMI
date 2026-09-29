@@ -63,8 +63,14 @@ def _config(**overrides):
 
 def _rank_directory(base: Path, config, rank: int = 0) -> str:
     return _store().spool_rank_directory(
-        str(base), config.database, config.table_prefix, config.store_id,
-        rank)
+        str(base), config._spool_destination(), rank)
+
+
+# Where a spool's packs go: the catalog's server and names, the store's.
+DESTINATION = dict(
+    clickhouse_host="ch", clickhouse_port=8123, database="db",
+    table_prefix="prefix", s3_endpoint="http://s3:9000", s3_bucket="bucket",
+    store_id="s3")
 
 
 def _service(config, spool_root, **options):
@@ -300,18 +306,62 @@ def test_a_shared_filesystem_is_refused_unless_allowed(tmp_path):
 
 def test_the_rank_directory_layout(tmp_path):
     store = _store()
-    key = hashlib.sha256(b"db/prefix/s3").hexdigest()[:12]
-    assert store.spool_catalog_key("db", "prefix", "s3") == key
+    key = hashlib.sha256(
+        b"db/prefix/s3\nclickhouse ch:8123\ns3 http://s3:9000/bucket"
+    ).hexdigest()[:12]
+    assert store.spool_catalog_key(DESTINATION) == key
     assert store.spool_rank_directory(
-        "/base", "db", "prefix", "s3", 3, "0a1b2c3d") == (
-        f"/base/{key}/r3-0a1b2c3d")
-    fresh = {store.spool_rank_directory("/base", "db", "prefix", "s3", 0)
+        "/base", DESTINATION, 3, "0a1b2c3d") == f"/base/{key}/r3-0a1b2c3d"
+    fresh = {store.spool_rank_directory("/base", DESTINATION, 0)
              for _ in range(16)}
     assert len(fresh) == 16  # a fresh incarnation each time
     for path in fresh:
         assert path.startswith(f"/base/{key}/r0-")
     with pytest.raises(ValueError, match="incarnation"):
-        store.spool_rank_directory("/base", "db", "prefix", "s3", 0, "XYZ")
+        store.spool_rank_directory("/base", DESTINATION, 0, "XYZ")
+    incomplete = dict(DESTINATION)
+    del incomplete["s3_bucket"]
+    with pytest.raises(KeyError, match="s3_bucket"):
+        store.spool_catalog_key(incomplete)
+    assert _config()._spool_destination() == {
+        name: getattr(_config(), name) for name in DESTINATION}
+
+
+def test_the_catalog_key_names_the_servers_not_only_the_names(tmp_path):
+    """The key was sha256(database/table_prefix/store_id), so two
+    deployments on one node with the default names (default, dmi, s3) but
+    different ClickHouse servers and buckets shared a key: whichever started
+    first adopted the other's dead directories, uploading its packs to its
+    own bucket and indexing them into its own catalog. Every server and
+    name the packs go to is in the key now."""
+    from dmi.storage.native_capture import (
+        NativeSinkConfig, claim_spool_directory,
+    )
+
+    store = _store()
+    key = store.spool_catalog_key(DESTINATION)
+    for field, value in (("clickhouse_host", "ch2"), ("clickhouse_port", 8124),
+                         ("s3_endpoint", "http://s3b:9000"),
+                         ("s3_bucket", "bucket2")):
+        assert store.spool_catalog_key({**DESTINATION, field: value}) != key
+
+    staging = _config(clickhouse_host="ch-staging", s3_bucket="staging")
+    production = _config(clickhouse_host="ch-production",
+                         s3_bucket="production")
+    sink = NativeSinkConfig(spool_root=str(tmp_path / "spool"))
+    staged = claim_spool_directory(sink, staging)
+    produced = claim_spool_directory(sink, production)
+    try:
+        assert (Path(staged.directory).parent
+                != Path(produced.directory).parent)
+        # A staging service cannot adopt from under production's key.
+        with pytest.raises(ValueError, match="adopt_sibling_spools"):
+            _service(staging, produced.directory,
+                     spool_owner_lock="held_by_caller",
+                     adopt_sibling_spools=True)
+    finally:
+        staged.release()
+        produced.release()
 
 
 def test_adoption_needs_a_rank_directory_under_this_catalogs_key(tmp_path):
@@ -321,8 +371,8 @@ def test_adoption_needs_a_rank_directory_under_this_catalogs_key(tmp_path):
     # A rank directory, but under another catalog's key: adopting its
     # siblings would index that catalog's packs into this one.
     other = _store().spool_rank_directory(
-        str(tmp_path / "base"), config.database, "another_prefix",
-        config.store_id, 0)
+        str(tmp_path / "base"),
+        {**config._spool_destination(), "table_prefix": "another_prefix"}, 0)
     with pytest.raises(ValueError, match="adopt_sibling_spools"):
         _service(config, other, adopt_sibling_spools=True)
     mine = _rank_directory(tmp_path / "base", config)

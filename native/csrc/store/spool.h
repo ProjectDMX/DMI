@@ -218,18 +218,36 @@ class SpoolOwnerLock {
   std::string dir_;
 };
 
+// Where a spool's packs go: the catalog -- its ClickHouse server, database
+// and table prefix -- and the store -- its S3 endpoint, bucket and store id.
+struct SpoolDestination {
+  std::string clickhouse_host;
+  uint64_t clickhouse_port = 0;
+  std::string database;
+  std::string table_prefix;
+  std::string s3_endpoint;
+  std::string s3_bucket;
+  std::string store_id;
+};
+
 // The spool layout of the plan's section 2.3. A capture process spools into
 //   <base>/<catalog_key>/r<producer_rank>-<incarnation>/
-// where catalog_key is the first 12 hex digits of
-// sha256("<database>/<table_prefix>/<store_id>"), and incarnation is 8 hex
-// digits fresh for every process start, so no two processes -- two jobs on
-// one node, or a restart of the same rank -- ever share a directory. The
-// directories under one catalog key are siblings: packs bound for one
-// catalog and store, which a successor on the node adopts once their owner
-// has died (CaptureStorageService, adopt_sibling_spools).
-std::string SpoolCatalogKey(const std::string& database,
-                            const std::string& table_prefix,
-                            const std::string& store_id);
+// where catalog_key is the first 12 hex digits of the sha256 of
+//   "<database>/<table_prefix>/<store_id>\n"
+//   "clickhouse <clickhouse_host>:<clickhouse_port>\n"
+//   "s3 <s3_endpoint>/<s3_bucket>"
+// and incarnation is 8 hex digits fresh for every process start, so no two
+// processes -- two jobs on one node, or a restart of the same rank -- ever
+// share a directory. The directories under one catalog key are siblings:
+// packs bound for one catalog and store, which a successor on the node
+// adopts once their owner has died (CaptureStorageService,
+// adopt_sibling_spools). The servers are in the key, not only the names:
+// with the plan's sha256(database/table_prefix/store_id), two deployments
+// sharing a spool_root and the default names but not a server adopted each
+// other's dead directories into the wrong catalog and bucket. The servers
+// are hashed as spelled, so spell them alike on every process of a
+// deployment, or a dead directory waits for a process that does.
+std::string SpoolCatalogKey(const SpoolDestination& destination);
 bool IsSpoolCatalogKey(const std::string& name);
 std::string SpoolRankDirectoryName(uint64_t producer_rank,
                                    const std::string& incarnation);
@@ -239,9 +257,7 @@ bool ParseSpoolRankDirectoryName(const std::string& name,
                                  std::string* incarnation);
 std::string NewSpoolIncarnation();
 std::string SpoolRankDirectory(const std::string& base,
-                               const std::string& database,
-                               const std::string& table_prefix,
-                               const std::string& store_id,
+                               const SpoolDestination& destination,
                                uint64_t producer_rank,
                                const std::string& incarnation);
 
