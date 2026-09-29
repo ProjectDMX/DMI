@@ -24,7 +24,10 @@ check, the directory layout -- are pinned by tests/native/
 test_spool_owner_lock.cpp (test_native_spool_owner_lock_unit.py).
 
 The Python spool (dmi.storage.capture.spool) takes no lock; the C++ spool is
-deliberately stricter, and that is not ported to the reference.
+deliberately stricter, and that is not ported to the reference. Skipping
+``_refs/`` is C++-only as well: the reference's constructor counts, and its
+recover() sweeps and quarantines, ``.open`` and ``.ready`` files there, and
+that divergence is deliberate, not ported either.
 
 Build: make -C native build/conformance_spool build/conformance_sink
 """
@@ -217,7 +220,9 @@ def test_an_unknown_owner_lock_mode_is_refused(tmp_path):
 
 def test_recovery_leaves_the_refs_directory_alone(tmp_path):
     """<spool>/_refs/ will hold the upload handoff's ref files (E2a). A
-    sweep that deleted, quarantined or listed them would break it."""
+    sweep that deleted, quarantined or listed them would break it. C++
+    only: the Python reference spool still walks _refs/, deliberately
+    unported."""
     root = tmp_path / "spool"
     refs = root / "_refs"
     refs.mkdir(parents=True)

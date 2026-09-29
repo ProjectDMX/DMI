@@ -47,7 +47,10 @@
 //
 // The Python DurablePackSpool (spool.py) takes no lock, and its recover()
 // deletes every .open file under its root; the C++ spool is deliberately
-// stricter, and that is not ported to the reference.
+// stricter, and that is not ported to the reference. Nor is skipping
+// <root>/_refs/: the reference counts, sweeps and quarantines .open and
+// .ready files there like any others, which the C++ spool leaves alone --
+// a C++-only divergence, deliberately not ported.
 
 #ifndef DMI_STORE_SPOOL_H_
 #define DMI_STORE_SPOOL_H_
