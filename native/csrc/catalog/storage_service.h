@@ -137,24 +137,27 @@ struct StorageServiceConfig {
   // off once it holds the lease and has swept its own directory; start()
   // itself uploads nothing of a dead backlog, and neither does flush(). A
   // cycle probes the owner lock of every sibling rank directory, then works
-  // through those whose owner is gone: it takes one's lock, sweeps its
-  // .open files and validates its .ready packs once, and uploads and
-  // indexes them a round at a time -- a chunk of the service's own upload
-  // path, at most uploader.max_workers and indexer.max_packs packs, each
-  // indexed before the next is uploaded -- under the cycle's upload rules,
-  // the lease and nothing owed to the catalog checked before every round,
-  // until adoption_slice_ns has passed, a stop is requested, or a flush()
-  // is running -- a flush waits for the step the adoption is in (one round,
-  // or one sibling's listing), not for the rest of a slice. Its
-  // listing, uploads and index reads go through the service's own clients
-  // and Cancellations, so stop() cuts an adoption as it cuts the service's
-  // own work: what it did not upload stays in the dead spool, which is let
-  // go of and never removed while a pack of it is left, for the next
-  // process on the node. The sibling's lock and its remaining packs are kept
-  // between cycles, so a large backlog is hashed once, not on every cycle,
-  // and neither a flush() nor the service's own uploads wait behind all of
-  // it. A drained sibling is removed once nothing but its lock file is
-  // left. An upload that failed stays in the dead spool and is retried by
+  // through those whose owner is gone: it takes one's lock and sweeps its
+  // .open files, validates its .ready packs once, a pack a step -- which
+  // hashes every byte of it -- and uploads and indexes them a round at a
+  // time -- a chunk of the service's own upload path, at most
+  // uploader.max_workers and indexer.max_packs packs, each indexed before
+  // the next is uploaded -- under the cycle's upload rules, the lease and
+  // nothing owed to the catalog checked before every round, until
+  // adoption_slice_ns has passed, a stop is requested, or a flush() is
+  // running -- a flush waits for the step the adoption is in (one round,
+  // one pack's validation, or one sibling's lock and sweep), not for the
+  // rest of a slice or of a listing. Its uploads and index reads go through
+  // the service's own clients and Cancellations, and its listing stops
+  // between packs on the uploads' cancel, so stop() cuts an adoption as it
+  // cuts the service's own work: what it did not upload stays in the dead
+  // spool, which is let go of and never removed while a pack of it is
+  // left, for the next process on the node. The sibling's lock, its
+  // listing and its remaining packs are kept between cycles, so a large
+  // backlog is hashed once, not on every cycle, and neither a flush() nor
+  // the service's own uploads wait behind all of it. A drained sibling is
+  // removed once nothing but its lock file is left. An upload that failed
+  // stays in the dead spool and is retried by
   // a later cycle, after the backoff -- unless no retry by this service can
   // ever succeed (dmi_store::UploadFailure::retryable: a pack over
   // uploader.max_in_flight_bytes, a different object at its key, bytes that
@@ -180,9 +183,10 @@ struct StorageServiceConfig {
   uint64_t adoption_recheck_interval_ns = 30'000'000'000ull;
   // How long one cycle may spend adopting before it lets go of the cycle --
   // to the service's own uploads, stop() -- and carries on in the next.
-  // Checked between rounds, so a cycle can outrun it by one. A flush()
-  // does not wait for it: a cycle that has made one step of adoption lets
-  // go of the cycle at the next one while a flush is running.
+  // Checked between rounds and between the packs a listing validates, so a
+  // cycle can outrun it by one round, or one pack's hash. A flush() does
+  // not wait for it: a cycle that has made one step of adoption lets go of
+  // the cycle at the next one while a flush is running.
   uint64_t adoption_slice_ns = 1'000'000'000ull;
 
   dmi_store::S3Config s3;
@@ -348,7 +352,10 @@ class CaptureStorageService {
   // when that is under about 6 s. At zero it still runs one cycle, which
   // indexes one batch of what earlier cycles owe and uploads nothing.
   // Its cycles adopt nothing, and a dead sibling still to adopt does not
-  // keep it from returning true (adopt_sibling_spools).
+  // keep it from returning true (adopt_sibling_spools); a loop cycle that
+  // is adopting when it is called lets go of the cycle after the step it
+  // is in -- one round of a dead spool's uploads, one of its packs
+  // validated, or one sibling's lock and sweep.
   // Throws, once, if packs were set aside since the last flush: they are in
   // the object store but can never reach the catalog.
   bool flush(double timeout_s);
@@ -418,9 +425,11 @@ class CaptureStorageService {
   // thread renewing it. Requires cycle_mutex_.
   void sweep_and_reconcile_at_start();
   // One cycle's share of adoption (see adopt_sibling_spools): looks at the
-  // siblings when that is due, then adopts until the slice ends, a stop is
-  // requested or the uploads' Cancellation is cancelled -- which also cuts
-  // a round in flight, and *cut_short then says so. Adds what its index
+  // siblings when that is due, then adopts a step at a time -- a sibling
+  // taken and swept, one of its packs validated, a round, a finish -- until
+  // the slice ends, a flush() is waiting (after one step at least), a stop
+  // is requested or the uploads' Cancellation is cancelled -- which also
+  // cuts a round in flight, and *cut_short then says so. Adds what its index
   // passes left owed through a cancel to *deferred (index_bounded). False
   // when an upload failed, so the cycle backs off. Requires cycle_mutex_.
   // Only a lost lease propagates.
@@ -428,11 +437,11 @@ class CaptureStorageService {
   // Probes every sibling rank directory's owner lock and queues the dead
   // ones. False when the directory cannot be listed. Requires cycle_mutex_.
   bool scan_siblings();
-  // Takes a queued sibling's lock, sweeps it and lists its packs into
-  // adopting_; leaves adopting_ empty for a live or vanished one, and for
-  // one whose listing the uploads' Cancellation cut (*cut), whose lock it
-  // lets go of. False when it could not be locked or opened.
-  bool begin_adoption(const std::string& directory, bool* cut);
+  // Takes a queued sibling's lock, sweeps its .open files and lists its
+  // ready packs into adopting_, hashing none of them (adopt_step validates
+  // them, a pack a step); leaves adopting_ empty for a live or vanished
+  // one, and for one it cannot lock or open, which it blocks.
+  void begin_adoption(const std::string& directory);
   // Uploads and indexes one round of adopting_'s packs, one chunk of the
   // service's upload path; *cut when a cancel left some in the dead spool,
   // back at the front of adopting_. False when an upload failed.

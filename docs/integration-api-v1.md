@@ -211,10 +211,11 @@ removed, so a crashed process's packs reach the catalog through the next one on
 the node, whatever run it belongs to. Neither `create_record_runtime` nor
 `flush_and_wait` waits for that: a flush covers this process's records (an
 adopted pack uploaded and not yet indexed is waited for like its own), waits
-for no more of an adoption in progress than the step it is in (one round, or
-one directory's listing), and `close()` cuts an adoption as it cuts the
-service's own uploads, leaving what it did not upload in the dead directory
-for the next process. The
+for no more of an adoption in progress than the step it is in (one round of
+its uploads, or one of its packs validated -- a dead directory's packs are
+hashed one per step, so a large backlog's listing does not hold a flush up),
+and `close()` cuts an adoption as it cuts the service's own uploads, leaving
+what it did not upload in the dead directory for the next process. The
 storage part of `capture_status()` reports the adoption (`adopted_spools`,
 `adopted_packs`, `adoption_owed`, `live_siblings`). A dead directory the
 service can never adopt -- one holding a pack it can never upload, such as one

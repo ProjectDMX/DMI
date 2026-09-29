@@ -313,7 +313,13 @@ class NativeCaptureStorageConfig:
     # budget cuts a multipart upload; against a slow catalog that still
     # answers, by one batch of statements and the release. When the sink
     # itself is stuck, the flush its release from the ring makes adds up to
-    # 30 s. close() logs what did not drain; flush_and_wait is what raises.
+    # 30 s. The budget also pays for the adoption step the background loop
+    # is in when the drain starts (adopt_sibling_spools, the engine's
+    # default): the drain's cycle waits for it -- one of a dead process's
+    # packs validated, which hashes it, or one round of their uploads --
+    # but never for a dead backlog's whole listing, and past the budget
+    # stopping the service cuts it. close() logs what did not drain;
+    # flush_and_wait is what raises.
     close_flush_timeout_s: float = 60.0
     # Bytes of packs the uploader holds in flight at once. A staged pack
     # larger than this is never uploaded, so the sink's max_pack_bytes must
@@ -863,6 +869,11 @@ class NativeCaptureStorage:
         background loop's, and ``snapshot()`` reports them
         (``adopted_spools``, ``adoption_owed``) -- though an adopted pack
         uploaded and not yet indexed is waited for like this process's own.
+        Nor does a flush adopt, but it does wait, within ``timeout_s``, for
+        the adoption step the loop is in when it is called: one of a dead
+        spool's packs validated, which hashes it, or one round of their
+        uploads (at most ``uploader_max_workers`` packs) -- not a dead
+        backlog's whole listing, which goes a pack a step.
         """
         if not self._service.flush(float(timeout_s)):
             snapshot = self._service.snapshot()

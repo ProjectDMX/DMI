@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <iterator>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -155,13 +156,17 @@ class CaptureStorageService::LeaseScope {
 };
 
 // The dead sibling a cycle is adopting, kept across cycles: its owner lock,
-// a Spool on it (held_by_caller, the lock being this service's), and the
-// packs its Recover() swept and validated that are not uploaded yet -- so a
-// backlog is hashed once, however many cycles its upload takes.
+// a Spool on it (held_by_caller, the lock being this service's), its
+// recovery -- the packs listed and those validated so far, a pack a step
+// (Spool::BeginRecovery) -- and, once every pack is validated, those not
+// uploaded yet. So a backlog is hashed once, however many cycles its
+// listing and its upload take.
 struct CaptureStorageService::Adoption {
   std::string directory;
   dmi_store::SpoolOwnerLock lock;
   dmi_store::Spool spool;
+  dmi_store::SpoolRecovery recovery;
+  bool validated = false;  // every listed pack; `remaining` holds the valid
   std::deque<dmi_store::StagedPack> remaining;
   // The first pack this service can never upload (UploadFailure::
   // retryable false); the directory is left, with it, once the rest are up.
@@ -828,14 +833,16 @@ bool CaptureStorageService::adopt_step(uint64_t deadline_ns, size_t* deferred,
     if (!scan_siblings()) return false;
   }
   bool ok = true;
-  // Whether this call has taken a step yet: a lock taken and a listing, a
-  // round, or a finish. Each call takes one at least, so flushes that keep
-  // coming slow adoption down but never stop it.
+  // Whether this call has taken a step yet: a lock taken and a sweep, one
+  // pack of a listing validated, a round, or a finish. Each call takes one
+  // at least, so flushes that keep coming slow adoption down but never stop
+  // it.
   bool stepped = false;
   while (!stop_requested()) {
     // The service's uploads' Cancellation is adoption's too: stop() cuts
-    // it between rounds, and in a round (its listing, its uploads, and,
-    // through the reads' Cancellation, its index reads).
+    // it between steps -- between the packs a listing validates too -- and
+    // in a round (its uploads, and, through the reads' Cancellation, its
+    // index reads).
     if (upload_cancel_.cancelled()) {
       *cut_short = true;
       break;
@@ -851,14 +858,26 @@ bool CaptureStorageService::adopt_step(uint64_t deadline_ns, size_t* deferred,
       if (adoption_queue_.empty()) break;
       const std::string next = adoption_queue_.front();
       adoption_queue_.pop_front();
-      bool cut = false;
-      if (!begin_adoption(next, &cut)) ok = false;
-      if (cut) {
-        // Its listing was cut: it is looked at again, from the start.
-        adoption_queue_.push_front(next);
-        *cut_short = true;
-        break;
+      begin_adoption(next);
+      continue;
+    }
+    if (!adopting_->validated) {
+      // One pack of the listing: validating hashes every byte of it, so
+      // over a dead backlog a whole listing takes as long as the backlog
+      // is big, and neither a flush nor stop() waits for more than the
+      // pack in flight. The slice bounds a listing as it does the rounds.
+      Adoption& adoption = *adopting_;
+      if (adoption.spool.ContinueRecovery(&adoption.recovery)) {
+        // Each pack's identity and object key come from the pack and its
+        // path in the dead directory, exactly as its owner would have
+        // uploaded it.
+        adoption.remaining.assign(
+            std::make_move_iterator(adoption.recovery.valid.begin()),
+            std::make_move_iterator(adoption.recovery.valid.end()));
+        adoption.recovery = dmi_store::SpoolRecovery{};
+        adoption.validated = true;
       }
+      if (steady_ns() - started >= config_.adoption_slice_ns) break;
       continue;
     }
     if (adopting_->remaining.empty()) {
@@ -939,9 +958,7 @@ bool CaptureStorageService::scan_siblings() {
   return true;
 }
 
-bool CaptureStorageService::begin_adoption(const std::string& directory,
-                                           bool* cut) {
-  *cut = false;
+void CaptureStorageService::begin_adoption(const std::string& directory) {
   auto adoption = std::make_unique<Adoption>();
   adoption->directory = directory;
   std::string error;
@@ -952,36 +969,28 @@ bool CaptureStorageService::begin_adoption(const std::string& directory,
     live_siblings_ = true;
     std::lock_guard<std::mutex> state(state_mutex_);
     ++state_.live_siblings;
-    return true;
+    return;
   }
   if (locked != dmi_store::SpoolStatus::kOk) {
     // Another adopter drained and removed it meanwhile: nothing is owed.
-    if (!std::filesystem::exists(directory)) return true;
+    if (!std::filesystem::exists(directory)) return;
     // Its lock cannot be taken at all -- another user's lock file, say.
     block_sibling(directory, "cannot lock it: " + error);
-    return true;
+    return;
   }
   dmi_store::SpoolConfig config{directory, config_.spool_max_bytes};
   config.owner_lock = dmi_store::OwnerLock::kHeldByCaller;  // adoption->lock
   config.allow_shared_filesystem = config_.spool_allow_shared_filesystem;
-  std::vector<dmi_store::StagedPack> ready;
+  // Its .open files swept and its ready packs listed, none hashed yet:
+  // adopt_step validates them, a pack a step.
   if (dmi_store::Spool::Open(config, &adoption->spool, &error) !=
           dmi_store::SpoolStatus::kOk ||
-      adoption->spool.Recover(&ready, &error, &upload_cancel_, cut) !=
+      adoption->spool.BeginRecovery(&adoption->recovery, &error) !=
           dmi_store::SpoolStatus::kOk) {
     block_sibling(directory, "cannot open it: " + error, &adoption->lock);
-    return true;
+    return;
   }
-  // Validating hashes every pack of a dead backlog; the uploads' cancel
-  // (stop()) stops it between packs, as it does the service's own listing.
-  // The directory is let go of whole, its lock with it: nothing of it was
-  // uploaded, and nothing is removed.
-  if (*cut) return true;
-  // Each pack's identity and object key come from the pack and its path in
-  // the dead directory, exactly as its owner would have uploaded it.
-  adoption->remaining.assign(ready.begin(), ready.end());
   adopting_ = std::move(adoption);
-  return true;
 }
 
 bool CaptureStorageService::upload_adopted_round(uint64_t deadline_ns,

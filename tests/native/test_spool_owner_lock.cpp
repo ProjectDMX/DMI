@@ -18,7 +18,7 @@
 //      allowed (a test seam stands in for statfs).
 //   6. Adoption's try-lock never creates a directory, and a released
 //      directory that holds nothing but its lock file can be removed; an
-//      adopter's listing of a dead spool stops between packs on a cancel.
+//      adopter recovers a dead spool a pack at a time.
 //   7. The directory layout of the plan's section 2.3.
 //   8. The spool budget charges what dead sibling directories hold.
 //
@@ -35,11 +35,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <set>
 #include <string>
 #include <vector>
 
-#include "store/cancel.h"
 #include "store/spool.h"
 
 namespace fs = std::filesystem;
@@ -985,16 +985,18 @@ void TestANewDirectoryAppearsWithItsLockHeld() {
   CHECK(unheld == 0);
 }
 
-// (6e) An adopter lists a dead spool once, through Recover, which hashes
-// every pack of what may be a large backlog. The storage service hands it
-// the Cancellation stop() cancels, and a cancelled listing stops between
-// packs: nothing listed, *cut, every ready pack where it was (nothing is
-// lost, and nothing is uploaded from a cut listing), the account as it
-// was. The dead owner's stale .open file is swept by then. Not cancelled,
-// the same listing lists every pack.
-void TestAnAdoptersListingStopsOnACancel() {
+// (6e) An adopter recovers a dead spool a pack at a time. Recover() hashes
+// every pack of what may be a large backlog in one call, and whatever
+// waited for the adopter -- stop(), a flush() behind its cycle -- waited
+// for all of it. BeginRecovery sweeps the dead owner's stale .open file and
+// lists the ready packs, hashing none, the account left as it was; each
+// ContinueRecovery validates the next one, quarantining a corrupt one at
+// its turn, and the last rebuilds the account as Recover() does. Until
+// then every other ready pack stays where it was: an adopter let go of
+// midway leaves nothing lost.
+void TestAnAdopterRecoversADeadSpoolAPackAtATime() {
   const std::string dead =
-      FreshRoot("adopt-cut") + "/0123456789ab/r0-0000dead";
+      FreshRoot("adopt-steps") + "/0123456789ab/r0-0000dead";
   std::string error;
   {
     Spool gone;
@@ -1018,6 +1020,10 @@ void TestAnAdoptersListingStopsOnACancel() {
   };
   const std::set<std::string> staged_before = readies();
   CHECK(staged_before.size() == 3);
+  // The second in listing order no longer matches its checksum.
+  const std::string corrupt = *std::next(staged_before.begin());
+  std::ofstream(corrupt, std::ios::binary | std::ios::trunc)
+      << std::string(100, 'z');
 
   SpoolOwnerLock adopter;
   CHECK(SpoolOwnerLock::TryAdopt(dead, &adopter, &error) == SpoolStatus::kOk);
@@ -1027,22 +1033,52 @@ void TestAnAdoptersListingStopsOnACancel() {
   CHECK(Spool::Open(config, &adopted, &error) == SpoolStatus::kOk);
   const uint64_t bytes_before = adopted.Snapshot().bytes;
 
-  dmi_store::Cancellation cancel;
-  cancel.Cancel();
-  std::vector<dmi_store::StagedPack> listed;
-  bool cut = false;
-  CHECK(adopted.Recover(&listed, &error, &cancel, &cut) == SpoolStatus::kOk);
-  CHECK(cut);
-  CHECK(listed.empty());
-  CHECK(readies() == staged_before);
+  dmi_store::SpoolRecovery recovery;
+  CHECK(adopted.BeginRecovery(&recovery, &error) == SpoolStatus::kOk);
   CHECK(!fs::exists(stale));
+  CHECK((std::set<std::string>(recovery.listed.begin(),
+                               recovery.listed.end()) == staged_before));
+  CHECK(recovery.next == 0 && recovery.valid.empty());
+  CHECK(readies() == staged_before);
   CHECK(adopted.Snapshot().bytes == bytes_before);
 
-  cancel.Reset();
-  CHECK(adopted.Recover(&listed, &error, &cancel, &cut) == SpoolStatus::kOk);
-  CHECK(!cut);
-  CHECK(listed.size() == 3);
-  CHECK(adopted.Snapshot().bytes == 300);
+  CHECK(!adopted.ContinueRecovery(&recovery));  // the first
+  CHECK(recovery.next == 1 && recovery.valid.size() == 1);
+  CHECK(recovery.valid[0].path == *staged_before.begin());
+  CHECK(!adopted.ContinueRecovery(&recovery));  // the corrupt one
+  CHECK(recovery.next == 2 && recovery.valid.size() == 1);
+  CHECK(!fs::exists(corrupt));
+  CHECK(fs::exists(corrupt.substr(0, corrupt.size() - 6) + ".quarantined"));
+  CHECK(readies().size() == 2);
+  CHECK(adopted.Snapshot().bytes == bytes_before);  // not rebuilt yet
+
+  CHECK(adopted.ContinueRecovery(&recovery));  // the last, and the account
+  CHECK(recovery.valid.size() == 2);
+  CHECK(recovery.valid[1].path == *staged_before.rbegin());
+  CHECK(recovery.valid[1].object_key ==
+        "v1/018f0000-0000-7000-8000-000000000003.dmi-pack");
+  CHECK(adopted.Snapshot().bytes == 200);
+  CHECK(adopted.Snapshot().entries == 2);
+  CHECK(adopted.ContinueRecovery(&recovery));  // done stays done
+  CHECK(recovery.valid.size() == 2);
+
+  // Nothing listed: done at the first step.
+  const std::string empty =
+      FreshRoot("adopt-steps-empty") + "/0123456789ab/r0-00000e00";
+  { Spool gone; CHECK(Spool::Open({empty, 1 << 20}, &gone, &error) ==
+                      SpoolStatus::kOk); }
+  SpoolOwnerLock empty_adopter;
+  CHECK(SpoolOwnerLock::TryAdopt(empty, &empty_adopter, &error) ==
+        SpoolStatus::kOk);
+  SpoolConfig empty_config{empty, 1 << 20};
+  empty_config.owner_lock = OwnerLock::kHeldByCaller;
+  Spool empty_spool;
+  CHECK(Spool::Open(empty_config, &empty_spool, &error) == SpoolStatus::kOk);
+  dmi_store::SpoolRecovery nothing;
+  CHECK(empty_spool.BeginRecovery(&nothing, &error) == SpoolStatus::kOk);
+  CHECK(nothing.listed.empty());
+  CHECK(empty_spool.ContinueRecovery(&nothing));
+  CHECK(nothing.valid.empty());
 }
 
 // (8) The budget across incarnations. Every process start gets a fresh
@@ -1296,7 +1332,7 @@ int main() {
   TestALockOnAnUnlinkedFileIsTakenAgain();
   TestAReplacedLockFileLeavesTheDirectoryOwned();
   TestANewDirectoryAppearsWithItsLockHeld();
-  TestAnAdoptersListingStopsOnACancel();
+  TestAnAdopterRecoversADeadSpoolAPackAtATime();
   TestTheDirectoryLayout();
   TestDeadSiblingsCountAgainstTheBudget();
   if (g_failures != 0) {

@@ -118,6 +118,14 @@ struct StagedPack {
   uint64_t object_bytes = 0;
 };
 
+// A recovery in steps (Spool::BeginRecovery): the ready packs it listed,
+// sorted, how many of them it has validated, and those that were valid.
+struct SpoolRecovery {
+  std::vector<std::string> listed;
+  size_t next = 0;
+  std::vector<StagedPack> valid;
+};
+
 struct SpoolSnapshot {
   uint64_t entries = 0;
   uint64_t bytes = 0;
@@ -354,13 +362,19 @@ class Spool {
   // lock keeps other processes out; writers in this process sharing it
   // (kHeldByCaller) are the caller's to order.
   SpoolStatus Recover(std::vector<StagedPack>* out, std::string* error);
-  // The same, but its validation stops between packs once `cancel` is
-  // cancelled, as ListPending's does: *cut then says so and *out is empty.
-  // The .open files are swept by then, and the account is left as it was.
-  // For an adopter's listing of a dead spool, whose backlog it would
-  // otherwise hash whole before a stop could take effect.
-  SpoolStatus Recover(std::vector<StagedPack>* out, std::string* error,
-                      const Cancellation* cancel, bool* cut);
+  // Recover() a pack at a time, for an adopter's recovery of a dead spool:
+  // Recover() hashes every byte of a dead backlog in one call, and whatever
+  // waits for the adopter -- a stop(), a flush() behind its cycle -- waits
+  // for all of it. BeginRecovery() is Recover()'s sweep of the .open files
+  // and its listing of the ready packs, and hashes none of them. Each
+  // ContinueRecovery() then validates the next pack listed, quarantining
+  // one that fails as Recover() does; once none is left it rebuilds the
+  // account as Recover() does and returns true, recovery->valid then the
+  // packs Recover() would have listed. The account is left as it was
+  // until then. Nothing else may validate or remove this spool's packs
+  // meanwhile.
+  SpoolStatus BeginRecovery(SpoolRecovery* recovery, std::string* error);
+  bool ContinueRecovery(SpoolRecovery* recovery);
 
   // Validate and list ready packs without deleting in-progress writes.
   SpoolStatus ListPending(std::vector<StagedPack>* out, std::string* error);
@@ -390,6 +404,18 @@ class Spool {
   SpoolStatus Scan(std::vector<StagedPack>* out, bool discard_open_files,
                   std::string* error, const Cancellation* cancel = nullptr,
                   bool* cut = nullptr);
+  // A scan's parts. The walk: every ready path, sorted, into *readies;
+  // the .open files this object is not writing deleted (discard_open_files)
+  // or their bytes added to *open_bytes. The validation of one listed ready
+  // path: true with *out filled when its name parses and its size and
+  // sha256 match, and otherwise it is quarantined. And the account rebuilt
+  // from a whole listing's valid packs. `mutex_` must be held for each.
+  void ListReadyLocked(bool discard_open_files,
+                       std::vector<std::string>* readies,
+                       uint64_t* open_bytes);
+  bool ValidateReadyLocked(const std::string& path, StagedPack* out);
+  void CommitListingLocked(const std::vector<StagedPack>& valid,
+                           uint64_t open_bytes);
   // Count/uncount one ready path in the committed account, at most once each
   // -- Python's _account_ready_locked / _unaccount_ready_locked. `mutex_`
   // must be held. Both return whether they actually changed the account.

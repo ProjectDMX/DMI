@@ -1757,9 +1757,27 @@ SpoolStatus Spool::Recover(std::vector<StagedPack>* out, std::string* error) {
   return Scan(out, true, error);
 }
 
-SpoolStatus Spool::Recover(std::vector<StagedPack>* out, std::string* error,
-                           const Cancellation* cancel, bool* cut) {
-  return Scan(out, true, error, cancel, cut);
+SpoolStatus Spool::BeginRecovery(SpoolRecovery* recovery, std::string* error) {
+  *recovery = SpoolRecovery{};
+  std::lock_guard<std::mutex> lock(mutex_);
+  uint64_t open_bytes = 0;  // stays 0: every .open file is swept
+  ListReadyLocked(true, &recovery->listed, &open_bytes);
+  (void)error;
+  return SpoolStatus::kOk;
+}
+
+bool Spool::ContinueRecovery(SpoolRecovery* recovery) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (recovery->next < recovery->listed.size()) {
+    StagedPack staged;
+    if (ValidateReadyLocked(recovery->listed[recovery->next], &staged)) {
+      recovery->valid.push_back(std::move(staged));
+    }
+    ++recovery->next;
+  }
+  if (recovery->next < recovery->listed.size()) return false;
+  CommitListingLocked(recovery->valid, 0);
+  return true;
 }
 
 SpoolStatus Spool::ListPending(std::vector<StagedPack>* out, std::string* error) {
@@ -1777,10 +1795,29 @@ SpoolStatus Spool::Scan(std::vector<StagedPack>* out, bool discard_open_files,
   out->clear();
   if (cut) *cut = false;
   std::lock_guard<std::mutex> lock(mutex_);
-  std::error_code ec;
   std::vector<std::string> readies;
-  uint64_t bytes = 0;
-  std::unordered_map<std::string, uint64_t> seen_ready;
+  uint64_t open_bytes = 0;
+  ListReadyLocked(discard_open_files, &readies, &open_bytes);
+  for (const std::string& path : readies) {
+    if (cancel != nullptr && cancel->cancelled()) {
+      // Before the next pack's hash. The account below is rebuilt from a
+      // whole listing only; quarantines already made stand.
+      out->clear();
+      if (cut) *cut = true;
+      return SpoolStatus::kOk;
+    }
+    StagedPack staged;
+    if (ValidateReadyLocked(path, &staged)) out->push_back(std::move(staged));
+  }
+  CommitListingLocked(*out, open_bytes);
+  (void)error;
+  return SpoolStatus::kOk;
+}
+
+void Spool::ListReadyLocked(bool discard_open_files,
+                            std::vector<std::string>* readies,
+                            uint64_t* open_bytes) {
+  std::error_code ec;
   for (auto it = fs::recursive_directory_iterator(root_, ec);
        it != fs::recursive_directory_iterator(); ++it) {
     if (AtSkippedDirectory(it)) {
@@ -1799,65 +1836,65 @@ SpoolStatus Spool::Scan(std::vector<StagedPack>* out, bool discard_open_files,
         FsyncDir(entry.path().parent_path().string(), nullptr);
       } else {
         const uint64_t size = entry.file_size(ec);
-        if (!ec) bytes += size;
+        if (!ec) *open_bytes += size;
         ec.clear();  // Another writer may have just committed its temp.
       }
       continue;
     }
     if (HasSuffix(name, kReadySuffix)) {
-      readies.push_back(path);
+      readies->push_back(path);
     }
   }
-  std::sort(readies.begin(), readies.end());
-  for (const std::string& path : readies) {
-    if (cancel != nullptr && cancel->cancelled()) {
-      // Before the next pack's hash. The account below is rebuilt from a
-      // whole listing only; quarantines already made stand.
-      out->clear();
-      if (cut) *cut = true;
-      return SpoolStatus::kOk;
-    }
-    const std::string name = fs::path(path).filename().string();
-    std::string id, sum;
-    uint64_t created = 0, records = 0;
-    const uint64_t size = fs::file_size(path, ec);
-    if (!ParseReadyName(name, &id, &created, &records, &sum) || ec ||
-        Sha256HexFile(path, nullptr) != sum) {
-      // Quarantine: keep the bytes, drop the .ready suffix.
-      const std::string target = path.substr(0, path.size() - 6) +
-                                 ".quarantined";
-      ::rename(path.c_str(), target.c_str());
-      FsyncDir(fs::path(path).parent_path().string(), nullptr);
-      ++generation_;
-      continue;
-    }
-    const std::string rel = fs::relative(path, root_, ec).string();
-    const size_t slash = rel.rfind('/');
-    const std::string parent = (slash == std::string::npos) ? "" : rel.substr(0, slash);
-    StagedPack staged;
-    staged.pack_id = id;
-    staged.created_at_ns = created;
-    staged.record_count = records;
-    staged.checksum = sum;
-    staged.object_key = (parent.empty() ? "" : parent + "/") + id + ".dmi-pack";
-    staged.path = path;
-    staged.object_bytes = size;
-    out->push_back(std::move(staged));
-    bytes += size;
-    seen_ready.emplace(path, size);
+  std::sort(readies->begin(), readies->end());
+}
+
+bool Spool::ValidateReadyLocked(const std::string& path, StagedPack* out) {
+  std::error_code ec;
+  const std::string name = fs::path(path).filename().string();
+  std::string id, sum;
+  uint64_t created = 0, records = 0;
+  const uint64_t size = fs::file_size(path, ec);
+  if (!ParseReadyName(name, &id, &created, &records, &sum) || ec ||
+      Sha256HexFile(path, nullptr) != sum) {
+    // Quarantine: keep the bytes, drop the .ready suffix.
+    const std::string target = path.substr(0, path.size() - 6) +
+                               ".quarantined";
+    ::rename(path.c_str(), target.c_str());
+    FsyncDir(fs::path(path).parent_path().string(), nullptr);
+    ++generation_;
+    return false;
   }
+  const std::string rel = fs::relative(path, root_, ec).string();
+  const size_t slash = rel.rfind('/');
+  const std::string parent = (slash == std::string::npos) ? "" : rel.substr(0, slash);
+  out->pack_id = id;
+  out->created_at_ns = created;
+  out->record_count = records;
+  out->checksum = sum;
+  out->object_key = (parent.empty() ? "" : parent + "/") + id + ".dmi-pack";
+  out->path = path;
+  out->object_bytes = size;
+  return true;
+}
+
+void Spool::CommitListingLocked(const std::vector<StagedPack>& valid,
+                                uint64_t open_bytes) {
   // Recovery rebuilds the committed account only; a stage in flight on
   // another thread keeps its reservation. The path ledger is rebuilt with
   // it (_commit_recovery_locked does the same), so the surviving entries are
   // exactly the ones a later retry will recognise as already counted, and
   // the quarantined ones are simply absent.
+  uint64_t bytes = open_bytes;
+  std::unordered_map<std::string, uint64_t> seen_ready;
+  for (const StagedPack& staged : valid) {
+    bytes += staged.object_bytes;
+    seen_ready.emplace(staged.path, staged.object_bytes);
+  }
   committed_bytes_ = bytes;
-  committed_entries_ = out->size();
+  committed_entries_ = valid.size();
   accounted_ready_ = std::move(seen_ready);
   peak_bytes_ = std::max(peak_bytes_, committed_bytes_ + reserved_bytes_);
   ++generation_;
-  (void)error;
-  return SpoolStatus::kOk;
 }
 
 SpoolStatus Spool::Remove(const StagedPack& staged, std::string* error) {
