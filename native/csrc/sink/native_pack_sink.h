@@ -10,6 +10,7 @@
 #ifndef DMI_SINK_NATIVE_PACK_SINK_H_
 #define DMI_SINK_NATIVE_PACK_SINK_H_
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -66,9 +67,22 @@ class NativePackSink final : public ring::RecordSink {
   PackSink& sink_for_testing() { return *sink_; }
   const std::string& layout() const { return layout_; }
   Duration release_flush_timeout() const { return release_flush_timeout_; }
+  // Whether the sink can no longer write its spool: its engine released it
+  // and the release backstop's flush went through. A released sink admits
+  // nothing, so once that flush has persisted everything admitted, no stage
+  // is left to come -- not from its stagers, its linger, or its destructor.
+  // False while attached (and from a new engine's acquire on), after a
+  // release whose flush failed or timed out, and when the backstop is off
+  // (release_flush_timeout zero): a stage may then still be on its way.
+  // The engine lets go of the spool directory's owner lock only on true.
+  bool sealed_on_release() const {
+    return sealed_on_release_.load(std::memory_order_acquire);
+  }
 
  protected:
-  void on_engine_acquire() override {}
+  void on_engine_acquire() override {
+    sealed_on_release_.store(false, std::memory_order_release);
+  }
   // The backstop for a ring that stops without a flush: RingEngine::stop
   // drains its record worker into submit() and then releases the sink, and
   // until a flush seals it the open pack is only in memory -- for up to
@@ -80,7 +94,8 @@ class NativePackSink final : public ring::RecordSink {
   // times out writes one line to stderr, and that line is the only report
   // of a timeout. A pipeline failure also counts in snapshot()["failures"];
   // rethrow_if_failed reports it only once the sink is attached again,
-  // since a released sink refuses the call as not attached.
+  // since a released sink refuses the call as not attached. Whether the
+  // flush went through is sealed_on_release().
   void on_engine_release() noexcept override;
 
  private:
@@ -91,6 +106,7 @@ class NativePackSink final : public ring::RecordSink {
   std::unique_ptr<PackSink> sink_;
   const std::string layout_;
   const Duration release_flush_timeout_;
+  std::atomic<bool> sealed_on_release_{false};
   // Counters at construction. Losses are judged against it, as the
   // reference adapter judges them against its pipeline's baseline.
   SinkSnapshot baseline_;

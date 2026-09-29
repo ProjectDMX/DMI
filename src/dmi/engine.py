@@ -837,6 +837,7 @@ class MonitoringEngine:
             drain_deadline = None if storage is None else (
                 time.monotonic()
                 + self._capture_storage_config.close_flush_timeout_s)
+            old_record_sink = self._record_sink
             sealed = storage is not None and self._seal_capture_sink(
                 drain_deadline)
             if old_record_mode:
@@ -850,6 +851,9 @@ class MonitoringEngine:
                     # A record sink remains leased while its worker may still
                     # call it. Preserve the transport so shutdown can retry.
                     raise
+            if storage is not None:
+                sealed = self._sink_sealed_after_release(old_record_sink,
+                                                         sealed)
             try:
                 _rt.deactivate()
             except Exception:
@@ -918,6 +922,25 @@ class MonitoringEngine:
             return False
         return True
 
+    @staticmethod
+    def _sink_sealed_after_release(sink: Any, sealed_before_stop: bool) -> bool:
+        """Whether nothing can still stage into the spool, the ring stopped.
+
+        Stopping the ring released the sink, and the native pack sink's
+        release backstop flushed it then; ``sealed_on_release`` says whether
+        that went through, and a released sink admits nothing more. It
+        decides either way: it seals a sink whose flush before the stop ran
+        out of close()'s budget, and a sink it did not get through -- one
+        wedged since that flush, holding what the stopping ring drained into
+        it, or with the backstop off -- may still stage, whatever that flush
+        said. A sink that does not say is judged by the flush before the
+        stop.
+        """
+        released = getattr(sink, "sealed_on_release", None)
+        if released is None:
+            return sealed_before_stop
+        return bool(released)
+
     def _retire_capture_storage(self, storage: Any, deadline: float, *,
                                 sink_sealed: bool) -> None:
         """Drain the storage service until ``deadline``, then stop it."""
@@ -938,8 +961,9 @@ class MonitoringEngine:
                 storage.stop()
             finally:
                 # Last: the ring is stopped by now, and the service has
-                # stopped touching the directory. The sink is let go of only
-                # if it sealed.
+                # stopped touching the directory. The directory is let go of
+                # only if the sink can stage no more
+                # (_sink_sealed_after_release).
                 if sink_sealed:
                     self._release_spool_claim()
                 else:
@@ -979,7 +1003,9 @@ class MonitoringEngine:
         ``NativeCaptureStorageConfig.close_flush_timeout_s`` says by how
         much. What does not drain in time is logged, not raised, and stays
         where the next start recovers it; ``flush_and_wait`` is the call
-        that raises.
+        that raises. The spool directory's owner lock goes last, and only
+        once the sink can stage no more -- its release backstop went
+        through; otherwise this process keeps the directory until it exits.
         """
 
         storage = self._capture_storage
@@ -988,10 +1014,11 @@ class MonitoringEngine:
         drain_deadline = None if storage is None else (
             time.monotonic() + self._capture_storage_config.close_flush_timeout_s)
         # Whether nothing can still stage into the spool: no record sink to
-        # seal, or one whose seal went through.
+        # seal, or one sealed by its flush or by its release from the ring.
         sealed = True
         if self._ring_transport is not None:
             record_mode = self._record_mode
+            record_sink = self._record_sink
             stopped = False
             # Best-effort reset of the device-global native null flag.  This is
             # needed only after callers explicitly disabled capture; the normal
@@ -1016,6 +1043,8 @@ class MonitoringEngine:
             # alive. Leave the state intact so close can be retried.
             if record_mode and not stopped:
                 return
+            if record_mode and storage is not None:
+                sealed = self._sink_sealed_after_release(record_sink, sealed)
             try:
                 _rt = _ring_module()
                 _rt.deactivate()

@@ -299,6 +299,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           [](const dmi_sink::NativePackSink& self) {
             return std::string(OverloadName(self.sink().config().overload));
           })
+      // Released by its engine, and the release backstop's flush went
+      // through: nothing the sink holds can still reach the spool.
+      .def_property_readonly("sealed_on_release",
+                             &dmi_sink::NativePackSink::sealed_on_release)
       .def_property_readonly(
           "release_flush_timeout_s",
           [](const dmi_sink::NativePackSink& self) {

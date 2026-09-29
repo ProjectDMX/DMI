@@ -834,6 +834,65 @@ def test_close_still_stops_when_the_sink_flush_fails(monkeypatch, tmp_path,
     assert "stays owned" in caplog.text
 
 
+def test_close_keeps_the_lock_when_the_release_backstop_did_not_seal(
+        monkeypatch, tmp_path, caplog):
+    """The sink's flush went through, but the ring stopping drains what it
+    still queued into the sink, and the release backstop that stages it
+    timed out (sealed_on_release false): a stage is still on its way into
+    the directory, so the lock stays, as for a sink that never sealed."""
+    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
+    engine.create_record_runtime(_record_format())
+    engine._record_sink.sealed_on_release = False
+    (lock,) = engine._test_locks
+    events.clear()
+
+    with caplog.at_level("WARNING", logger="dmi.engine"):
+        engine.close()
+
+    assert [event[:2] for event in events] == [
+        ("sink", "flush"), ("ring", "stop"),
+        ("service", "flush"), ("service", "stop")]
+    assert lock.held
+    assert "stays owned" in caplog.text
+
+
+def test_close_releases_the_lock_once_the_release_backstop_sealed_the_sink(
+        monkeypatch, tmp_path):
+    """The sink's flush ran out of close()'s budget, but its release from
+    the stopping ring flushed it (sealed_on_release true), and a released
+    sink admits nothing more: nothing can stage into the directory, so the
+    lock goes, as for a sink whose flush went through."""
+    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
+    engine.create_record_runtime(_record_format())
+    _fail_the_sink_flush(engine, events)
+    engine._record_sink.sealed_on_release = True
+    (lock,) = engine._test_locks
+    events.clear()
+
+    engine.close()
+
+    assert [event[:2] for event in events] == [
+        ("sink", "flush"), ("ring", "stop"),
+        ("service", "flush"), ("service", "stop"), ("lock", "release")]
+    assert not lock.held
+
+
+def test_replacing_a_record_ring_asks_the_released_sink_whether_it_sealed(
+        monkeypatch, tmp_path):
+    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
+    engine.create_record_runtime(_record_format())
+    engine._record_sink.sealed_on_release = False
+    (lock,) = engine._test_locks
+    events.clear()
+
+    engine.enable_ring_transport(object())
+
+    assert [event[:2] for event in events] == [
+        ("sink", "flush"), ("ring", "stop"),
+        ("service", "flush"), ("service", "stop"), ("ring", "create")]
+    assert lock.held
+
+
 def test_replacing_a_record_ring_keeps_the_lock_when_the_sink_did_not_seal(
         monkeypatch, tmp_path):
     engine, events, _services = _capture_engine(monkeypatch, tmp_path)
