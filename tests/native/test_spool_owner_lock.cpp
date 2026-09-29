@@ -9,7 +9,8 @@
 //      lock.
 //   3. A second process is refused, told the holder's pid and host; the
 //      lock goes with its holder, even one killed with SIGKILL.
-//   4. Nesting: a directory under, or containing, an owned one is refused.
+//   4. Nesting: a directory under a HELD one, or containing one with a lock
+//      file, is refused -- also when two processes take the pair at once.
 //   5. The node-local check refuses NFS and Lustre by statfs f_type, unless
 //      explicitly allowed (a test seam stands in for statfs).
 //   6. Adoption's try-lock never creates a directory, and a released
@@ -276,6 +277,104 @@ void TestNestedDirectoriesAreRefused() {
   Spool spool;
   CHECK(Spool::Open({base + "/other", 1 << 20}, &spool, &error) ==
         SpoolStatus::kBadArgument);
+  // A refused take leaves nothing of its own behind: not the directory it
+  // created, nor a lock file it added to one that existed.
+  CHECK(!fs::exists(base + "/outer/inner"));
+  CHECK(!fs::exists(base + "/other/.owner.lock"));
+}
+
+// (4b) An outer directory and one nested in it, taken at the same moment by
+// two processes: each checks the other's lock only after publishing its
+// own, so at most one of them wins. Checked first and locked second, both
+// won most of the time (275 of 300 in the review's probe).
+void TestAnOuterAndANestedTakeRacingNeverBothWin() {
+  const std::string base = FreshRoot("nest-race");
+  int both = 0;
+  int outer_won = 0;
+  int inner_won = 0;
+  for (int trial = 0; trial < 200; ++trial) {
+    const std::string outer = base + "/t" + std::to_string(trial);
+    const std::string inner = outer + "/0123456789ab/r0-0a1b2c3d";
+    if (trial % 2 == 0) fs::create_directories(outer);
+    int go[2], report[2], done[2];
+    CHECK(::pipe(go) == 0 && ::pipe(report) == 0 && ::pipe(done) == 0);
+    pid_t children[2];
+    for (int side = 0; side < 2; ++side) {
+      children[side] = ::fork();
+      if (children[side] == 0) {
+        ::close(go[1]);
+        ::close(report[0]);
+        ::close(done[1]);
+        char byte = 0;
+        (void)!::read(go[0], &byte, 1);  // EOF: the parent let both go
+        SpoolOwnerLock lock;
+        std::string error;
+        const bool won =
+            SpoolOwnerLock::Acquire(side == 0 ? outer : inner, false, &lock,
+                                    &error) == SpoolStatus::kOk;
+        byte = static_cast<char>(side == 0 ? (won ? 'O' : 'o')
+                                           : (won ? 'I' : 'i'));
+        if (::write(report[1], &byte, 1) != 1) ::_exit(3);
+        (void)!::read(done[0], &byte, 1);  // hold it until both reported
+        ::_exit(0);
+      }
+    }
+    ::close(go[0]);
+    ::close(report[1]);
+    ::close(done[0]);
+    ::close(go[1]);
+    char results[2] = {0, 0};
+    CHECK(::read(report[0], &results[0], 1) == 1);
+    CHECK(::read(report[0], &results[1], 1) == 1);
+    const std::string seen(results, 2);
+    const bool o = seen.find('O') != std::string::npos;
+    const bool i = seen.find('I') != std::string::npos;
+    if (o && i) ++both;
+    if (o) ++outer_won;
+    if (i) ++inner_won;
+    ::close(done[1]);
+    ::close(report[0]);
+    for (const pid_t child : children) {
+      int status = 0;
+      ::waitpid(child, &status, 0);
+    }
+  }
+  if (both != 0) {
+    std::cerr << "outer and nested both acquired in " << both
+              << " of 200 trials\n";
+  }
+  CHECK(both == 0);
+  CHECK(outer_won + inner_won > 0);
+}
+
+// (4c) An ancestor refuses only while its lock is HELD. A lock file nobody
+// holds is a spool that was -- every take leaves its file behind -- and
+// refusing on it kept a spool_root that a sink-only run once owned from
+// ever holding rank directories. Whoever takes the outer directory next
+// meets the inner one's lock file below it and is refused, held or not.
+void TestAStaleLockFileAboveDoesNotRefuseANestedDirectory() {
+  const std::string base = FreshRoot("stale-above");
+  std::string error;
+  {
+    SpoolOwnerLock once;
+    CHECK(SpoolOwnerLock::Acquire(base + "/root", false, &once, &error) ==
+          SpoolStatus::kOk);
+  }
+  CHECK(fs::exists(base + "/root/.owner.lock"));
+  SpoolOwnerLock inner;
+  error.clear();
+  CHECK(SpoolOwnerLock::Acquire(base + "/root/0123456789ab/r0-0a1b2c3d",
+                                false, &inner, &error) == SpoolStatus::kOk);
+  CHECK(error.empty());
+  SpoolOwnerLock outer;
+  CHECK(SpoolOwnerLock::Acquire(base + "/root", false, &outer, &error) ==
+        SpoolStatus::kBadArgument);
+  CHECK(Contains(error, "contains"));
+  inner.Release();  // its lock file stays: still refused
+  error.clear();
+  CHECK(SpoolOwnerLock::Acquire(base + "/root", false, &outer, &error) ==
+        SpoolStatus::kBadArgument);
+  CHECK(Contains(error, "contains"));
 }
 
 // (5) The node-local check, through the test seam.
@@ -419,6 +518,8 @@ int main() {
   TestTheLockGoesWithItsSpool();
   TestASecondProcessIsRefusedUntilTheHolderDies();
   TestNestedDirectoriesAreRefused();
+  TestAnOuterAndANestedTakeRacingNeverBothWin();
+  TestAStaleLockFileAboveDoesNotRefuseANestedDirectory();
   TestSharedFilesystemsAreRefusedUnlessAllowed();
   TestAdoptionLocksOnlyWhatExistsAndIsDead();
   TestANewDirectoryAppearsWithItsLockHeld();

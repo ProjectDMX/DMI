@@ -355,26 +355,38 @@ std::string CanonicalPath(const std::string& path, std::string* error) {
 }
 
 // A spool directory must not be nested under, or contain, another owned
-// directory -- one with a lock file, held or not: Scan walks recursively,
-// so the outer spool's Recover would sweep the inner one's .open files and
-// upload its packs under the outer spool's keys.
-SpoolStatus CheckNotNested(const std::string& dir, bool exists,
-                           std::string* error) {
+// directory: Scan walks recursively, so the outer spool's Recover would
+// sweep the inner one's .open files and upload its packs under the outer
+// spool's keys. Run AFTER `dir`'s own lock is taken, so that of two takes
+// racing on an outer directory and one inside it, at least one sees the
+// other: each publishes its lock before it looks.
+//   - An ancestor refuses while its lock is HELD. A lock file nobody holds
+//     is a spool that was (every take leaves its file behind); whoever
+//     takes that ancestor next meets this directory's lock file in its own
+//     descendant walk, and is refused.
+//   - A descendant refuses when it has a lock file at all, held or not: a
+//     dead directory's packs are its successor's to adopt, not this
+//     spool's to sweep and upload under its own keys.
+SpoolStatus CheckNotNested(const std::string& dir, std::string* error) {
   fs::path ancestor(dir);
   while (ancestor.has_parent_path() && ancestor.parent_path() != ancestor) {
     ancestor = ancestor.parent_path();
     std::error_code ec;
-    if (fs::exists(ancestor / kOwnerLockFile, ec)) {
+    SpoolOwner owner;
+    if (fs::exists(ancestor / kOwnerLockFile, ec) &&
+        ReadSpoolOwner(ancestor.string(), &owner)) {
       if (error) {
-        *error = "spool directory " + dir + " is nested under the owned "
-                 "spool directory " + ancestor.string() + " (it has " +
-                 kOwnerLockFile + "), whose recovery would sweep this one; "
-                 "use a directory outside it";
+        *error = "spool directory " + dir + " is nested under the spool "
+                 "directory " + ancestor.string() + ", which " +
+                 (owner.pid > 0 ? "pid " + std::to_string(owner.pid) +
+                                      " on host " + owner.host
+                                : std::string("another owner")) +
+                 " holds (" + kOwnerLockFile + "), and whose recovery "
+                 "would sweep this one; use a directory outside it";
       }
       return SpoolStatus::kBadArgument;
     }
   }
-  if (!exists) return SpoolStatus::kOk;
   std::error_code ec;
   for (auto it = fs::recursive_directory_iterator(
            dir, fs::directory_options::skip_permission_denied, ec);
@@ -681,14 +693,28 @@ SpoolStatus SpoolOwnerLock::Acquire(const std::string& dir,
       CheckNodeLocal(exists ? canonical : parent, allow_shared_filesystem,
                      error);
   if (status != SpoolStatus::kOk) return status;
-  status = CheckNotNested(canonical, exists, error);
-  if (status != SpoolStatus::kOk) return status;
+  const std::string lock_file = canonical + "/" + kOwnerLockFile;
+  const bool had_lock_file = exists && fs::exists(lock_file, ec);
   int fd = -1;
   status = exists ? LockInPlace(canonical, &fd, error)
                   : CreateLocked(canonical, &fd, error);
   if (status != SpoolStatus::kOk) return status;
   out->fd_ = fd;
   out->dir_ = canonical;
+  // Only now, with this lock published: see CheckNotNested.
+  status = CheckNotNested(canonical, error);
+  if (status != SpoolStatus::kOk) {
+    // Leave nothing of this take behind: the directory it created (while
+    // it is still empty), or the lock file it added to one that existed.
+    if (!exists) {
+      std::string ignored;
+      out->ReleaseAndRemoveIfEmpty(&ignored);
+    } else {
+      if (!had_lock_file) ::unlink(lock_file.c_str());
+      out->Release();
+    }
+    return status;
+  }
   return SpoolStatus::kOk;
 }
 

@@ -7,8 +7,9 @@ when it opens a directory with ``owner_lock="take"`` (the default), and a
 second process that tries is refused, told who holds it. What that lock
 must also refuse, and what it must leave alone:
 
-* a directory nested under, or containing, an owned directory: Scan walks
-  recursively, so the outer spool's cleanup would reach into the inner one;
+* a directory nested under a held one, or containing one with a lock file:
+  Scan walks recursively, so the outer spool's cleanup would reach into the
+  inner one;
 * ``owner_lock="held_by_caller"`` unless THIS process holds the lock: that
   mode opens without a lock of its own, for a second Spool in the process
   that holds one. Beside another process's lock it is refused, naming the
@@ -156,16 +157,21 @@ def test_a_directory_containing_an_owned_one_is_refused(tmp_path):
         holder.close()
 
 
-def test_a_stale_lock_file_still_marks_an_owned_directory(tmp_path):
-    """Nesting is judged by the lock FILE, not by a live holder: an outer
-    directory some spool once owned is still a spool directory, and the
-    next process to open it would sweep the inner one."""
+def test_a_stale_lock_file_above_does_not_refuse_a_nested_directory(tmp_path):
+    """Above, only a HELD lock refuses: every take leaves its lock file
+    behind, so a spool_root some spool once owned would otherwise refuse
+    every directory under it for good. Below, the lock FILE refuses, held
+    or not: a dead directory's packs are for its successor to adopt, not
+    for the outer spool to sweep and upload under its own keys -- so the
+    next process to take the outer directory is refused."""
     outer = tmp_path / "spool"
     assert _spool(op="recover", root=str(outer))["ok"]
     assert (outer / ".owner.lock").exists()
-    response = _spool(op="recover", root=str(outer / "inner"))
+    assert _spool(op="recover", root=str(outer / "inner"))["ok"]
+    assert (outer / "inner" / ".owner.lock").exists()
+    response = _spool(op="recover", root=str(outer))
     assert not response["ok"], response
-    assert "nested" in response["what"], response
+    assert "contains" in response["what"], response
 
 
 def test_held_by_caller_is_refused_beside_another_processs_holder(tmp_path):

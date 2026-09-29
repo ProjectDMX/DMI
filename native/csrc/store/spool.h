@@ -30,9 +30,14 @@
 //     naming the holder, beside another process's lock, and kBadArgument
 //     when nothing holds it. Standalone callers -- the drivers, adoption --
 //     take.
-// A directory nested under, or containing, an owned directory (one with a
-// .owner.lock file, held or not) is refused: Scan walks recursively, so the
-// outer spool's Recover would reach into the inner one. <root>/_refs/ is
+// A directory nested under a HELD spool directory, or containing one with
+// a .owner.lock file (held or not: a dead directory's packs are for its
+// successor to adopt), is refused: Scan walks recursively, so the outer
+// spool's Recover would reach into the inner one. An unheld lock file
+// ABOVE refuses nothing -- every take leaves its file behind -- since the
+// next take of that directory meets this one's lock file below it. The
+// check runs after the lock is taken, so of two processes taking an outer
+// and a nested directory at once, at least one is refused. <root>/_refs/ is
 // never scanned: the upload handoff's ref files live there (plan section
 // 2.4). The spool must be node-local: NFS and Lustre are refused by statfs
 // f_type unless allow_shared_filesystem is set, since neither guarantees a
@@ -163,7 +168,8 @@ class SpoolOwnerLock {
   // parent ever meets the directory before its owner holds it -- and records
   // this host and pid in it. kOwned, naming the holder, when another holder
   // has it; kBadArgument for a shared filesystem or a directory nested
-  // under, or containing, an owned one.
+  // under, or containing, an owned one (see above), after letting go of
+  // the lock and of whatever this call created.
   static SpoolStatus Acquire(const std::string& dir,
                              bool allow_shared_filesystem,
                              SpoolOwnerLock* out, std::string* error);

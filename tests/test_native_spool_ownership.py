@@ -192,6 +192,27 @@ def test_a_nested_spool_directory_is_refused(tmp_path):
             _service(_config(), tmp_path / "outer" / "inner")
 
 
+def test_a_spool_root_a_sink_once_owned_still_takes_rank_directories(tmp_path):
+    """A sink-only run (or the explicit-record_sink rollback) takes
+    spool_root itself and leaves its lock file there. The next default run
+    claims a rank directory under it, which that unheld lock file must not
+    refuse as nested."""
+    from dmi.storage.native_capture import (
+        NativeSinkConfig, claim_spool_directory,
+    )
+
+    root = tmp_path / "root"
+    _store().SpoolOwnerLock(str(root)).release()
+    assert (root / ".owner.lock").exists()
+    claim = claim_spool_directory(NativeSinkConfig(spool_root=str(root)),
+                                  _config())
+    try:
+        assert claim.held
+        assert Path(claim.directory).parent.parent == root
+    finally:
+        claim.release()
+
+
 def test_a_shared_filesystem_is_refused_unless_allowed(tmp_path):
     store = _store()
     store._set_spool_filesystem_type_for_testing(NFS_SUPER_MAGIC)
