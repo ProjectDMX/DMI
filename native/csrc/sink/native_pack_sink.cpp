@@ -264,8 +264,9 @@ void NativePackSink::on_engine_release() noexcept {
     const bool flushed = sink_->Flush(
         std::chrono::duration<double>(release_flush_timeout_).count(), &error);
     if (flushed) return;
-    // A latched failure is rethrown by rethrow_if_failed; this line says
-    // what became of the open pack, which nothing else will.
+    // Once released, rethrow_if_failed refuses the sink as not attached,
+    // and a timeout latches nothing: this line is what says what became of
+    // the open pack (a failure also counts in the snapshot's failures).
     const std::string why =
         error.empty() ? "timed out after " +
                             std::to_string(release_flush_timeout_.count()) +

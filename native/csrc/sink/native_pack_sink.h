@@ -70,10 +70,14 @@ class NativePackSink final : public ring::RecordSink {
   // drains its record worker into submit() and then releases the sink, and
   // until a flush seals it the open pack is only in memory -- for up to
   // max_linger_ns, or until this object dies. So the release flushes,
-  // bounded by release_flush_timeout, and the open pack reaches the spool
-  // as one .ready file. It cannot throw (it runs in RingEngine::stop and
-  // its destructor): a flush that fails or times out writes one line to
-  // stderr, and the failure stays latched for rethrow_if_failed.
+  // bounded by release_flush_timeout -- a flush_and_wait in flight on
+  // another thread included, which it waits for only that long -- and the
+  // open pack reaches the spool as one .ready file. It cannot throw (it
+  // runs in RingEngine::stop and its destructor): a flush that fails or
+  // times out writes one line to stderr, and that line is the only report
+  // of a timeout. A pipeline failure also counts in snapshot()["failures"];
+  // rethrow_if_failed reports it only once the sink is attached again,
+  // since a released sink refuses the call as not attached.
   void on_engine_release() noexcept override;
 
  private:

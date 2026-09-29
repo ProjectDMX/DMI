@@ -153,7 +153,8 @@ class PackSink {
 
   // Persist everything admitted before this call. False on timeout; the
   // in-flight barrier is kept for the next call to reuse. timeout_s < 0
-  // waits forever. Error string set on pipeline failure.
+  // waits forever. The timeout covers waiting for a flush already in
+  // flight on another thread too. Error string set on pipeline failure.
   bool Flush(double timeout_s, std::string* error);
   // Terminal close: drains, joins, returns the final snapshot.
   SinkSnapshot Close(double timeout_s, std::string* error);
@@ -212,7 +213,10 @@ class PackSink {
   std::vector<std::thread> workers_;
   std::vector<std::thread> stagers_;
 
-  std::mutex flush_mutex_;
+  // Serialises flushes. Timed: a flush waits for another in flight only
+  // until its own deadline, so a short flush (the release backstop's) is
+  // not held for a long one's (flush_and_wait's).
+  std::timed_mutex flush_mutex_;
   std::shared_ptr<FlushBarrier> pending_;
 
   std::string latched_error_;
