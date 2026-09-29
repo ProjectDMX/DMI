@@ -930,8 +930,9 @@ def test_a_flush_out_of_time_does_not_hash_the_spool(fake_s3, tmp_path):
     listed the spool through the uploader, and a listing re-hashes every
     staged pack: flush(0) -- what flush_and_wait and close() pass once the
     sink's flush has spent the budget -- held its caller for as long as
-    hashing the whole backlog took. It now asks only whether any pack is
-    staged, by name. One sparse 1 GiB pack stands in for a backlog."""
+    hashing the whole backlog took. A listing already cancelled now stops
+    before the first pack's hash. One sparse 1 GiB pack stands in for a
+    backlog."""
     import hashlib
 
     from dmi.storage.native_capture import _load_native_store_extension

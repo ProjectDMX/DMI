@@ -101,12 +101,6 @@ class Spool {
   SpoolStatus ListPending(std::vector<StagedPack>* out, std::string* error,
                           const Cancellation* cancel, bool* cut);
 
-  // Whether any ready pack is on disk, from the file names alone: nothing
-  // is hashed, quarantined or re-accounted, so it costs a directory walk
-  // where ListPending re-hashes every pack. A ready file ListPending would
-  // quarantine still counts.
-  SpoolStatus HasReady(bool* any, std::string* error) const;
-
   // Remove one staged pack after upload (identity + size verified first).
   SpoolStatus Remove(const StagedPack& staged, std::string* error);
 
