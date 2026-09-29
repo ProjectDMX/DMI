@@ -199,11 +199,16 @@ when a drained directory is removed. If the sink did not seal within
 by the process until it exits (a warning names it) and the next process on the
 node adopts it; so does the directory of an engine dropped without `close()`.
 A second process on a directory is
-refused, naming the holder's pid and host. At start the service adopts the
-directories under the same catalog key whose owners have died: their stale
-`.open` files are swept, their ready packs uploaded and indexed, and the
-directory removed, so a crashed process's packs reach the catalog through the
-next one on the node, whatever run it belongs to. `spool_max_bytes` bounds the
+refused, naming the holder's pid and host. Once started, the service's
+background loop adopts the directories under the same catalog key whose owners
+have died: their stale `.open` files are swept, their ready packs uploaded and
+indexed, a round at a time and a slice of each cycle, and the directory
+removed, so a crashed process's packs reach the catalog through the next one on
+the node, whatever run it belongs to. Neither `create_record_runtime` nor
+`flush_and_wait` waits for that: a flush covers this process's records (an
+adopted pack uploaded and not yet indexed is waited for like its own), and the
+storage part of `capture_status()` reports the adoption (`adopted_spools`,
+`adopted_packs`, `adoption_owed`, `live_siblings`). `spool_max_bytes` bounds the
 directory together with what those dead directories still hold (a live
 process's directory is its own budget), so restarts while uploads are blocked
 cannot each add a whole budget; the room comes back as they are adopted. The

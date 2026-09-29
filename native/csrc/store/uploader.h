@@ -91,6 +91,12 @@ class SpoolUploader {
   // uploads nothing — see the comment at the byte gate in uploader.cpp.
   UploadBatchResult UploadPending(int limit = -1);
 
+  // Upload these entries, as UploadPending uploads the ones it lists, in
+  // this order: for a caller that has listed the spool already (adoption
+  // lists a dead spool once, through Recover, and uploads it a round at a
+  // time) and must not pay for another hash of everything it holds.
+  UploadBatchResult UploadEntries(std::vector<StagedPack> entries);
+
   // Upload one staged entry with retry. Public for tests.
   bool UploadOne(const StagedPack& staged, PackRef* ref, int* attempts_out,
                  std::string* error);

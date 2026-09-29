@@ -752,19 +752,6 @@ def test_flush_reports_packs_that_did_not_reach_the_catalog(monkeypatch, tmp_pat
         engine.flush_and_wait(1.0)
 
 
-def test_flush_says_when_a_dead_spool_is_still_to_adopt(monkeypatch, tmp_path):
-    engine, _events, services = _capture_engine(monkeypatch, tmp_path)
-    engine.create_record_runtime(_record_format())
-    services[0].flush_results = [False]
-    services[0].snapshot = lambda: {
-        "pending_index": 0, "adoption_owed": True,
-        "last_error": "adopting dead spool /x: upload failed"}
-
-    with pytest.raises(TimeoutError,
-                       match="dead process's spool still to adopt.*upload"):
-        engine.flush_and_wait(1.0)
-
-
 def test_close_flushes_the_sink_before_the_ring_stops(monkeypatch, tmp_path):
     """The sink's open pack is in memory until a flush seals it, and stopping
     the ring releases the sink without one. So close() flushes the sink

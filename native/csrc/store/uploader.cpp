@@ -235,6 +235,12 @@ UploadBatchResult SpoolUploader::UploadPending(int limit) {
   if (limit != -1 && static_cast<size_t>(limit) < pending.size()) {
     pending.resize(static_cast<size_t>(limit));
   }
+  return UploadEntries(std::move(pending));
+}
+
+UploadBatchResult SpoolUploader::UploadEntries(
+    std::vector<StagedPack> pending) {
+  UploadBatchResult result;
   // Both vectors are positional from the start: sized to the recover()
   // order up front, oversized refusals written into their own slot, and
   // workers below fill the rest by index.

@@ -123,6 +123,8 @@ dc::StorageServiceConfig service_config(const py::dict& d) {
       get<bool>(d, "adopt_sibling_spools", c.adopt_sibling_spools);
   c.adoption_recheck_interval_ns = get<uint64_t>(
       d, "adoption_recheck_interval_ns", c.adoption_recheck_interval_ns);
+  c.adoption_slice_ns =
+      get<uint64_t>(d, "adoption_slice_ns", c.adoption_slice_ns);
   c.s3 = s3_config(d);
   c.uploader.store_id = get<std::string>(d, "store_id", c.uploader.store_id);
   c.uploader.max_workers = get<int>(d, "uploader_max_workers", c.uploader.max_workers);

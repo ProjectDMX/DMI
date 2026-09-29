@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -117,6 +118,17 @@ class CaptureStorageService::LeaseScope {
   RequestDeadline deadline_;  // after lock_: released before it
   std::string held_on_entry_;  // the lease_id held on entry, "" for none
   uint64_t counted_on_entry_ = 0;
+};
+
+// The dead sibling a cycle is adopting, kept across cycles: its owner lock,
+// a Spool on it (held_by_caller, the lock being this service's), and the
+// packs its Recover() swept and validated that are not uploaded yet -- so a
+// backlog is hashed once, however many cycles its upload takes.
+struct CaptureStorageService::Adoption {
+  std::string directory;
+  dmi_store::SpoolOwnerLock lock;
+  dmi_store::Spool spool;
+  std::deque<dmi_store::StagedPack> remaining;
 };
 
 CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
@@ -241,8 +253,10 @@ void CaptureStorageService::start() {
   last_reconcile_ns_ = steady_ns();
 
   {
+    // With siblings to look at, the loop's first cycle runs at once: it,
+    // not start(), adopts them.
     std::lock_guard<std::mutex> lock(wake_mutex_);
-    kick_ = false;
+    kick_ = adoption_scan_owed_;
   }
   {
     LeaseScope lease(this);  // publishes the lease state
@@ -271,25 +285,14 @@ void CaptureStorageService::sweep_and_reconcile_at_start() {
     state_.swept_on_start = recovered.size();
   }
 
-  // Dead siblings next, after this directory's own sweep and before the
-  // reconcile, which then finds their packs committed. Nothing here fails
-  // start(): a sibling left undrained is owed, and the loop retries it.
+  // Dead siblings are the loop's, from its first cycle on: after the lease
+  // and this directory's own sweep, as the plan orders them, but not here,
+  // where a backlog the object store refuses would hold start() -- and
+  // create_record_runtime -- through every pack's retry chain.
   if (config_.adopt_sibling_spools) {
-    try {
-      adopt_siblings();
-    } catch (const CatalogError& exc) {
-      adoption_owed_ = true;
-      record_error(std::string("adopting dead spools at start ") +
-                   (is_lease_refusal(exc) ? "lost the publisher lease: "
-                                          : "failed: ") +
-                   exc.what());
-    } catch (const std::exception& exc) {
-      adoption_owed_ = true;
-      record_error(std::string("adopting dead spools at start failed: ") +
-                   exc.what());
-    }
+    adoption_scan_owed_ = true;
     std::lock_guard<std::mutex> lock(state_mutex_);
-    state_.adoption_owed = adoption_owed_;
+    state_.adoption_owed = true;
   }
 
   // A failed pass is not fatal -- the bucket is still there next time. Nor
@@ -328,6 +331,10 @@ void CaptureStorageService::stop() {
   // lease has to keep renewing until that is done.
   stop_lease_thread();
   std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
+  // A sibling half adopted keeps what is left of it, for the next process
+  // on the node; what was uploaded from it was indexed, or is owed.
+  adopting_.reset();
+  adoption_queue_.clear();
   if (started_) {
     started_ = false;
     // A quarantined writer holds no lease, so it writes no tombstone: the
@@ -372,7 +379,7 @@ bool CaptureStorageService::flush(double timeout_s) {
       if (!cycle.try_lock_until(deadline)) return false;
       if (!started_) throw std::logic_error("storage service: not started");
       rethrow_if_failed();
-      const bool drained = run_cycle().drained;
+      const bool drained = run_cycle(false).drained;
       if (!rejected_unreported_.empty()) {
         std::string message = "storage service: " +
                               std::to_string(rejected_unreported_.size()) +
@@ -417,7 +424,7 @@ void CaptureStorageService::loop() {
       if (failure_) return;  // another publisher holds the catalog
     }
     std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
-    run_cycle();
+    run_cycle(true);
     // poll_interval * 2^streak, capped: flush() shares the streak, so an
     // outage it saw also slows the loop, and a success from either resets it.
     wait_ns = config_.poll_interval_ns;
@@ -429,7 +436,8 @@ void CaptureStorageService::loop() {
   }
 }
 
-CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
+CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
+    bool adopt) {
   CycleOutcome outcome;
   // The catalog phase needs the lease. Without one -- quarantined after an
   // unknown outcome, or refused by another holder -- the cycle uploads
@@ -489,17 +497,14 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
     // 3. Index them.
     index_or_owe(std::move(to_index), catalog);
 
-    // 3a. A dead sibling an earlier adoption pass left undrained, or -- on
-    //     the recheck interval -- a sibling that was alive then and may have
-    //     died since, under the same rule as the uploads above: only with
-    //     the lease, nothing owed and nothing of our own failing.
-    const bool recheck_due =
-        live_siblings_ && config_.adoption_recheck_interval_ns > 0 &&
-        steady_ns() - last_adoption_ns_ >=
-            config_.adoption_recheck_interval_ns;
-    if (catalog && (adoption_owed_ || recheck_due) &&
+    // 3a. The loop's cycles adopt dead siblings, a slice at a time, under
+    //     the same rule as the uploads above: only with the lease, nothing
+    //     owed and nothing of our own failing. flush()'s cycles do not: a
+    //     dead backlog is not this process's records.
+    bool adoption_failed = false;
+    if (adopt && config_.adopt_sibling_spools && catalog &&
         pending_index_.empty() && upload_failures == 0) {
-      adopt_siblings();
+      adoption_failed = !adopt_step();
     }
 
     // 4. Reconcile on its interval, or when the pass at start() lost the
@@ -523,8 +528,10 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
     // would be re-hashed on every cycle of an outage.
     // Without the lease nothing can be confirmed in the catalog, so the
     // cycle is not drained, and it counts towards the backoff.
+    // A dead sibling still to adopt is not a failure, nor undrained: only
+    // an adoption upload that failed backs the loop off.
     outcome.failed = !catalog || upload_failures != 0 ||
-                     !pending_index_.empty() || adoption_owed_;
+                     !pending_index_.empty() || adoption_failed;
     bool nothing_pending = !batch.refs.empty();
     if (batch.refs.empty() && !outcome.failed) {
       std::vector<dmi_store::StagedPack> pending;
@@ -553,7 +560,7 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_.pending_index = pending_index_.size();
-    state_.adoption_owed = adoption_owed_;
+    state_.adoption_owed = adoption_owed();
   }
   failure_streak_ = outcome.failed ? std::min(failure_streak_ + 1, 32) : 0;
   return outcome;
@@ -577,10 +584,61 @@ void CaptureStorageService::index_or_owe(std::vector<PackRefData> refs,
                         unindexed.end());
 }
 
-void CaptureStorageService::adopt_siblings() {
+bool CaptureStorageService::adoption_owed() const {
+  return adoption_scan_owed_ || adopting_ != nullptr ||
+         !adoption_queue_.empty();
+}
+
+bool CaptureStorageService::stop_requested() {
+  std::lock_guard<std::mutex> lock(wake_mutex_);
+  return stop_requested_;
+}
+
+bool CaptureStorageService::adopt_step() {
+  const uint64_t started = steady_ns();
+  if (adopting_ == nullptr && adoption_queue_.empty()) {
+    // Look at the siblings when that is owed (from start() on) or, while
+    // the last look found a live one, again on the recheck interval.
+    const bool recheck_due =
+        live_siblings_ && config_.adoption_recheck_interval_ns > 0 &&
+        started - last_adoption_scan_ns_ >=
+            config_.adoption_recheck_interval_ns;
+    if (!adoption_scan_owed_ && !recheck_due) return true;
+    if (!scan_siblings()) return false;
+  }
+  bool ok = true;
+  while (!stop_requested()) {
+    if (adopting_ == nullptr) {
+      if (adoption_queue_.empty()) break;
+      const std::string next = adoption_queue_.front();
+      adoption_queue_.pop_front();
+      if (!begin_adoption(next)) ok = false;
+      continue;
+    }
+    if (adopting_->remaining.empty()) {
+      finish_adoption();
+      continue;
+    }
+    // The rules of the cycle's uploads, before every round: none without
+    // the lease, and none while an uploaded pack is still owed to the
+    // catalog -- the dead spool is where the rest are durable.
+    bool catalog = false;
+    {
+      LeaseScope lease(this);
+      catalog = writer_.held_lease() != nullptr;
+    }
+    if (!catalog || !pending_index_.empty()) break;
+    if (!upload_adopted_round()) {
+      ok = false;  // the failed packs stay in the dead spool
+      break;
+    }
+    if (steady_ns() - started >= config_.adoption_slice_ns) break;
+  }
+  return ok;
+}
+
+bool CaptureStorageService::scan_siblings() {
   namespace fs = std::filesystem;
-  // Owed until the pass completes: a lost lease propagates from the middle.
-  adoption_owed_ = true;
   const fs::path own(spool_.root());
   std::vector<std::string> siblings;
   std::vector<fs::path> claim_staging;
@@ -607,22 +665,126 @@ void CaptureStorageService::adopt_siblings() {
   if (ec) {
     record_error("adoption: cannot list " + own.parent_path().string() +
                  ": " + ec.message());
-    return;
+    return false;
   }
   clear_dead_claim_staging(claim_staging);
   std::sort(siblings.begin(), siblings.end());
-  bool owed = false;
   uint64_t live = 0;
   for (const std::string& sibling : siblings) {
-    bool alive = false;
-    if (!adopt_sibling(sibling, &alive)) owed = true;
-    if (alive) ++live;
+    // A live owner answers a non-blocking probe at once; TryAdopt would
+    // retry for a few milliseconds first, on every recheck.
+    if (dmi_store::ReadSpoolOwner(sibling, nullptr)) {
+      ++live;
+    } else {
+      adoption_queue_.push_back(sibling);
+    }
   }
-  adoption_owed_ = owed;
+  adoption_scan_owed_ = false;
   live_siblings_ = live != 0;
-  last_adoption_ns_ = steady_ns();
+  last_adoption_scan_ns_ = steady_ns();
   std::lock_guard<std::mutex> state(state_mutex_);
   state_.live_siblings = live;
+  return true;
+}
+
+bool CaptureStorageService::begin_adoption(const std::string& directory) {
+  auto adoption = std::make_unique<Adoption>();
+  adoption->directory = directory;
+  std::string error;
+  const dmi_store::SpoolStatus locked =
+      dmi_store::SpoolOwnerLock::TryAdopt(directory, &adoption->lock, &error);
+  if (locked == dmi_store::SpoolStatus::kOwned) {
+    // Alive after all (taken since the look): its owner's, and not owed.
+    live_siblings_ = true;
+    std::lock_guard<std::mutex> state(state_mutex_);
+    ++state_.live_siblings;
+    return true;
+  }
+  if (locked != dmi_store::SpoolStatus::kOk) {
+    // Another adopter drained and removed it meanwhile: nothing is owed.
+    if (!std::filesystem::exists(directory)) return true;
+    record_error("adopting dead spool " + directory + ": " + error);
+    adoption_scan_owed_ = true;  // look again, after the backoff
+    return false;
+  }
+  dmi_store::SpoolConfig config{directory, config_.spool_max_bytes};
+  config.owner_lock = dmi_store::OwnerLock::kHeldByCaller;  // adoption->lock
+  config.allow_shared_filesystem = config_.spool_allow_shared_filesystem;
+  std::vector<dmi_store::StagedPack> ready;
+  if (dmi_store::Spool::Open(config, &adoption->spool, &error) !=
+          dmi_store::SpoolStatus::kOk ||
+      adoption->spool.Recover(&ready, &error) !=
+          dmi_store::SpoolStatus::kOk) {
+    record_error("adopting dead spool " + directory + ": " + error);
+    adoption_scan_owed_ = true;
+    return false;
+  }
+  // Each pack's identity and object key come from the pack and its path in
+  // the dead directory, exactly as its owner would have uploaded it.
+  adoption->remaining.assign(ready.begin(), ready.end());
+  adopting_ = std::move(adoption);
+  return true;
+}
+
+bool CaptureStorageService::upload_adopted_round() {
+  Adoption& adoption = *adopting_;
+  const size_t round =
+      static_cast<size_t>(std::max(1, config_.uploader.max_workers));
+  std::vector<dmi_store::StagedPack> entries;
+  while (!adoption.remaining.empty() && entries.size() < round) {
+    entries.push_back(std::move(adoption.remaining.front()));
+    adoption.remaining.pop_front();
+  }
+  dmi_store::SpoolUploader uploader(&adoption.spool, &s3_, config_.uploader);
+  const dmi_store::UploadBatchResult batch = uploader.UploadEntries(entries);
+  std::vector<PackRefData> to_index;
+  uint64_t uploaded_bytes = 0;
+  size_t failures = 0;
+  for (size_t i = 0; i < batch.refs.size(); ++i) {
+    const dmi_store::PackRef& ref = batch.refs[i];
+    if (ref.pack_id.empty()) {
+      // Still in the dead spool: a later cycle retries it.
+      ++failures;
+      adoption.remaining.push_back(entries[i]);
+      if (i < batch.failures.size()) {
+        record_error("adopting dead spool " + adoption.directory +
+                     ": upload failed for " + batch.failures[i].object_key +
+                     ": " + batch.failures[i].error);
+      }
+      continue;
+    }
+    to_index.push_back({ref.pack_id, ref.store_id, ref.object_key,
+                        ref.object_bytes, ref.checksum, ref.record_count});
+    uploaded_bytes += ref.object_bytes;
+  }
+  {
+    std::lock_guard<std::mutex> state(state_mutex_);
+    state_.uploaded_packs += to_index.size();
+    state_.uploaded_bytes += uploaded_bytes;
+    state_.upload_failures += failures;
+    state_.adopted_packs += to_index.size();
+  }
+  // Uploaded, so gone from the dead spool: indexed now, or owed in
+  // pending_index_ like any pack of this service's own.
+  index_or_owe(std::move(to_index), true);
+  return failures == 0;
+}
+
+void CaptureStorageService::finish_adoption() {
+  std::unique_ptr<Adoption> adoption = std::move(adopting_);
+  {
+    std::lock_guard<std::mutex> state(state_mutex_);
+    ++state_.adopted_spools;
+  }
+  std::string error;
+  if (!adoption->lock.ReleaseAndRemoveIfEmpty(&error)) {
+    // Nothing to upload is left, only files that are not packs (a
+    // quarantined one, say): the directory stays for someone to look at,
+    // and is not owed.
+    record_error("adopted dead spool " + adoption->directory +
+                 " was drained but still holds files that are not packs; "
+                 "left in place");
+  }
 }
 
 void CaptureStorageService::clear_dead_claim_staging(
@@ -647,101 +809,6 @@ void CaptureStorageService::clear_dead_claim_staging(
       lock.ReleaseAndRemoveIfEmpty(&error);
     }
   }
-}
-
-bool CaptureStorageService::adopt_sibling(const std::string& directory,
-                                          bool* live) {
-  *live = false;
-  // A live owner answers a non-blocking probe at once; TryAdopt would retry
-  // for a few milliseconds first, on every recheck.
-  if (dmi_store::ReadSpoolOwner(directory, nullptr)) {
-    *live = true;
-    return true;
-  }
-  dmi_store::SpoolOwnerLock lock;
-  std::string error;
-  const dmi_store::SpoolStatus locked =
-      dmi_store::SpoolOwnerLock::TryAdopt(directory, &lock, &error);
-  if (locked == dmi_store::SpoolStatus::kOwned) {  // it lives
-    *live = true;
-    return true;
-  }
-  if (locked != dmi_store::SpoolStatus::kOk) {
-    // Another adopter drained and removed it meanwhile: nothing is owed.
-    if (!std::filesystem::exists(directory)) return true;
-    record_error("adopting dead spool " + directory + ": " + error);
-    return false;
-  }
-  // The rules of the cycle's uploads: none without the lease, and none while
-  // an uploaded pack is still owed to the catalog.
-  bool catalog = false;
-  {
-    LeaseScope lease(this);
-    catalog = writer_.held_lease() != nullptr;
-  }
-  if (!catalog || !pending_index_.empty()) return false;
-
-  dmi_store::SpoolConfig config{directory, config_.spool_max_bytes};
-  config.owner_lock = dmi_store::OwnerLock::kHeldByCaller;  // `lock`
-  config.allow_shared_filesystem = config_.spool_allow_shared_filesystem;
-  dmi_store::Spool spool;
-  std::vector<dmi_store::StagedPack> ready;
-  if (dmi_store::Spool::Open(config, &spool, &error) !=
-          dmi_store::SpoolStatus::kOk ||
-      spool.Recover(&ready, &error) != dmi_store::SpoolStatus::kOk) {
-    record_error("adopting dead spool " + directory + ": " + error);
-    return false;
-  }
-  // Each pack's identity and object key come from the pack and its path in
-  // the dead directory, exactly as its owner would have uploaded it.
-  dmi_store::SpoolUploader uploader(&spool, &s3_, config_.uploader);
-  const dmi_store::UploadBatchResult batch = uploader.UploadPending(-1);
-  std::vector<PackRefData> to_index;
-  uint64_t uploaded_bytes = 0;
-  size_t failures = 0;
-  for (size_t i = 0; i < batch.refs.size(); ++i) {
-    const dmi_store::PackRef& ref = batch.refs[i];
-    if (ref.pack_id.empty()) {
-      ++failures;
-      if (i < batch.failures.size()) {
-        record_error("adopting dead spool " + directory + ": upload failed "
-                     "for " + batch.failures[i].object_key + ": " +
-                     batch.failures[i].error);
-      }
-      continue;
-    }
-    to_index.push_back({ref.pack_id, ref.store_id, ref.object_key,
-                        ref.object_bytes, ref.checksum, ref.record_count});
-    uploaded_bytes += ref.object_bytes;
-  }
-  {
-    std::lock_guard<std::mutex> state(state_mutex_);
-    state_.uploaded_packs += to_index.size();
-    state_.uploaded_bytes += uploaded_bytes;
-    state_.upload_failures += failures;
-    state_.adopted_packs += to_index.size();
-  }
-  // Uploaded, so gone from the dead spool: indexed now, or owed in
-  // pending_index_ like any pack of this service's own.
-  index_or_owe(std::move(to_index), true);
-  if (failures != 0) return false;  // they stay in the dead spool
-  std::vector<dmi_store::StagedPack> left;
-  if (spool.ListPending(&left, &error) != dmi_store::SpoolStatus::kOk ||
-      !left.empty()) {
-    return false;
-  }
-  {
-    std::lock_guard<std::mutex> state(state_mutex_);
-    ++state_.adopted_spools;
-  }
-  if (!lock.ReleaseAndRemoveIfEmpty(&error)) {
-    // Nothing to upload is left, only files that are not packs (a
-    // quarantined one, say): the directory stays for someone to look at,
-    // and is not owed.
-    record_error("adopted dead spool " + directory + " was drained but "
-                 "still holds files that are not packs; left in place");
-  }
-  return true;
 }
 
 void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,

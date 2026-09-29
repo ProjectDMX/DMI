@@ -693,8 +693,9 @@ class NativeCaptureStorage:
     refuse each other.
 
     ``adopt_sibling_spools`` needs ``spool_root`` to be a rank directory of
-    the spool layout (``spool_rank_directory``); ``start`` then drains the
-    sibling directories whose owners have died into this catalog.
+    the spool layout (``spool_rank_directory``); once started, the service's
+    background loop drains the sibling directories whose owners have died
+    into this catalog, a slice per cycle.
     """
 
     def __init__(
@@ -757,18 +758,18 @@ class NativeCaptureStorage:
 
         Call after the sink's own flush. Raises TimeoutError, carrying the
         last upload or index error, if the spool has not drained in time.
+        The dead processes' spools the service adopts
+        (``adopt_sibling_spools``) are not part of it -- they are the
+        background loop's, and ``snapshot()`` reports them
+        (``adopted_spools``, ``adoption_owed``) -- though an adopted pack
+        uploaded and not yet indexed is waited for like this process's own.
         """
         if not self._service.flush(float(timeout_s)):
             snapshot = self._service.snapshot()
-            # A dead process's spool this service has still to adopt keeps
-            # it undrained too (adopt_sibling_spools).
-            adopting = (", and a dead process's spool still to adopt"
-                        if snapshot.get("adoption_owed") else "")
             raise TimeoutError(
                 "timed out waiting for staged packs to reach the catalog "
-                f"({snapshot['pending_index']} uploaded but unindexed"
-                f"{adopting}); last error: "
-                f"{snapshot['last_error'] or 'none'}")
+                f"({snapshot['pending_index']} uploaded but unindexed); last "
+                f"error: {snapshot['last_error'] or 'none'}")
 
     def stop(self) -> None:
         """Stop the background thread and release the lease. No flush."""

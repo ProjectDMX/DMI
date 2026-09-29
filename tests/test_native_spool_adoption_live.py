@@ -194,6 +194,16 @@ def _wait_for(predicate, timeout_s: float = 30.0) -> None:
         time.sleep(0.05)
 
 
+def _adopted(service, spools: int):
+    """Whether `spools` dead siblings have been adopted and nothing more is
+    to adopt, as of the last cycle's end."""
+    def done():
+        snapshot = service.snapshot()
+        return (snapshot["adopted_spools"] == spools
+                and not snapshot["adoption_owed"])
+    return done
+
+
 def _read_all(config) -> dict:
     from dmi.storage.native_capture import NativeCaptureReader
 
@@ -253,8 +263,9 @@ def test_a_sigkilled_process_spool_is_adopted_by_its_successor(
         lock = _claim(base, config)
         service = _service(config, lock.directory)
         started = time.monotonic()
-        service.start()  # waits out the dead lease, then adopts
+        service.start()  # waits out the dead lease; the loop adopts
         try:
+            _wait_for(_adopted(service, 1))
             snapshot = service.snapshot()
             assert time.monotonic() - started < 30
             assert snapshot["adopted_spools"] == 1, snapshot
@@ -298,26 +309,41 @@ def test_a_dead_spool_waits_in_place_while_the_object_store_is_down(
         staged = sorted(dead.rglob("*.dmi-pack.ready"))
         assert staged
 
+        # Let the dead process's lease lapse, so start() has none to wait
+        # out and its time is its own.
+        time.sleep(LEASE["lease_ttl_s"] + 1.0)
         switch.cut()
         config = _storage_config(switch.url, prefix)
         lock = _claim(base, config)
         service = _service(config, lock.directory)
+        started = time.monotonic()
         service.start()
         try:
+            # start() leaves the dead backlog to the loop: it does not sit
+            # through every dead pack's retry chain against a store that
+            # refuses them (about 8 s a round of four packs).
+            assert time.monotonic() - started < 3.0
+            # Nor does flush(), which is about this process's own records:
+            # it returns within its deadline, drained or not.
+            flushed = time.monotonic()
+            try:
+                service.flush(0.5)
+            except TimeoutError:
+                pass  # a loop cycle still in an upload round holds the cycle
+            assert time.monotonic() - flushed < 2.0
+            _wait_for(lambda: service.snapshot()["upload_failures"] > 0)
             snapshot = service.snapshot()
             assert snapshot["adoption_owed"] is True, snapshot
             assert snapshot["adopted_spools"] == 0, snapshot
             # Nothing left the dead spool: its packs are durable there.
             assert sorted(dead.rglob("*.dmi-pack.ready")) == staged
-            with pytest.raises(TimeoutError):
-                service.flush(2.0)
 
             switch.restore()
-            service.flush(60.0)
+            _wait_for(_adopted(service, 1), 90.0)
             snapshot = service.snapshot()
             assert snapshot["adoption_owed"] is False, snapshot
-            assert snapshot["adopted_spools"] == 1, snapshot
             assert not dead.exists()
+            service.flush(60.0)
             assert _read_all(config) == _expected()
         finally:
             service.stop()
@@ -403,7 +429,7 @@ def test_no_dead_spool_is_uploaded_while_an_adopted_pack_is_owed(
 
             clickhouse.restore()
             service.flush(60.0)
-            _wait_for(lambda: service.snapshot()["adopted_spools"] == 2, 60.0)
+            _wait_for(_adopted(service, 2), 60.0)
             snapshot = service.snapshot()
             assert snapshot["adoption_owed"] is False, snapshot
             assert not first.exists() and not second.exists()
@@ -447,6 +473,7 @@ def test_a_sibling_whose_owner_dies_after_start_is_adopted_by_a_recheck(
         service = _store().StorageService(native)
         service.start()
         try:
+            _wait_for(lambda: not service.snapshot()["adoption_owed"])
             snapshot = service.snapshot()
             assert snapshot["live_siblings"] == 1, snapshot
             assert snapshot["adopted_spools"] == 0, snapshot
