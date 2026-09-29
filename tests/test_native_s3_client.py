@@ -185,6 +185,11 @@ class FakeS3Handler(BaseHTTPRequestHandler):
             return 500, b"boom"
         if under("fault/always-500"):
             return 500, b"boom"
+        if under("fault/hang-put") and self.command == "PUT" and \
+                "partNumber=" not in self.path:
+            # Only a single-request PUT: the upload's HEADs are answered.
+            time.sleep(5)
+            return None
         if under("fault/forbidden"):
             return 403, b"no"
         if under("fault/hang"):

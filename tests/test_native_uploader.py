@@ -457,6 +457,56 @@ def test_a_cancel_counts_only_when_it_ended_the_upload(fake_s3, tmp_path,
         store.close()
 
 
+@pytest.mark.parametrize("multipart", [False, True],
+                         ids=["put", "multipart-part"])
+def test_a_cancel_that_cuts_the_last_attempts_upload_is_a_cancel(
+        fake_s3, tmp_path, multipart):
+    """The upload's one attempt gets its HEAD answered 404 at once, then
+    its PUT -- or, over the multipart threshold, its first part -- is held
+    for 5 s, and the cancel at 0.3 s cuts it. No attempt or backoff comes
+    after it to see the cancel, so only the request's own report says the
+    cancel ended the upload; a PUT that stopped reporting it would book
+    the pack as failed -- upload_failures up, the backoff growing, and
+    "request cancelled" as the last error. The HEAD-cut case above pins
+    the preflight's report; these pin the PUT's and the part's."""
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        root = tmp_path / "spool"
+        if multipart:
+            staged = _stage_large_pack(root, 6, MIB)  # over 5 MiB: 2 parts
+            fault = "fault/hang-parts/"
+            transport = dict(multipart_threshold=5 * MIB,
+                             multipart_chunk=5 * MIB)
+        else:
+            staged = _stage(sink, root, 8)
+            fault = "fault/hang-put/"
+            transport = {}
+        staged = dict(staged, object_key=(
+            fault + staged["object_key"].rsplit("/", 1)[1]))
+        fields = _store_base(fake_s3, max_attempts=1, **transport)
+        fields.update(
+            op="upload_one", root=str(root), spool_max_bytes=1 << 40,
+            max_in_flight_bytes=1 << 30, upload_max_attempts=1,
+            staged=staged, cancel_after_ms=300,
+        )
+        started = time.monotonic()
+        result = store.call(**fields)
+        elapsed = time.monotonic() - started
+        assert not result["ok"], result
+        assert result["upload_attempts"] == 1, result
+        assert result["cancelled"] is True, result
+        assert "cancel" in result["what"], result
+        assert elapsed < 3.0, (elapsed, result)
+        assert Path(staged["path"]).exists()
+        assert staged["object_key"] not in STATE.objects
+        heads = [c for c in STATE.calls if c["method"] == "HEAD"]
+        assert len(heads) == 1, STATE.calls  # the preflight, answered
+    finally:
+        sink.close()
+        store.close()
+
+
 def test_pack_over_the_byte_gate_fails_fast(fake_s3, tmp_path):
     sink = DriverSession(SINK_DRIVER)
     store = DriverSession(STORE_DRIVER)
