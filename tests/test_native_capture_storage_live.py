@@ -897,7 +897,8 @@ def test_a_flush_against_a_black_hole_catalog_overruns_by_one_request(
             fake_s3, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="black-hole-test",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="black-hole-test",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             # Every cycle is due a reconcile.
@@ -942,7 +943,8 @@ def test_the_stop_after_a_flush_runs_no_further_cycle(fake_s3, tmp_path):
             fake_s3, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stop-after-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stop-after-flush",
             # Wakes while the flush below holds the cycle lock.
             poll_interval_ns=3_000_000_000, reconcile_on_start=False,
             # No renewal falls due while the test runs (a third of the TTL).
@@ -1006,7 +1008,8 @@ def test_a_flush_out_of_time_does_not_hash_the_spool(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="flush-out-of-time",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="flush-out-of-time",
             # The loop sleeps through the test, and nothing uploads.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             sweep_spool_on_start=False,
@@ -1065,7 +1068,8 @@ def test_stop_cuts_a_listing_that_hashes_a_backlog(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="listing-stop",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="listing-stop",
             poll_interval_ns=20_000_000, reconcile_on_start=False,
             sweep_spool_on_start=False,
             uploader_max_in_flight_bytes=1 << 30)
@@ -1101,7 +1105,8 @@ def test_a_flush_cuts_the_listing_its_deadline_passes_in(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="listing-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="listing-flush",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             sweep_spool_on_start=False,
@@ -1139,7 +1144,8 @@ def test_a_flush_returns_on_time_while_an_upload_stalls(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stalled-upload-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stalled-upload-flush",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             s3_read_timeout_s=30)
@@ -1212,7 +1218,8 @@ def test_a_flush_that_cuts_a_multipart_upload_waits_for_its_abort(
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="multipart-abort-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="multipart-abort-flush",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             clickhouse_request_timeout_s=2.0,
@@ -1250,7 +1257,8 @@ def test_stop_returns_promptly_while_an_upload_stalls(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stalled-upload-stop",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stalled-upload-stop",
             poll_interval_ns=20_000_000, reconcile_on_start=False,
             s3_read_timeout_s=60)
         service = _load_native_store_extension().StorageService(native)
@@ -1314,7 +1322,8 @@ def test_a_flush_returns_on_time_while_the_index_reads_stall(
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stalled-read-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stalled-read-flush",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             s3_read_timeout_s=3,
@@ -1373,7 +1382,8 @@ def test_stop_returns_promptly_while_the_index_reads_stall(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stalled-read-stop",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stalled-read-stop",
             poll_interval_ns=20_000_000, reconcile_on_start=False,
             s3_read_timeout_s=3)
         service = _load_native_store_extension().StorageService(native)
@@ -1452,7 +1462,8 @@ def test_stop_sends_no_catalog_request_for_packs_it_cannot_index(
             s3.url, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stop-no-replay-guard",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stop-no-replay-guard",
             poll_interval_ns=20_000_000, reconcile_on_start=False,
             uploader_max_workers=1, s3_read_timeout_s=30)
         # Staged first, so the loop's first cycle lists all four.
@@ -1518,7 +1529,8 @@ def test_an_object_store_read_outage_sets_no_pack_aside(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="read-outage",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="read-outage",
             poll_interval_ns=20_000_000, max_backoff_ns=200_000_000,
             reconcile_on_start=False, s3_read_timeout_s=1,
             s3_max_attempts=1, max_index_attempts=2)
@@ -1575,7 +1587,8 @@ def test_a_flush_against_a_slow_catalog_indexes_one_batch_past_its_deadline(
             fake_s3, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="slow-catalog-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="slow-catalog-flush",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             indexer_max_packs=1,
@@ -1639,7 +1652,8 @@ def test_a_close_whose_budget_ends_mid_upload_leaves_nothing_owed(
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="close-mid-upload",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="close-mid-upload",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             uploader_max_workers=1, indexer_max_packs=4)
@@ -1692,7 +1706,8 @@ def test_the_one_batch_past_a_flushs_deadline_is_a_full_one(fake_s3,
             fake_s3, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="full-batch-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="full-batch-flush",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             indexer_max_packs=2, clickhouse_request_timeout_s=60.0)
@@ -1731,7 +1746,8 @@ def test_only_the_loop_reconciles_never_a_flush(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="flush-no-reconcile",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="flush-no-reconcile",
             poll_interval_ns=2_000_000_000, reconcile_on_start=False,
             reconcile_interval_ns=1_000_000)
         service = _load_native_store_extension().StorageService(native)
@@ -1761,7 +1777,8 @@ def test_a_service_started_again_after_stop_uploads_again(fake_s3, tmp_path):
     spool_root = tmp_path / "spool"
     with _catalog() as (_client, catalog):
         native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
-        native.update(spool_root=str(spool_root), holder="restarted",
+        native.update(spool_root=str(spool_root),
+                      spool_owner_lock=_held(spool_root), holder="restarted",
                       reconcile_on_start=False)
         service = _load_native_store_extension().StorageService(native)
         service.start()
@@ -1793,7 +1810,8 @@ def test_stop_cuts_a_reconcile_whose_listing_stalls(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stalled-reconcile-stop",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stalled-reconcile-stop",
             poll_interval_ns=20_000_000, reconcile_on_start=False,
             reconcile_interval_ns=1_000_000, s3_read_timeout_s=30)
         service = _load_native_store_extension().StorageService(native)
