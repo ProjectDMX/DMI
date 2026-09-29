@@ -196,6 +196,11 @@ class FakeS3Handler(BaseHTTPRequestHandler):
             # answered at once.
             time.sleep(5)
             return None
+        if under("fault/hang-complete") and self.command == "POST" and \
+                "uploadId=" in self.path:
+            # Only CompleteMultipartUpload, with every part already in.
+            time.sleep(5)
+            return None
         return None
 
     def _route(self):
@@ -925,6 +930,31 @@ def test_a_cancel_aborts_a_multipart_upload_and_says_so_to_the_store(fake_s3):
     assert len(aborts) == 1, STATE.calls
     assert STATE.uploads == {}
     assert "fault/hang-parts/b" not in STATE.objects
+
+
+def test_a_cancel_that_cuts_the_complete_still_aborts_the_upload(fake_s3):
+    """Cut short with every part sent, CompleteMultipartUpload may or may
+    not have taken effect. The client aborts the upload either way: a
+    completed one refuses the abort harmlessly, and one left open would
+    otherwise sit in the bucket, invisible and billed."""
+    payload = bytes((i * 7) & 0xFF for i in range(10 * MIB))
+    put, elapsed = _timed_call(
+        "put", **_base(fake_s3, read_timeout=30), key="fault/hang-complete/d",
+        data_b64=base64.b64encode(payload).decode(), metadata={},
+        content_type="application/vnd.dmi.pack",
+        multipart_threshold=5 * MIB, multipart_chunk=5 * MIB,
+        cancel_after_ms=1000)
+    assert not put["ok"], put
+    assert put.get("cancelled") is True, put
+    assert "CompleteMultipartUpload" in put["what"], put
+    assert elapsed < 4.0, elapsed
+    completes = [call for call in STATE.calls
+                 if call["method"] == "POST" and "uploadId=" in call["path"]]
+    assert len(completes) == 1, STATE.calls
+    aborts = [call for call in STATE.calls
+              if call["method"] == "DELETE" and "uploadId=" in call["path"]]
+    assert len(aborts) == 1, STATE.calls
+    assert STATE.uploads == {}
 
 
 def test_a_cancel_interrupts_the_retry_backoff(fake_s3):

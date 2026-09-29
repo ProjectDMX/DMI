@@ -1343,6 +1343,81 @@ def test_only_the_loop_reconciles_never_a_flush(fake_s3, tmp_path):
         assert sorted(_read_all(direct)) == sorted(tensors)
 
 
+def test_a_service_started_again_after_stop_uploads_again(fake_s3, tmp_path):
+    """stop() cancels the service's uploads and reads for good, and start()
+    clears that: without it, a service object stopped and started again
+    would cancel every upload from then on, its flushes returning False
+    with the packs piling up in the spool."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    with _catalog() as (_client, catalog):
+        native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
+        native.update(spool_root=str(spool_root), holder="restarted",
+                      reconcile_on_start=False)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        service.stop()
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(2))
+            assert service.flush(10.0), service.snapshot()
+            snapshot = service.snapshot()
+            assert snapshot["cancelled_uploads"] == 0, snapshot
+            assert snapshot["indexed_packs"] == 1, snapshot
+        finally:
+            service.stop()
+        assert service.snapshot()["lease_state"] == "released"
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_stop_cuts_a_reconcile_whose_listing_stalls(fake_s3, tmp_path):
+    """The loop's periodic reconcile lists the bucket through the client
+    the index reads use. A listing the store never answers held stop() for
+    s3_read_timeout_s on each of the client's attempts; stop() cuts it now,
+    and the pass ends quietly, to run again on the next start."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="stalled-reconcile-stop",
+            poll_interval_ns=20_000_000, reconcile_on_start=False,
+            reconcile_interval_ns=1_000_000, s3_read_timeout_s=30)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        stopper = None
+        try:
+            s3.stall_requests(_listing)
+            _wait_for(lambda: s3.stalled, timeout_s=10.0)
+            outcome = {}
+
+            def _stop():
+                started = time.monotonic()
+                service.stop()
+                outcome["elapsed"] = time.monotonic() - started
+
+            stopper = threading.Thread(target=_stop, daemon=True)
+            stopper.start()
+            stopper.join(timeout=60.0)
+            assert not stopper.is_alive(), "stop() still blocked after 60 s"
+            snapshot = service.snapshot()
+            assert outcome["elapsed"] < 3.0, (outcome, snapshot)
+            assert snapshot["lease_state"] == "released", snapshot
+            assert snapshot["reconcile_passes"] == 0, snapshot
+            assert len(s3.stalled) == 1, s3.stalled
+        finally:
+            s3.close()  # releases the stalled listing
+            if stopper is None:
+                service.stop()
+            else:
+                stopper.join(timeout=120.0)
+
+
 def test_dropping_a_running_service_does_not_hold_the_gil(fake_s3, tmp_path):
     """A service collected without stop() stops itself in its destructor,
     joining a cycle that may be waiting on the catalog. That ran with the
