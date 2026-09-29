@@ -265,7 +265,19 @@ bool PackSink::Flush(double timeout_s, std::string* error) {
       return false;
     }
   }
-  std::lock_guard<std::mutex> flush_lock(flush_mutex_);
+  // A flush in flight holds this for as long as its own timeout. This one
+  // waits for it only until its own deadline, so the release backstop's
+  // bounded flush does not wait out a concurrent flush_and_wait's.
+  std::unique_lock<std::timed_mutex> flush_lock(flush_mutex_, std::defer_lock);
+  if (deadline < 0) {
+    flush_lock.lock();
+  } else if (!flush_lock.try_lock_until(
+                 std::chrono::steady_clock::now() +
+                 std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::duration<double>(
+                         std::max(0.0, deadline - NowS()))))) {
+    return false;  // timed out, as a wait on the barrier would have
+  }
   {
     std::unique_lock<std::mutex> lock(mutex_);
     if (!latched_error_.empty()) {

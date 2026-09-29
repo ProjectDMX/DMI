@@ -63,8 +63,9 @@ std::vector<uint8_t> ReadFile(const std::string& path, std::string* error) {
   return data;
 }
 
-void SleepBackoff(const UploaderConfig& config, int attempt,
-                  std::mt19937_64* rng) {
+// False when `cancel` (may be null) woke it before the wait was out.
+bool SleepBackoff(const UploaderConfig& config, int attempt,
+                  std::mt19937_64* rng, const Cancellation* cancel) {
   double wait = config.base_backoff_s * (1 << std::min(attempt, 20));
   wait = std::min(wait, config.max_backoff_s);
   if (config.jitter_ratio > 0) {
@@ -72,10 +73,17 @@ void SleepBackoff(const UploaderConfig& config, int attempt,
                                                   1.0 + config.jitter_ratio);
     wait *= jitter(*rng);
   }
-  if (wait > 0) {
-    std::this_thread::sleep_for(std::chrono::duration<double>(wait));
-  }
+  if (wait <= 0) return true;
+  const auto duration =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::duration<double>(wait));
+  if (cancel != nullptr) return cancel->SleepFor(duration);
+  std::this_thread::sleep_for(duration);
+  return true;
 }
+
+constexpr const char* kUploadCancelled =
+    "upload cancelled; the pack stays staged";
 
 std::map<std::string, std::string> PackMetadata(const StagedPack& staged) {
   return {
@@ -94,21 +102,39 @@ SpoolUploader::SpoolUploader(Spool* spool, S3Client* client,
     : spool_(spool), client_(client), config_(std::move(config)) {}
 
 bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
-                              int* attempts_out, std::string* error) {
+                              int* attempts_out, std::string* error,
+                              bool* cancelled_out) {
   const std::string& key = staged.object_key;
   std::mt19937_64 rng(
       static_cast<uint64_t>(std::hash<std::string>{}(staged.pack_id)));
   std::string last_error;
   int attempts = 0;
+  bool cancelled = false;
+  // The Cancellation cut this attempt's failed request short.
+  bool attempt_cut = false;
+  if (cancelled_out) *cancelled_out = false;
   for (int attempt = 0; attempt < config_.max_attempts; ++attempt) {
+    // A cancel ends the retries: the backoff wakes for it, and no attempt
+    // starts after it. What an attempt cut short left behind is safe: a
+    // PUT that never completed made no object, and one that did is found
+    // and re-verified by the next upload's preflight.
+    if (attempt > 0 && !SleepBackoff(config_, attempt - 1, &rng, cancel_)) {
+      cancelled = true;
+      break;
+    }
+    if (cancel_ != nullptr && cancel_->cancelled()) {
+      cancelled = true;
+      break;
+    }
     ++attempts;
-    if (attempt > 0) SleepBackoff(config_, attempt - 1, &rng);
+    attempt_cut = false;
 
     // 1. Preflight: an object already carrying this pack is re-read and
     // re-hashed before it is blessed — metadata alone is not proof.
     {
       std::string head_error;
-      const ObjectHead head = client_->HeadObject(key, &head_error);
+      const ObjectHead head =
+          client_->HeadObject(key, &head_error, &attempt_cut);
       if (!head_error.empty()) {
         last_error = head_error;
         continue;  // transport-level: retryable below
@@ -120,7 +146,7 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
           std::vector<uint8_t> existing;
           std::string get_error;
           if (!client_->GetRange(key, 0, staged.object_bytes, &existing,
-                                 &get_error) ||
+                                 &get_error, nullptr, &attempt_cut) ||
               Sha256HexBytes(existing.data(), existing.size()) !=
                   staged.checksum) {
             last_error = get_error.empty()
@@ -187,14 +213,15 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
     std::string put_error;
     if (!client_->PutObject(key, data.data(), data.size(),
                             PackMetadata(staged), config_.content_type, &etag,
-                            &put_error)) {
+                            &put_error, &attempt_cut)) {
       last_error = put_error;
       continue;
     }
     // 3. Post-upload visibility: the object must be there.
     {
       std::string head_error;
-      const ObjectHead head = client_->HeadObject(key, &head_error);
+      const ObjectHead head =
+          client_->HeadObject(key, &head_error, &attempt_cut);
       if (!head_error.empty() || !head.found ||
           head.size != staged.object_bytes) {
         last_error = head_error.empty()
@@ -217,6 +244,19 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
     if (attempts_out) *attempts_out = attempts;
     return true;
   }
+  // The last attempt cut short by a cancel ends the loop without the checks
+  // above seeing it. Only its request's own report says so: attempts that
+  // ran out on real failures, or the corrupt-bytes break, stay failures
+  // even when a flush's deadline passed meanwhile, so the error is counted
+  // and recorded rather than booked as a cancel.
+  if (!cancelled && attempt_cut) cancelled = true;
+  if (cancelled) {
+    last_error = last_error.empty()
+                     ? kUploadCancelled
+                     : std::string(kUploadCancelled) +
+                           " (the attempt before failed: " + last_error + ")";
+    if (cancelled_out) *cancelled_out = true;
+  }
   if (attempts_out) *attempts_out = attempts;
   if (error) *error = last_error;
   return false;
@@ -227,14 +267,27 @@ UploadBatchResult SpoolUploader::UploadPending(int limit) {
   if (limit != -1 && limit <= 0) return result;  // invalid limit: empty result
   std::vector<StagedPack> pending;
   {
+    // Listing hashes every staged pack; a cancel stops it between packs
+    // rather than after the whole backlog.
     std::string error;
-    if (spool_->ListPending(&pending, &error) != SpoolStatus::kOk) {
+    bool cut = false;
+    if (spool_->ListPending(&pending, &error, cancel_, &cut) !=
+        SpoolStatus::kOk) {
+      return result;
+    }
+    if (cut) {
+      result.listing_cancelled = true;
       return result;
     }
   }
   if (limit != -1 && static_cast<size_t>(limit) < pending.size()) {
     pending.resize(static_cast<size_t>(limit));
   }
+  return UploadStaged(std::move(pending));
+}
+
+UploadBatchResult SpoolUploader::UploadStaged(std::vector<StagedPack> pending) {
+  UploadBatchResult result;
   // Both vectors are positional from the start: sized to the recover()
   // order up front, oversized refusals written into their own slot, and
   // workers below fill the rest by index.
@@ -303,6 +356,7 @@ UploadBatchResult SpoolUploader::UploadPending(int limit) {
         // the scan after the wait always finds the pack the predicate saw.
         cv.wait(lock, [&] {
           if (remaining.empty()) return true;
+          if (cancel_ != nullptr && cancel_->cancelled()) return true;
           for (const auto& candidate : remaining) {
             if (in_flight +
                     pending[candidate.index].object_bytes <=
@@ -313,6 +367,24 @@ UploadBatchResult SpoolUploader::UploadPending(int limit) {
           return false;
         });
         if (remaining.empty()) return;
+        if (cancel_ != nullptr && cancel_->cancelled()) {
+          // No pack starts once cancelled. Each one left is reported at its
+          // own position, still staged.
+          for (const Slot& left : remaining) {
+            UploadFailure& failure = result.failures[left.index];
+            failure = {pending[left.index].pack_id,
+                       pending[left.index].object_key, 0,
+                       "upload cancelled before it started; the pack stays "
+                       "staged",
+                       true};
+            ++result.snapshot.cancelled_packs;
+            finished[left.index] = true;
+          }
+          remaining.clear();
+          lock.unlock();
+          cv.notify_all();
+          return;
+        }
         for (auto it = remaining.begin(); it != remaining.end(); ++it) {
           if (in_flight + pending[it->index].object_bytes <=
               config_.max_in_flight_bytes) {
@@ -333,7 +405,8 @@ UploadBatchResult SpoolUploader::UploadPending(int limit) {
       PackRef ref;
       std::string error;
       int attempts = 0;
-      const bool ok = UploadOne(*staged, &ref, &attempts, &error);
+      bool cancelled = false;
+      const bool ok = UploadOne(*staged, &ref, &attempts, &error, &cancelled);
       const int64_t elapsed = NowNs() - started;
       {
         std::lock_guard<std::mutex> lock(mutex);
@@ -355,8 +428,12 @@ UploadBatchResult SpoolUploader::UploadPending(int limit) {
         } else {
           result.refs[slot.index] = PackRef{};
           result.failures[slot.index] = {staged->pack_id, staged->object_key,
-                                         attempts, error};
-          ++result.snapshot.failed_packs;
+                                         attempts, error, cancelled};
+          if (cancelled) {
+            ++result.snapshot.cancelled_packs;
+          } else {
+            ++result.snapshot.failed_packs;
+          }
           if (attempts > 1) {
             result.snapshot.retries += static_cast<uint64_t>(attempts - 1);
           }

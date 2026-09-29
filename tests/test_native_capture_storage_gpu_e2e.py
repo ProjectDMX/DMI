@@ -174,6 +174,65 @@ def test_flush_and_wait_means_queryable_and_byte_identical(fake_s3, tmp_path):
     assert not sorted((tmp_path / "spool").rglob("*.dmi-pack.ready"))
 
 
+def test_stopping_the_ring_stages_the_open_pack_without_a_service(tmp_path):
+    """The sink alone, no storage service: nothing in close() flushes the
+    sink, and stopping the ring releases it. The audit's probe -- ready
+    packs right after the stop -- reported 0, the tail staying in memory
+    until the sink object died or its 60 s linger fired. The release now
+    stages it. The test holds the sink, so its destructor cannot be what
+    wrote the pack."""
+    from dmi.api.v1 import HookPointV1, HookSpecV1, MonitoringEngine, TransportSpec
+    from dmi.config import MonitoringConfig
+    from dmi.storage.capture import (
+        CaptureRecordFormat, DurablePackSpool, PackReader,
+    )
+    from dmi.storage.capture.native_sink import NativeSinkConfig
+
+    spool = tmp_path / "spool"
+    config = MonitoringConfig(
+        storage_backend="persistent",
+        capture_sink_config=NativeSinkConfig(
+            spool_root=str(spool), max_pack_records=2,
+            max_linger_ns=60_000_000_000),
+    )
+    tensors = {f"tail-{i}": torch.arange(8, dtype=torch.float32) + i
+               for i in range(3)}
+    engine = MonitoringEngine(config=config, model_id="native-sink-gpu",
+                              ring_config=_ring_config())
+    try:
+        runtime = engine.create_record_runtime(CaptureRecordFormat())
+        sink = engine._record_sink
+        hook = HookPointV1(
+            HookSpecV1("capture_tensor", (TransportSpec("payload"),)))
+        hook_runtime = _CaptureHookRuntime(runtime)
+        runtime.bind_hook(hook, hook_runtime=hook_runtime)
+        for step, (capture_id, tensor) in enumerate(tensors.items()):
+            hook_runtime.metadata = _metadata(capture_id, tensor, step=step)
+            hook(tensor.cuda())
+        torch.cuda.synchronize()
+
+        engine.close()  # no flush_and_wait, and no service to drain
+
+        # Two packs: the full one of two records, and the tail of one.
+        assert len(sorted(spool.rglob("*.dmi-pack.ready"))) == 2
+        snapshot = sink.snapshot()
+        assert snapshot["persisted_records"] == len(tensors), snapshot
+    finally:
+        engine.close()
+
+    staged = {}
+    for entry in DurablePackSpool(spool, max_bytes=1 << 40).recover():
+        with entry.open() as handle:
+            reader = PackReader.from_bytes(handle.read())
+        for descriptor in reader.descriptors(
+                store_id="spool", object_key=entry.object_key):
+            staged[descriptor.metadata.capture_id] = reader.read_payload(
+                descriptor)
+    assert sorted(staged) == sorted(tensors)
+    for capture_id, tensor in tensors.items():
+        assert staged[capture_id] == tensor.numpy().tobytes(), capture_id
+
+
 def test_close_alone_delivers_the_tail_to_the_catalog(fake_s3, tmp_path):
     """No flush_and_wait: close() must still seal the sink's open pack and
     drain it into the catalog. The 60 s linger means nothing but a flush can

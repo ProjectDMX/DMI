@@ -14,6 +14,10 @@ envelope of rows through EnvelopeAdmission, the path NativePackSink::submit
 takes: the whole envelope must time out within one admission_timeout_s,
 not one per row.
 
+A third wedges the stager under one flush and gives a second, shorter
+flush on another thread its own timeout: the second must return within it,
+not wait out the first (the release backstop beside a flush_and_wait).
+
 This is the native-tier coverage of the deadline wait loop in
 PackSink::Submit; the conformance-driver suite (test_native_pack_sink.py)
 covers the admission bounds around it.

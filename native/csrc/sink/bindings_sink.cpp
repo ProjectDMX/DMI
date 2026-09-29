@@ -13,7 +13,9 @@
 
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -24,6 +26,28 @@
 namespace py = pybind11;
 
 namespace {
+
+// Parks every stage of a sink's spool until Open(), or for max_hold at
+// most, so a test can wedge the sink's pipeline without a hung filesystem
+// -- and still gets it back if what it tests never lets go.
+struct StageGate {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool open = false;
+  std::chrono::nanoseconds max_hold{0};
+
+  void Wait() {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait_for(lock, max_hold, [this] { return open; });
+  }
+  void Open() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      open = true;
+    }
+    cv.notify_all();
+  }
+};
 
 ring::PayloadSlice ParseSlice(const py::dict& row) {
   ring::PayloadSlice slice;
@@ -157,7 +181,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        uint64_t max_pack_bytes, uint64_t max_pack_records,
                        uint64_t max_linger_ns, uint64_t spool_max_bytes,
                        const std::string& overload,
-                       std::optional<double> admission_timeout_s) {
+                       std::optional<double> admission_timeout_s,
+                       double release_flush_timeout_s) {
              dmi_sink::SinkConfig config;
              config.overload = ParseOverload(overload);
              config.admission_timeout_s =
@@ -170,9 +195,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              config.max_pack_bytes = max_pack_bytes;
              config.max_pack_records = max_pack_records;
              config.max_linger_ns = max_linger_ns;
+             if (!std::isfinite(release_flush_timeout_s) ||
+                 release_flush_timeout_s < 0.0) {
+               throw py::value_error(
+                   "release_flush_timeout_s must be a finite, non-negative "
+                   "number");
+             }
              auto sink = std::make_unique<dmi_sink::PackSink>(config);
              return std::make_shared<dmi_sink::NativePackSink>(
-                 std::move(sink), layout);
+                 std::move(sink), layout,
+                 std::chrono::ceil<ring::RecordSink::Duration>(
+                     std::chrono::duration<double>(release_flush_timeout_s)));
            }),
            py::arg("spool_root"), py::arg("layout"),
            py::arg("num_workers") = 1,
@@ -185,7 +218,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            // SinkConfig's own defaults: the Python NativeSinkConfig, which
            // the ring-fed sink is built from, picks block with 2 s.
            py::arg("overload") = "drop_newest",
-           py::arg("admission_timeout_s") = py::none())
+           py::arg("admission_timeout_s") = py::none(),
+           // How long releasing the sink from its engine waits for the open
+           // pack to reach the spool; 0 turns that flush off.
+           py::arg("release_flush_timeout_s") =
+               std::chrono::duration<double>(
+                   dmi_sink::NativePackSink::kDefaultReleaseFlushTimeout)
+                   .count())
       .def("attach",
            [](std::shared_ptr<dmi_sink::NativePackSink> self) {
              // Simulates engine ownership for tests (the real engine takes
@@ -215,11 +254,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                      std::chrono::duration<double>(timeout_s)));
            })
       .def("rethrow_if_failed", &dmi_sink::NativePackSink::rethrow_if_failed)
+      // Test seam, not API: from now on each stage of the sink's spool
+      // waits, before it writes anything, until the returned function is
+      // called or max_hold_s has passed. Wedges the pipeline the way a hung
+      // filesystem would (tests/test_native_sink_release.py).
+      .def("_hold_stages_for_testing",
+           [](dmi_sink::NativePackSink& self, double max_hold_s) {
+             if (!(max_hold_s > 0.0 && max_hold_s <= 3600.0)) {
+               throw py::value_error("max_hold_s must be in (0, 3600]");
+             }
+             auto gate = std::make_shared<StageGate>();
+             gate->max_hold =
+                 std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::duration<double>(max_hold_s));
+             self.sink_for_testing().SpoolForTesting().SetStageHookForTesting(
+                 [gate] { gate->Wait(); });
+             return py::cpp_function([gate] { gate->Open(); });
+           },
+           py::arg("max_hold_s"))
       .def_property_readonly("layout", &dmi_sink::NativePackSink::layout)
       .def_property_readonly(
           "overload",
           [](const dmi_sink::NativePackSink& self) {
             return std::string(OverloadName(self.sink().config().overload));
+          })
+      .def_property_readonly(
+          "release_flush_timeout_s",
+          [](const dmi_sink::NativePackSink& self) {
+            return std::chrono::duration<double>(self.release_flush_timeout())
+                .count();
           })
       .def_property_readonly(
           "admission_timeout_s",

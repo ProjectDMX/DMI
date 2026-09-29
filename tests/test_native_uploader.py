@@ -16,6 +16,7 @@ import json
 import random
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -303,6 +304,208 @@ def test_corrupt_staged_bytes_are_refused(fake_s3, tmp_path):
         # Nothing reached the store.
         puts = [c for c in STATE.calls if c["method"] == "PUT"]
         assert not puts
+    finally:
+        sink.close()
+        store.close()
+
+
+def test_a_cancel_ends_the_retries_and_keeps_the_pack_staged(fake_s3,
+                                                            tmp_path):
+    """Against a store that answers every request 500, one pack costs four
+    upload attempts of four transport attempts each, about 7 s of backoff.
+    The storage service cancels its uploads when it stops or a flush's
+    deadline passes; the cancel must end the retries and the backoff at
+    once, and leave the pack in the spool -- the durable place for it --
+    rather than count it lost."""
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        staged = _stage(sink, tmp_path / "spool", 5)
+        staged = dict(staged, object_key=(
+            "fault/always-500/" + staged["object_key"].rsplit("/", 1)[1]))
+        fields = _store_base(fake_s3)
+        fields.update(
+            op="upload_one", root=str(tmp_path / "spool"),
+            spool_max_bytes=1 << 40, max_workers=1,
+            max_in_flight_bytes=1 << 30, staged=staged,
+            cancel_after_ms=500,
+        )
+        started = time.monotonic()
+        result = store.call(**fields)
+        elapsed = time.monotonic() - started
+        assert not result["ok"], result
+        assert result.get("cancelled") is True, result
+        assert "cancel" in result["what"], result
+        assert result["upload_attempts"] <= 2, result
+        assert elapsed < 3.0, elapsed
+        assert Path(staged["path"]).exists()
+    finally:
+        sink.close()
+        store.close()
+
+
+def test_a_cancel_wakes_the_uploaders_own_backoff(fake_s3, tmp_path):
+    """The uploader backs off between its attempts on a pack, for up to
+    max_backoff_s (10 s), apart from the S3 client's backoff inside each
+    attempt. Here each attempt is one HEAD answered 500 at once (one
+    transport attempt), and the uploader's backoff is 2 s (+-20% jitter):
+    the cancel at 0.3 s lands in the first one. Slept out, it would end
+    after 1.6 s at the earliest, when the check before the next attempt
+    stops the upload anyway."""
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        staged = _stage(sink, tmp_path / "spool", 7)
+        staged = dict(staged, object_key=(
+            "fault/always-500/" + staged["object_key"].rsplit("/", 1)[1]))
+        fields = _store_base(fake_s3, max_attempts=1)
+        fields.update(
+            op="upload_one", root=str(tmp_path / "spool"),
+            spool_max_bytes=1 << 40, upload_max_attempts=4,
+            upload_base_backoff_ms=2000, staged=staged, cancel_after_ms=300,
+        )
+        started = time.monotonic()
+        result = store.call(**fields)
+        elapsed = time.monotonic() - started
+        assert not result["ok"], result
+        assert result["cancelled"] is True, result
+        assert result["upload_attempts"] == 1, result
+        assert elapsed < 1.2, (elapsed, result)
+        assert Path(staged["path"]).exists()
+    finally:
+        sink.close()
+        store.close()
+
+
+def test_a_cancel_stops_the_listing_between_packs(fake_s3, tmp_path):
+    """UploadPending lists the spool before it uploads anything, and a
+    listing re-hashes every staged pack: over a backlog, seconds a GiB of
+    it, all before a single worker looked at the cancel. The listing now
+    stops between packs once cancelled, and nothing is tried. 16 sparse
+    packs of 256 MiB, zeros named for their checksum, take it about 3 s."""
+    import hashlib
+    import uuid
+
+    size = 256 << 20
+    digest = hashlib.sha256()
+    zeros = bytes(1 << 20)
+    for _ in range(size // len(zeros)):
+        digest.update(zeros)
+    root = tmp_path / "spool"
+    root.mkdir()
+    backlog = []
+    for _ in range(16):
+        ready = root / f"{uuid.uuid4()}.1.1.{digest.hexdigest()}.dmi-pack.ready"
+        with open(ready, "wb") as sparse:
+            sparse.truncate(size)
+        backlog.append(ready)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        started = time.monotonic()
+        result = _upload_pending(store, fake_s3, root, cancel_after_ms=300)
+        elapsed = time.monotonic() - started
+    finally:
+        store.close()
+    assert result["ok"], result
+    assert result["listing_cancelled"] is True, result
+    assert result["refs"] == [] and result["failures"] == [], result
+    assert result["snapshot"]["cancelled_packs"] == 0, result
+    # Between packs, not after the listing: the cut ends within one pack's
+    # hash of the cancel, about 0.5 s here, where the whole listing takes
+    # over 3 s. The bound leaves room for a loaded runner, whose hashing
+    # slows with it (about 1.1 s at 4x oversubscription).
+    assert elapsed < 2.0, elapsed
+    assert sorted(root.rglob("*.dmi-pack.ready")) == sorted(backlog)
+    assert STATE.calls == []
+
+
+@pytest.mark.parametrize("request_cut", [False, True],
+                         ids=["failed-on-its-own", "cut-by-the-cancel"])
+def test_a_cancel_counts_only_when_it_ended_the_upload(fake_s3, tmp_path,
+                                                       request_cut):
+    """UploadOne booked a pack cancelled whenever its Cancellation was set
+    once its attempts were over -- also when they had run out on real
+    failures and a flush's deadline merely passed meanwhile. The storage
+    service then counted the pack in cancelled_uploads, not in
+    upload_failures, and never recorded its error, so the TimeoutError a
+    flush raised named no cause. The one attempt's HEAD is answered 500
+    after 1.2 s, and the cancel comes at 0.3 s. With only the uploader
+    holding the Cancellation the HEAD runs to its answer: a failure, and
+    it says so. With the client holding it too the cancel cuts the HEAD,
+    and that is a cancel, last attempt or not."""
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        staged = _stage(sink, tmp_path / "spool", 6)
+        staged = dict(staged, object_key=(
+            "fault/slow-once-500/" + staged["object_key"].rsplit("/", 1)[1]))
+        fields = _store_base(fake_s3, max_attempts=1)
+        fields.update(
+            op="upload_one", root=str(tmp_path / "spool"),
+            spool_max_bytes=1 << 40, upload_max_attempts=1,
+            staged=staged, cancel_after_ms=300,
+            cancel_uploader_only=not request_cut,
+        )
+        result = store.call(**fields)
+        assert not result["ok"], result
+        assert result["upload_attempts"] == 1, result
+        assert result["cancelled"] is request_cut, result
+        if request_cut:
+            assert "cancel" in result["what"], result
+        else:
+            assert "HTTP 500" in result["what"], result
+            assert "cancel" not in result["what"], result
+        assert Path(staged["path"]).exists()
+    finally:
+        sink.close()
+        store.close()
+
+
+@pytest.mark.parametrize("multipart", [False, True],
+                         ids=["put", "multipart-part"])
+def test_a_cancel_that_cuts_the_last_attempts_upload_is_a_cancel(
+        fake_s3, tmp_path, multipart):
+    """The upload's one attempt gets its HEAD answered 404 at once, then
+    its PUT -- or, over the multipart threshold, its first part -- is held
+    for 5 s, and the cancel at 0.3 s cuts it. No attempt or backoff comes
+    after it to see the cancel, so only the request's own report says the
+    cancel ended the upload; a PUT that stopped reporting it would book
+    the pack as failed -- upload_failures up, the backoff growing, and
+    "request cancelled" as the last error. The HEAD-cut case above pins
+    the preflight's report; these pin the PUT's and the part's."""
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        root = tmp_path / "spool"
+        if multipart:
+            staged = _stage_large_pack(root, 6, MIB)  # over 5 MiB: 2 parts
+            fault = "fault/hang-parts/"
+            transport = dict(multipart_threshold=5 * MIB,
+                             multipart_chunk=5 * MIB)
+        else:
+            staged = _stage(sink, root, 8)
+            fault = "fault/hang-put/"
+            transport = {}
+        staged = dict(staged, object_key=(
+            fault + staged["object_key"].rsplit("/", 1)[1]))
+        fields = _store_base(fake_s3, max_attempts=1, **transport)
+        fields.update(
+            op="upload_one", root=str(root), spool_max_bytes=1 << 40,
+            max_in_flight_bytes=1 << 30, upload_max_attempts=1,
+            staged=staged, cancel_after_ms=300,
+        )
+        started = time.monotonic()
+        result = store.call(**fields)
+        elapsed = time.monotonic() - started
+        assert not result["ok"], result
+        assert result["upload_attempts"] == 1, result
+        assert result["cancelled"] is True, result
+        assert "cancel" in result["what"], result
+        assert elapsed < 3.0, (elapsed, result)
+        assert Path(staged["path"]).exists()
+        assert staged["object_key"] not in STATE.objects
+        heads = [c for c in STATE.calls if c["method"] == "HEAD"]
+        assert len(heads) == 1, STATE.calls  # the preflight, answered
     finally:
         sink.close()
         store.close()

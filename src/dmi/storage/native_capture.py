@@ -265,8 +265,30 @@ class NativeCaptureStorageConfig:
     # 0 disables the periodic pass; in-process index failures are retried
     # regardless.
     reconcile_interval_s: float = 0.0
-    # engine.close()'s total budget for draining capture: sealing the sink's
-    # open pack, then getting every staged pack into the catalog.
+    # engine.close()'s budget for draining capture, best effort: it flushes
+    # the sink (sealing its open pack), then waits for the service to get
+    # the staged packs into the catalog, and stops the service when the
+    # budget is spent, whatever is left. That stays in the spool, which the
+    # next start on it uploads, or -- uploaded but not yet indexed, one index
+    # batch of packs at most, since the service indexes what it uploads a
+    # batch at a time -- in the bucket, which only the next start's
+    # reconcile indexes (reconcile_on_start). Past the budget the drain
+    # starts no upload -- one in flight is cut, within about a second (the
+    # transfer's progress poll), and a multipart one then aborted, one
+    # request of at most 5 s that nothing cuts -- and at most one index
+    # batch: its object-store reads are cut one clickhouse_request_timeout_s
+    # past the budget, and its catalog statements are never cut, each
+    # bounded by that timeout (under the publisher lease, by the lease's
+    # deadline when that is sooner). Stopping the service then releases the
+    # lease: one more catalog request, bounded the same way -- or, when a
+    # lease renewal is in flight, that renewal, which it waits for (a lease
+    # the renewal loses needs no release). So against a catalog or an
+    # object store that stopped answering, close() outlasts the budget by
+    # up to about two request timeouts, and up to about 6 s more when the
+    # budget cuts a multipart upload; against a slow catalog that still
+    # answers, by one batch of statements and the release. When the sink
+    # itself is stuck, the flush its release from the ring makes adds up to
+    # 30 s. close() logs what did not drain; flush_and_wait is what raises.
     close_flush_timeout_s: float = 60.0
     # Bytes of packs the uploader holds in flight at once. A staged pack
     # larger than this is never uploaded, so the sink's max_pack_bytes must
@@ -297,6 +319,19 @@ class NativeCaptureStorageConfig:
     # on these defaults, so one on the native 30 s default (which processes
     # predating these knobs used) outlasts the default wait by 10 s.
     start_lease_wait_s: Optional[float] = None
+
+    # Every object-store request is bounded: each attempt by
+    # s3_read_timeout_s (whole seconds, connecting included), with up to
+    # s3_max_attempts attempts for a timeout, a host that does not resolve
+    # or connect, a connection that broke or answered nothing, a 429 or a
+    # 500/502/503/504 -- not for another status, nor a TLS failure -- and a
+    # backoff between them of 0.2 s doubling up to 5 s. That is how long
+    # one read the store never answers can hold the service's background
+    # cycle -- 4 x 120 s + 1.4 s on these defaults -- and a reader's
+    # request. stop() and a flush's deadline cut the service's requests
+    # short regardless (see close_flush_timeout_s).
+    s3_read_timeout_s: int = 120
+    s3_max_attempts: int = 4
 
     def __post_init__(self) -> None:
         for name in ("s3_endpoint", "s3_bucket", "s3_access_key",
@@ -332,6 +367,12 @@ class NativeCaptureStorageConfig:
                                  "s3_endpoint")
         if type(self.clickhouse_port) is not int or not 0 < self.clickhouse_port < 65536:
             raise ValueError("clickhouse_port must be in 1..65535")
+        # The native client takes both as C ints; a bool is not a count.
+        for name, most in (("s3_read_timeout_s", 86_400),
+                           ("s3_max_attempts", 1_000)):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 < value <= most:
+                raise ValueError(f"{name} must be an int in 1..{most}")
         _positive("poll_interval_s", self.poll_interval_s, float)
         # The native wait is int(poll_interval_s * 1e9) ns; a zero wait spins.
         if self.poll_interval_s < 0.001:
@@ -473,6 +514,8 @@ class NativeCaptureStorageConfig:
             "s3_allow_insecure_http": self.s3_allow_insecure_http,
             "s3_ca_file": self.s3_ca_file,
             "s3_ca_path": self.s3_ca_path,
+            "s3_read_timeout_s": self.s3_read_timeout_s,
+            "s3_max_attempts": self.s3_max_attempts,
             "store_id": self.store_id,
             "clickhouse_scheme": self.clickhouse_scheme,
             "clickhouse_host": self.clickhouse_host,
@@ -601,6 +644,13 @@ class NativeCaptureStorage:
 
         Call after the sink's own flush. Raises TimeoutError, carrying the
         last upload or index error, if the spool has not drained in time.
+        Returns on time, to within a bound: past ``timeout_s`` it starts
+        no upload and at most one index batch, leaving the rest to the
+        background loop -- about one ``clickhouse_request_timeout_s`` late
+        against a catalog or store that stopped answering, and up to about
+        6 s late when the deadline cuts a multipart upload, whose abort
+        nothing cuts (see
+        ``NativeCaptureStorageConfig.close_flush_timeout_s``).
         """
         if not self._service.flush(float(timeout_s)):
             snapshot = self._service.snapshot()

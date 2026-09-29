@@ -239,6 +239,10 @@ void NativeIndexer::read(IndexPlan* planned) {
     try {
       rows = read_pack_descriptor_rows(s3_, ref);
     } catch (const CatalogError& e) {
+      if (config_.end_read_when_store_unavailable &&
+          dynamic_cast<const StoreUnavailableError*>(&e) != nullptr) {
+        throw;
+      }
       std::string message = e.what();
       if (message.size() > 512) message.resize(512);
       result.failures.push_back(

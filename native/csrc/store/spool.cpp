@@ -1,5 +1,7 @@
 #include "spool.h"
 
+#include "cancel.h"
+
 #include <openssl/sha.h>
 
 #include <algorithm>
@@ -627,9 +629,16 @@ SpoolStatus Spool::ListPending(std::vector<StagedPack>* out, std::string* error)
   return Scan(out, false, error);
 }
 
+SpoolStatus Spool::ListPending(std::vector<StagedPack>* out, std::string* error,
+                               const Cancellation* cancel, bool* cut) {
+  return Scan(out, false, error, cancel, cut);
+}
+
 SpoolStatus Spool::Scan(std::vector<StagedPack>* out, bool discard_open_files,
-                        std::string* error) {
+                        std::string* error, const Cancellation* cancel,
+                        bool* cut) {
   out->clear();
+  if (cut) *cut = false;
   std::lock_guard<std::mutex> lock(mutex_);
   std::error_code ec;
   std::vector<std::string> readies;
@@ -660,6 +669,13 @@ SpoolStatus Spool::Scan(std::vector<StagedPack>* out, bool discard_open_files,
   }
   std::sort(readies.begin(), readies.end());
   for (const std::string& path : readies) {
+    if (cancel != nullptr && cancel->cancelled()) {
+      // Before the next pack's hash. The account below is rebuilt from a
+      // whole listing only; quarantines already made stand.
+      out->clear();
+      if (cut) *cut = true;
+      return SpoolStatus::kOk;
+    }
     const std::string name = fs::path(path).filename().string();
     std::string id, sum;
     uint64_t created = 0, records = 0;

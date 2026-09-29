@@ -116,6 +116,7 @@ py::dict snapshot_dict(const dc::StorageServiceSnapshot& s) {
   out["uploaded_packs"] = s.uploaded_packs;
   out["uploaded_bytes"] = s.uploaded_bytes;
   out["upload_failures"] = s.upload_failures;
+  out["cancelled_uploads"] = s.cancelled_uploads;
   out["indexed_packs"] = s.indexed_packs;
   out["indexed_rows"] = s.indexed_rows;
   out["index_failures"] = s.index_failures;

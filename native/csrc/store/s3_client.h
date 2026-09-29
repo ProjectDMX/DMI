@@ -20,7 +20,10 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "cancel.h"
 
 namespace dmi_store {
 
@@ -56,6 +59,10 @@ struct S3Response {
   std::map<std::string, std::string> headers;  // lowercased names
   std::string body;
   std::string error;
+  // The client's Cancellation cut the exchange short (ok is false): before
+  // an attempt, during its transfer, or in the backoff before a retry.
+  // Never retried.
+  bool cancelled = false;
 };
 
 // Parsed HEAD metadata the DMI pack layout stores per object.
@@ -81,6 +88,10 @@ struct ListResult {
 // S3's minimum size for every part of a multipart upload but the last.
 inline constexpr uint64_t kMinMultipartPartBytes = 5ull * 1024 * 1024;
 
+// The whole-request bound, connect included, on the AbortMultipartUpload a
+// cancel leads to: one attempt, since whoever cancelled is waiting on it.
+inline constexpr int kAbortAfterCancelTimeoutS = 5;
+
 class S3Client {
  public:
   // An invalid config (see ValidateConfig) does not throw: the client
@@ -96,17 +107,40 @@ class S3Client {
   S3Client& operator=(const S3Client&) = delete;
 
   const S3Config& config() const { return config_; }
+
+  // Every request from now on honours `cancel` (nullptr: none): none is
+  // sent once it is cancelled, a transfer in flight is aborted (libcurl's
+  // progress callback asks at least once a second, connecting included),
+  // and a retry's backoff wakes for it. A cancelled request fails with the
+  // error "request cancelled" and is not retried; a multipart upload it cut
+  // short is aborted with a request of its own, which the cancel does not
+  // cut (bounded by kAbortAfterCancelTimeoutS instead). Set it before the
+  // client is shared, and keep `cancel` alive as long as the client.
+  void set_cancellation(const Cancellation* cancel) { cancel_ = cancel; }
+  bool cancelled() const { return cancel_ != nullptr && cancel_->cancelled(); }
   // Attempts actually made by the last call (1 + retries), for tests.
   int last_attempts() const { return last_attempts_.load(std::memory_order_relaxed); }
 
   // HEAD /bucket/key. 404 → {found=false}, no error.
-  ObjectHead HeadObject(const std::string& key, std::string* error);
+  //
+  // On failure, *cancelled (when given, here and on GetRange and
+  // PutObject) says whether the Cancellation cut the call short -- before
+  // an attempt, in its transfer or in a retry's backoff -- rather than the
+  // store failing it: a cancel that merely comes in while a failure is
+  // reported does not count.
+  ObjectHead HeadObject(const std::string& key, std::string* error,
+                        bool* cancelled = nullptr);
 
   // GET /bucket/key, optionally Range: bytes=offset-(offset+length-1).
   // length==0 returns empty without a request (matches read_range).
-  // Short/oversized bodies are errors, not truncations.
+  // Short/oversized bodies are errors, not truncations. On failure,
+  // *unavailable (when given) says whether the store never answered for
+  // the object: a transport error or timeout, a retryable status on every
+  // attempt, or a cancel -- as against an answer about it (a 404, a 403, a
+  // short body), which says something about the object itself.
   bool GetRange(const std::string& key, uint64_t offset, uint64_t length,
-                std::vector<uint8_t>* out, std::string* error);
+                std::vector<uint8_t>* out, std::string* error,
+                bool* unavailable = nullptr, bool* cancelled = nullptr);
 
   // PUT /bucket/key with x-amz-content-sha256 over the exact bytes plus the
   // DMI metadata headers. Over multipart_threshold_bytes the call becomes
@@ -114,7 +148,7 @@ class S3Client {
   bool PutObject(const std::string& key, const uint8_t* data, size_t n,
                  const std::map<std::string, std::string>& metadata,
                  const std::string& content_type, std::string* etag_out,
-                 std::string* error);
+                 std::string* error, bool* cancelled = nullptr);
 
   bool DeleteObject(const std::string& key, std::string* error);
 
@@ -123,6 +157,15 @@ class S3Client {
   bool ListObjects(const std::string& prefix, const std::string& delimiter,
                    int max_keys, const std::string& continuation,
                    ListResult* out, std::string* error);
+
+  // Test seam: called each time an exchange has returned (every attempt of
+  // it done), before the call that made it reads the response. A test can
+  // cancel there, to stand for a cancel that comes in once a request has
+  // failed on its own -- the case *cancelled must not report. Set it
+  // before the client is shared.
+  void SetAfterExchangeHookForTesting(std::function<void()> hook) {
+    after_exchange_for_testing_ = std::move(hook);
+  }
 
   // Exposed for the fault-matrix tests: one raw signed exchange.
   S3Response Exchange(const std::string& method, const std::string& key,
@@ -140,16 +183,37 @@ class S3Client {
   // Atomic because SpoolUploader shares one client across its worker
   // threads, and every request writes this; a plain int was a data race.
   std::atomic<int> last_attempts_{0};
+  const Cancellation* cancel_ = nullptr;
+  std::function<void()> after_exchange_for_testing_;
+
+  // How one exchange departs from the config: whether the Cancellation
+  // applies, and (when positive) its own attempt count and whole-request
+  // timeout in seconds.
+  struct ExchangeOptions {
+    bool cancellable = true;
+    int max_attempts = 0;
+    int timeout_s = 0;
+  };
+  S3Response ExchangeWith(
+      const std::string& method, const std::string& key,
+      const std::vector<std::pair<std::string, std::string>>& query,
+      const std::map<std::string, std::string>& extra_headers,
+      const uint8_t* body, size_t body_len, const std::string& body_hash_hex,
+      const ExchangeOptions& options);
+  // Aborts a multipart upload: as configured, or -- after a cancel -- once,
+  // uncancelled, within kAbortAfterCancelTimeoutS.
+  void AbortMultipart(const std::string& key, const std::string& upload_id,
+                      bool after_cancel);
 
   // Multipart primitives (single PUT when under threshold).
   bool PutSingle(const std::string& key, const uint8_t* data, size_t n,
                  const std::map<std::string, std::string>& metadata,
                  const std::string& content_type, std::string* etag_out,
-                 std::string* error);
+                 std::string* error, bool* cancelled_out);
   bool PutMultipart(const std::string& key, const uint8_t* data, size_t n,
                     const std::map<std::string, std::string>& metadata,
                     const std::string& content_type, std::string* etag_out,
-                    std::string* error);
+                    std::string* error, bool* cancelled_out);
 };
 
 }  // namespace dmi_store
