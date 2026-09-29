@@ -237,7 +237,8 @@ def test_close_alone_delivers_the_tail_to_the_catalog(fake_s3, tmp_path):
     """No flush_and_wait: close() must still seal the sink's open pack and
     drain it into the catalog. The 60 s linger means nothing but a flush can
     seal it, and 3 records against max_pack_records=2 leave one record in the
-    open pack when close() runs."""
+    open pack when close() runs. The sink sealed, close() lets go of the
+    engine's spool directory and removes it."""
     from dmi.api.v1 import HookPointV1, HookSpecV1, MonitoringEngine, TransportSpec
     from dmi.config import MonitoringConfig
     from dmi.storage.capture import CaptureRecordFormat
@@ -282,6 +283,11 @@ def test_close_alone_delivers_the_tail_to_the_catalog(fake_s3, tmp_path):
         torch.cuda.synchronize()
 
         engine.close()  # no flush_and_wait
+
+        # The ring's release sealed the sink (sealed_on_release), so close()
+        # let go of the engine's own spool directory, and removed it once
+        # drained: no rank directory is left for anyone to adopt.
+        assert list((tmp_path / "spool").glob("*/r*-*")) == []
 
         reader = NativeCaptureReader(storage)
         selection = reader.select(tenant_id="tenant-gpu")
