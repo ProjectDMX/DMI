@@ -530,63 +530,110 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
       index_or_owe(std::move(owed));
     }
 
-    // 2. Upload everything the sink has staged -- but only with the lease
-    //    and nothing owed. Without the lease an uploaded pack could only be
+    // 2. Upload what the sink has staged -- but only with the lease and
+    //    nothing owed. Without the lease an uploaded pack could only be
     //    owed, and pending_index_ dies with the process: with
     //    reconcile_on_start off, a crash would leave it in the bucket and
     //    never in the catalog. Left in the spool it survives the crash.
-    //    A cancel (the flush deadline, or stop()) stops the uploader's
-    //    listing between packs, before the next pack's hash, starts no
-    //    upload, and cuts those in flight: those packs stay staged too.
-    //    So a flush whose time ran out before this point -- flush(0) --
-    //    hashes nothing: a listing already cancelled stops at the first
-    //    staged pack, and finds an empty spool empty, which then reports
-    //    drained.
-    dmi_store::UploadBatchResult batch;
-    if (catalog && pending_index_.empty()) {
-      batch = uploader_->UploadPending(-1);
-      if (batch.listing_cancelled) outcome.cut_short = true;
-    }
-    std::vector<PackRefData> to_index;
-    uint64_t uploaded_packs = 0;
-    uint64_t uploaded_bytes = 0;
+    //    The spool is listed once, since listing hashes every staged pack.
+    //    A cancel (the flush deadline, or stop()) stops the listing between
+    //    packs, before the next hash, starts no upload, and cuts those in
+    //    flight: those packs stay staged too. So a flush out of time before
+    //    this point -- flush(0) -- hashes nothing: a listing already
+    //    cancelled stops at the first staged pack, and finds an empty spool
+    //    empty, which then reports drained.
+    // 3. Index them -- a chunk of indexer.max_packs at a time, each chunk
+    //    indexed before the next is uploaded, so at most one chunk is ever
+    //    out of the spool and not yet in the catalog, remembered by this
+    //    process alone (stop() drops it). A cancel starts no further chunk,
+    //    so what the flush deadline or stop() finds unsent stays in the
+    //    spool, which any later start uploads, not owed in memory; a chunk
+    //    left owed, or a lease lost meanwhile, stops the uploads as in step
+    //    1. What a chunk uploaded it indexes, a cancel of the uploads or
+    //    not: past a flush's deadline, as its one batch past it
+    //    (index_bounded). Its reads end at stop(), or one request timeout
+    //    past a flush's deadline, leaving what they did not read owed.
+    // Every staged pack listed and uploaded: drained as far as flush() is
+    // concerned, since the listing came after the sink's flush.
+    bool uploaded_all = false;
+    bool listing_failed = false;
+    bool lost_lease = false;
     size_t upload_failures = 0;
-    size_t cancelled_uploads = 0;
-    for (size_t i = 0; i < batch.refs.size(); ++i) {
-      const dmi_store::PackRef& ref = batch.refs[i];
-      if (!ref.pack_id.empty()) {
-        to_index.push_back({ref.pack_id, ref.store_id, ref.object_key,
-                            ref.object_bytes, ref.checksum, ref.record_count});
-        ++uploaded_packs;
-        uploaded_bytes += ref.object_bytes;
-      } else if (i < batch.failures.size() && batch.failures[i].cancelled) {
-        ++cancelled_uploads;  // still staged; not the pack's fault
+    if (catalog && pending_index_.empty()) {
+      std::vector<dmi_store::StagedPack> staged;
+      std::string error;
+      bool cut = false;
+      if (spool_.ListPending(&staged, &error, &upload_cancel_, &cut) !=
+          dmi_store::SpoolStatus::kOk) {
+        record_error("spool listing failed: " + error);
+        listing_failed = true;
+      } else if (cut) {
+        outcome.cut_short = true;
       } else {
-        // A failed upload stays in the spool, so the next cycle retries it.
-        ++upload_failures;
-        if (i < batch.failures.size()) {
-          record_error("upload failed for " + batch.failures[i].object_key +
-                       ": " + batch.failures[i].error);
+        const size_t chunk =
+            static_cast<size_t>(std::max(1, config_.indexer.max_packs));
+        size_t next = 0;
+        while (next < staged.size()) {
+          if (next != 0) {
+            if (!pending_index_.empty()) break;  // the chunk before is owed
+            if (upload_cancel_.cancelled()) {
+              outcome.cut_short = true;
+              break;
+            }
+            // No request: a lease quarantined or refused meanwhile has
+            // already been dropped, and a fresh one is the next cycle's.
+            LeaseScope lease(this);
+            if (writer_.held_lease() == nullptr) {
+              lost_lease = true;
+              break;
+            }
+          }
+          const size_t end = std::min(staged.size(), next + chunk);
+          const dmi_store::UploadBatchResult batch = uploader_->UploadStaged(
+              std::vector<dmi_store::StagedPack>(staged.begin() + next,
+                                                 staged.begin() + end));
+          next = end;
+          std::vector<PackRefData> to_index;
+          uint64_t uploaded_packs = 0;
+          uint64_t uploaded_bytes = 0;
+          size_t failed_uploads = 0;
+          size_t cancelled_uploads = 0;
+          for (size_t i = 0; i < batch.refs.size(); ++i) {
+            const dmi_store::PackRef& ref = batch.refs[i];
+            if (!ref.pack_id.empty()) {
+              to_index.push_back({ref.pack_id, ref.store_id, ref.object_key,
+                                  ref.object_bytes, ref.checksum,
+                                  ref.record_count});
+              ++uploaded_packs;
+              uploaded_bytes += ref.object_bytes;
+            } else if (i < batch.failures.size() &&
+                       batch.failures[i].cancelled) {
+              ++cancelled_uploads;  // still staged; not the pack's fault
+            } else {
+              // A failed upload stays in the spool, so a later cycle
+              // retries it.
+              ++failed_uploads;
+              if (i < batch.failures.size()) {
+                record_error("upload failed for " +
+                             batch.failures[i].object_key + ": " +
+                             batch.failures[i].error);
+              }
+            }
+          }
+          if (cancelled_uploads != 0) outcome.cut_short = true;
+          upload_failures += failed_uploads;
+          {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            state_.uploaded_packs += uploaded_packs;
+            state_.uploaded_bytes += uploaded_bytes;
+            state_.upload_failures += failed_uploads;
+            state_.cancelled_uploads += cancelled_uploads;
+          }
+          index_or_owe(std::move(to_index));
         }
+        uploaded_all = next == staged.size() && upload_failures == 0;
       }
     }
-    if (cancelled_uploads != 0) outcome.cut_short = true;
-    {
-      std::lock_guard<std::mutex> lock(state_mutex_);
-      state_.uploaded_packs += uploaded_packs;
-      state_.uploaded_bytes += uploaded_bytes;
-      state_.upload_failures += upload_failures;
-      state_.cancelled_uploads += cancelled_uploads;
-    }
-
-    // 3. Index them, a cancel of the uploads or not: they are gone from
-    //    the spool, so until the catalog has them only this process
-    //    remembers them. Past a flush's deadline, one batch of them: the
-    //    rest stay owed, for the loop or a later flush, so that the flush
-    //    returns on time however many it uploaded. Their reads end at
-    //    stop(), or one request timeout past a flush's deadline, leaving
-    //    what they did not read owed.
-    index_or_owe(std::move(to_index));
 
     // 4. Reconcile on its interval, or when the pass at start() lost the
     //    lease before it finished -- in the loop's cycles only, and not
@@ -601,39 +648,15 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
       }
     }
 
-    // Drained: nothing failed to upload, every uploaded pack is in the
-    // catalog, and nothing is pending. A batch that uploaded everything it
-    // listed is drained as far as flush() is concerned -- its listing came
-    // after the sink's flush -- so the spool is re-listed only when the batch
-    // was empty, which UploadPending also returns when its listing FAILED.
-    // A cycle that already failed is not drained whatever the spool holds,
-    // so it skips the listing: an empty spool lists for free, but a backlog
-    // would be re-hashed on every cycle of an outage.
-    // Without the lease nothing can be confirmed in the catalog, so the
-    // cycle is not drained, and it counts towards the backoff. Packs a
-    // cancel or the deadline left owed make it cut short, not failed.
+    // Drained: every staged pack uploaded, every uploaded pack in the
+    // catalog, and nothing pending. Without the lease nothing can be
+    // confirmed in the catalog, so the cycle is not drained, and it counts
+    // towards the backoff. Packs a cancel or the deadline left owed make it
+    // cut short, not failed.
     if (deferred != 0) outcome.cut_short = true;
-    outcome.failed =
-        !catalog || upload_failures != 0 || pending_index_.size() > deferred;
-    bool nothing_pending = !batch.refs.empty();
-    if (batch.refs.empty() && !outcome.failed && !outcome.cut_short) {
-      // Cut between packs by a cancel, like the uploader's listing: a
-      // backlog staged since would otherwise be hashed to its end.
-      std::vector<dmi_store::StagedPack> pending;
-      std::string error;
-      bool cut = false;
-      const bool listed =
-          spool_.ListPending(&pending, &error, &upload_cancel_, &cut) ==
-          dmi_store::SpoolStatus::kOk;
-      if (!listed) {
-        record_error("spool listing failed: " + error);
-        outcome.failed = true;
-      } else if (cut) {
-        outcome.cut_short = true;
-      }
-      nothing_pending = listed && !cut && pending.empty();
-    }
-    outcome.drained = nothing_pending && !outcome.failed && !outcome.cut_short;
+    outcome.failed = !catalog || listing_failed || lost_lease ||
+                     upload_failures != 0 || pending_index_.size() > deferred;
+    outcome.drained = uploaded_all && !outcome.failed && !outcome.cut_short;
     std::lock_guard<std::mutex> lock(state_mutex_);
     ++state_.cycles;
   } catch (const CatalogError& exc) {

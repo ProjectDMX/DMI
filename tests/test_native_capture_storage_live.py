@@ -1355,12 +1355,17 @@ def test_a_flush_against_a_slow_catalog_indexes_one_batch_past_its_deadline(
     it still indexed everything it had uploaded, batch after batch. Against
     a catalog that answers slowly but inside the request timeout no request
     fails, so the overrun grew with the batches -- 8 one-pack batches at
-    0.4 s a statement ran a 1 s flush for 59 s. Past the deadline a
-    flush now starts no further batch: it finishes the one in flight (or
-    indexes one batch of what it uploaded) and leaves the rest owed, for
-    the loop, or a later flush, to index. (Its index reads are cut one
-    request timeout past the deadline too, which ends the pass; the request
-    timeout here outlasts all eight batches, so that is not what ends it.)"""
+    0.4 s a statement ran a 1 s flush for 59 s. Past the deadline a flush
+    then started no further batch, and left the rest of what it had
+    uploaded owed: gone from the spool, and remembered only by the service
+    -- so close(), which stops the service after its flush, dropped it,
+    and only a later start's reconcile could find those packs in the
+    bucket; with reconcile_on_start off, none did. A cycle now uploads a
+    chunk of indexer_max_packs at a time and indexes it before the next, so
+    past the deadline it indexes the one chunk it uploaded and leaves the
+    rest in the spool, which any later start uploads. (Its index reads are
+    cut one request timeout past the deadline too; the request timeout
+    here outlasts the batch, so that is not what ends it.)"""
     from dmi.storage.native_capture import _load_native_store_extension
 
     request_timeout = 60.0
@@ -1381,28 +1386,93 @@ def test_a_flush_against_a_slow_catalog_indexes_one_batch_past_its_deadline(
         try:
             tensors = _stage(spool_root, range(16))  # eight packs
             switch.delay_requests(_slow_catalog(0.4, 0.4))
+            # close()'s order: a flush on the budget, then stop().
             started = time.monotonic()
             drained = service.flush(1.0)
             elapsed = time.monotonic() - started
             snapshot = service.snapshot()
-            # One batch past the deadline -- about 7 s of statements at
-            # 0.4 s each, the lease's included -- not eight (59 s before).
-            assert elapsed < 1.0 + 12.0, (elapsed, snapshot)
-            assert drained is False
-            assert snapshot["uploaded_packs"] == 8, snapshot
-            assert snapshot["indexed_packs"] == 1, snapshot
-            assert snapshot["pending_index"] == 7, snapshot
-            # Left owed by the deadline: neither failed nor set aside.
-            assert snapshot["index_failures"] == 0, snapshot
-
-            switch.restore()
-            assert service.flush(60.0)
-            assert service.snapshot()["indexed_packs"] == 8
         finally:
-            switch.close()
             service.stop()
+            switch.close()
 
-        direct = _storage_config(fake_s3, catalog.table_prefix)
+        # One batch past the deadline -- about 7 s of statements at 0.4 s
+        # each, the lease's included -- not eight (59 s before).
+        assert elapsed < 1.0 + 12.0, (elapsed, snapshot)
+        assert drained is False
+        assert snapshot["uploaded_packs"] == 1, snapshot
+        assert snapshot["indexed_packs"] == 1, snapshot
+        # Nothing owed for stop() to drop: the rest never left the spool.
+        assert snapshot["pending_index"] == 0, snapshot
+        assert snapshot["index_failures"] == 0, snapshot
+        assert len(_ready(spool_root)) == 7
+
+        # A successor that does not reconcile -- a shared bucket's setting
+        # -- still gets every capture into the catalog.
+        direct = _storage_config(fake_s3, catalog.table_prefix,
+                                 reconcile_on_start=False)
+        successor = _service(direct, spool_root)
+        successor.start()
+        try:
+            successor.flush(60.0)
+        finally:
+            successor.stop()
+        assert _ready(spool_root) == []
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_a_close_whose_budget_ends_mid_upload_leaves_nothing_owed(
+        fake_s3, tmp_path):
+    """close() flushes the service on what is left of its budget, then
+    stops it. The flush's cycle uploaded pack after pack until the
+    deadline, each deleted from the spool once its upload was verified,
+    and past the deadline indexed one batch of them: the rest were owed,
+    in memory only, and stop() dropped them -- in the bucket, out of the
+    spool and out of the catalog, for a later start's reconcile alone to
+    find. A cycle uploads a chunk of indexer_max_packs at a time now and
+    indexes it before the next, so at the deadline at most the chunk in
+    flight is owed, and the flush indexes it; the rest stays in the spool.
+    Here uploads take about 0.3 s a pack, one at a time, so a 2 s budget
+    runs out a few packs into the twelve."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="close-mid-upload",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            uploader_max_workers=1, indexer_max_packs=4)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(24))  # twelve packs
+            s3.delay_requests(lambda request: 0.3 if _put(request) else 0.0)
+            # close()'s order: a flush on the budget, then stop().
+            drained = service.flush(2.0)
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+            s3.close()
+
+        assert drained is False
+        assert 0 < snapshot["uploaded_packs"] < 12, snapshot
+        assert snapshot["pending_index"] == 0, snapshot
+        assert snapshot["indexed_packs"] == snapshot["uploaded_packs"], snapshot
+        assert len(_ready(spool_root)) == 12 - snapshot["uploaded_packs"]
+
+        # A successor that does not reconcile -- a shared bucket's setting
+        # -- still gets every capture into the catalog.
+        direct = _storage_config(fake_s3, catalog.table_prefix,
+                                 reconcile_on_start=False)
+        successor = _service(direct, spool_root)
+        successor.start()
+        try:
+            successor.flush(60.0)
+        finally:
+            successor.stop()
+        assert _ready(spool_root) == []
         assert sorted(_read_all(direct)) == sorted(tensors)
 
 

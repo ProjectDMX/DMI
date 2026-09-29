@@ -4,14 +4,17 @@
 //   NativePackSink -> spool  (the sink, in the capture process)
 //   spool -> SpoolUploader -> object store -> NativeIndexer -> catalog  (here)
 //
-// One background thread runs a cycle: upload everything pending, index what
-// was uploaded, keep the publisher lease alive, and periodically reconcile the
-// bucket against the catalog. The conformance drivers exercise each of these
+// One background thread runs a cycle: upload what is pending and index it, a
+// chunk at a time, keep the publisher lease alive, and periodically reconcile
+// the bucket against the catalog. The conformance drivers exercise each of these
 // pieces; this is what composes them outside a test.
 //
 // SpoolUploader removes a pack from the spool the moment its upload is
 // verified, before anything indexes it, so the spool alone cannot say what is
-// still owed to the catalog. Two things cover the gap:
+// still owed to the catalog. A cycle uploads a chunk of indexer.max_packs at
+// a time and indexes it before it uploads the next, so at most one chunk is
+// in that gap at once, and a cycle cut short leaves the rest in the spool.
+// Two things cover the gap:
 //   - in-process, a pack whose indexing fails stays on a retry list, and
 //     flush() does not report drained until that list is empty. Nothing new
 //     is uploaded while it is not, so an outage leaves new packs in the
@@ -153,14 +156,14 @@ struct StorageServiceConfig {
   // take the lease and sweep while the first is still writing; one on
   // another (database, table_prefix) never meets the lease at all. Its
   // Recover() also lists the first's sealed packs, which the first may
-  // upload too. A cycle checks the lease once, before its upload batch, and
-  // UploadPending does not stop when the lease is lost: a holder that is
-  // quarantined, or refused a renewal or publish, while a batch is in
-  // flight finishes that batch (which can outlast the TTL), and only its
-  // later cycles upload nothing while it holds no lease. One whose catalog
+  // upload too. A cycle checks the lease before each chunk it uploads, and
+  // the uploads in flight do not stop when the lease is lost: a holder that
+  // is quarantined, or refused a renewal or publish, while a chunk is in
+  // flight finishes that chunk (which can outlast the TTL), and uploads
+  // nothing more while it holds no lease. One whose catalog
   // requests stall gives the lease up at its deadline, before its row
   // lapses: requests made under the lease are cut off there, and a cycle's
-  // check abandons a lease past it (LeaseScope), so no batch starts after
+  // check abandons a lease past it (LeaseScope), so no chunk starts after
   // that. Only a holder whose whole process stalls keeps the lease locally
   // past its row: until it resumes and next checks, or -- after a system
   // suspend, which the steady clock the deadline runs on does not count --
@@ -237,14 +240,15 @@ class CaptureStorageService {
   // including while a cycle already in flight outlives the deadline, and
   // once stop() has begun. The cycles it runs honour the deadline: they
   // skip the reconcile (the loop runs it), and at the deadline their
-  // uploads are cancelled, each pack cut short left in the spool. What a
-  // cycle has uploaded it still indexes, since until then only this
-  // process remembers it -- but past the deadline no index batch starts
-  // after the first: that batch's object-store reads are cut one catalog
-  // request timeout past the deadline, and its catalog statements are
-  // never cut mid-flight, each bounded by the client's request timeout
-  // (under the lease, by the lease deadline). What it leaves unindexed
-  // stays owed, for the loop or a later flush. A pass ends at its first
+  // uploads are cancelled, each pack cut short left in the spool, and no
+  // further chunk starts, so what is not uploaded by then stays in the
+  // spool. The chunk a cycle has uploaded it still indexes, since until
+  // then only this process remembers it -- but past the deadline no index
+  // batch starts after the first: that batch's object-store reads are cut
+  // one catalog request timeout past the deadline, and its catalog
+  // statements are never cut mid-flight, each bounded by the client's
+  // request timeout (under the lease, by the lease deadline). What it
+  // leaves unindexed stays owed, for the loop or a later flush. A pass ends at its first
   // failure, so a flush overruns its deadline by about one request
   // timeout against a catalog or an object store that stopped answering,
   // and by one batch of statements against a slow catalog that still
@@ -257,14 +261,16 @@ class CaptureStorageService {
   // Stop the background cycle and release the lease. Does not flush. Its
   // object-store work is cancelled first: a spool listing stops between
   // packs; an upload in flight is aborted, its pack left in the spool for
-  // the next start; an index read in flight is cut, its pack left owed --
-  // which stop() drops, so it waits in the bucket for a start's reconcile
-  // (reconcile_on_start); a retry backoff ends, and so does the
-  // reconcile. What stop() still waits for is the catalog work in flight,
-  // never cut mid-flight, the abort of a multipart upload it cut (one
-  // attempt, 5 s at most), and the lease release, each catalog request
-  // bounded by the client's request timeout (under the lease, by the lease
-  // deadline); the lease renews until the loop is done.
+  // the next start, with every pack no upload has reached; an index read
+  // in flight is cut, its pack left owed -- which stop() drops, so it waits
+  // in the bucket for a start's reconcile (reconcile_on_start); that is at
+  // most the one chunk a cycle has uploaded and not yet indexed. A retry
+  // backoff ends, and so does the reconcile. What stop() still waits for
+  // is the catalog work in flight, never cut mid-flight, the abort of a
+  // multipart upload it cut (one attempt, 5 s at most), and the lease
+  // release, each catalog request bounded by the client's request timeout
+  // (under the lease, by the lease deadline); the lease renews until the
+  // loop is done.
   void stop();
 
   StorageServiceSnapshot snapshot() const;

@@ -114,6 +114,11 @@ class SpoolUploader {
   // uploads nothing — see the comment at the byte gate in uploader.cpp.
   UploadBatchResult UploadPending(int limit = -1);
 
+  // Upload `pending`, packs a ListPending already returned, as UploadPending
+  // does after its listing: in their order, refs and failures positional.
+  // A caller that uploads a listing in parts lists it once.
+  UploadBatchResult UploadStaged(std::vector<StagedPack> pending);
+
   // Upload one staged entry with retry. Public for tests. *cancelled_out
   // (when given) says whether a cancel ended it.
   bool UploadOne(const StagedPack& staged, PackRef* ref, int* attempts_out,

@@ -851,9 +851,9 @@ class MonitoringEngine:
         self._capture_storage = None
         # Best effort: once the sink is sealed, a pack that does not reach
         # the catalog here is still in the spool, which the next start on it
-        # uploads, or uploaded but unindexed, which only the next start's
-        # reconcile finds (reconcile_on_start, on by default).
-        # flush_and_wait is the boundary that reports.
+        # uploads, or uploaded but unindexed -- one index batch at most --
+        # which only the next start's reconcile finds (reconcile_on_start,
+        # on by default). flush_and_wait is the boundary that reports.
         try:
             storage.flush(max(0.0, deadline - time.monotonic()))
         except Exception as exc:

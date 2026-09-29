@@ -269,14 +269,16 @@ class NativeCaptureStorageConfig:
     # the sink (sealing its open pack), then waits for the service to get
     # the staged packs into the catalog, and stops the service when the
     # budget is spent, whatever is left. That stays in the spool, which the
-    # next start on it uploads, or -- uploaded but not yet indexed -- in the
-    # bucket, which only the next start's reconcile indexes
-    # (reconcile_on_start). Past the budget the drain starts no upload -- one
-    # in flight is cut, and a multipart one then aborted, one request of at
-    # most 5 s -- and at most one index batch: its object-store reads are
-    # cut one clickhouse_request_timeout_s past the budget, and its catalog
-    # statements are never cut, each bounded by that timeout (under the
-    # publisher lease, by the lease's deadline when that is sooner).
+    # next start on it uploads, or -- uploaded but not yet indexed, one index
+    # batch of packs at most, since the service indexes what it uploads a
+    # batch at a time -- in the bucket, which only the next start's
+    # reconcile indexes (reconcile_on_start). Past the budget the drain
+    # starts no upload -- one in flight is cut, and a multipart one then
+    # aborted, one request of at most 5 s -- and at most one index batch:
+    # its object-store reads are cut one clickhouse_request_timeout_s past
+    # the budget, and its catalog statements are never cut, each bounded by
+    # that timeout (under the publisher lease, by the lease's deadline when
+    # that is sooner).
     # Stopping the service then releases the lease: one more catalog
     # request, bounded the same way -- or, when a lease renewal is in
     # flight, that renewal, which it waits for (a lease the renewal loses
