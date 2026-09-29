@@ -32,6 +32,7 @@ catalog through the next process on the node for the same catalog.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -592,8 +593,35 @@ def validate_capture_bounds(
             "uploader_max_in_flight_bytes")
 
 
+_LOG = logging.getLogger(__name__)
+
 # The spool directory's owner-lock modes (native/csrc/store/spool.h).
 SPOOL_OWNER_LOCKS = ("take", "held_by_caller")
+
+# The spool layout's directory names (native/csrc/store/spool.h).
+_CATALOG_KEY = re.compile(r"[0-9a-f]{12}")
+_RANK_DIRECTORY = re.compile(r"r(?:0|[1-9][0-9]{0,18})-[0-9a-f]{8}")
+
+
+def _packs_outside_the_layout(spool_root: str) -> tuple[int, Optional[str]]:
+    """Ready packs under ``spool_root`` that no rank directory of the layout
+    holds -- left by an engine from before the layout, or by a sink-only or
+    explicit-record_sink run, which write into ``spool_root`` itself -- and
+    the first one met. Only names are read, and the rank directories, which
+    adoption drains, are not walked."""
+    count, example = 0, None
+    for directory, subdirectories, files in os.walk(spool_root):
+        relative = os.path.relpath(directory, spool_root)
+        depth = 0 if relative == "." else relative.count(os.sep) + 1
+        if depth == 1 and _CATALOG_KEY.fullmatch(os.path.basename(directory)):
+            subdirectories[:] = [name for name in subdirectories
+                                 if not _RANK_DIRECTORY.fullmatch(name)]
+        for name in files:
+            if name.endswith(".dmi-pack.ready"):
+                count += 1
+                if example is None:
+                    example = os.path.join(directory, name)
+    return count, example
 
 
 def _spool_producer_rank() -> int:
@@ -660,14 +688,35 @@ def claim_spool_directory(
     already held. Raises ``SpoolOwnedError`` (a ``RuntimeError``) if another
     process holds it, and ``ValueError`` for a shared filesystem or a
     directory nested in another spool.
+
+    Ready packs under ``spool_root`` outside the layout -- an engine from
+    before it spooled into ``<spool_root>/v1/...``, and a sink-only or
+    explicit-``record_sink`` run still does -- are adopted by nothing, so a
+    claim logs a warning naming how many there are, one of them, and a
+    directory of the layout to move them into for adoption.
     """
     module = _load_native_store_extension()
     directory = module.spool_rank_directory(
         sink_config.spool_root, storage_config._spool_destination(),
         _spool_producer_rank())
-    return SpoolClaim(module.SpoolOwnerLock(
+    claim = SpoolClaim(module.SpoolOwnerLock(
         directory,
         allow_shared_filesystem=sink_config.spool_allow_shared_filesystem))
+    count, example = _packs_outside_the_layout(sink_config.spool_root)
+    if count:
+        orphanage = os.path.join(sink_config.spool_root,
+                                 os.path.basename(os.path.dirname(directory)),
+                                 "r0-00000000")
+        _LOG.warning(
+            "spool_root %s holds %d ready pack(s) outside the per-process "
+            "layout (for example %s), which no engine adopts: left by an "
+            "engine from before the layout, or by a sink-only or "
+            "explicit-record_sink run. If they are bound for this catalog "
+            "and store, move them, keeping their paths below spool_root "
+            "(v1/...), into a directory of the layout nobody owns, such as "
+            "%s, and the next start on this node adopts them",
+            sink_config.spool_root, count, example, orphanage)
+    return claim
 
 
 def spool_owner_lock_beside(spool_root: str) -> str:

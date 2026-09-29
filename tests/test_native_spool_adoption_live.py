@@ -501,6 +501,68 @@ def test_a_dead_spool_this_service_can_never_upload_is_left_and_reported(
         lock.release_and_remove_if_empty()
 
 
+def test_packs_left_outside_the_layout_are_adopted_once_moved_as_told(
+        fake_s3, tmp_path, caplog):
+    """A sink-only run (or an engine from before the layout) leaves its
+    packs in spool_root itself, where nothing adopts them. The claim's
+    warning names a directory of the layout to move them into; moved there
+    with their paths kept, they are adopted like a dead process's."""
+    import logging
+    import shutil
+
+    import torch  # noqa: F401 -- the sink extension links against it
+
+    from dmi.storage.native_capture import (
+        NativeSinkConfig, claim_spool_directory,
+    )
+
+    base = tmp_path / "spool"
+    with _catalog() as prefix:
+        config = _storage_config(fake_s3, prefix)
+        sys.path.insert(0, str(BUILD))
+        try:
+            import _dmi_native_sink
+        finally:
+            sys.path.remove(str(BUILD))
+        sink = _dmi_native_sink.NativePackSink(
+            spool_root=str(base), layout=LAYOUT,
+            max_pack_records=RECORDS_PER_PACK, max_linger_ns=600 * 10**9)
+        lease = sink.attach()
+        envelope = _envelope(STAGED_BY_THE_DEAD)
+        sink.submit_envelope(LAYOUT, envelope.rows, envelope.payload())
+        assert sink.flush_and_wait(60.0)
+        del lease, sink
+        flat = sorted((base / "v1").rglob("*.dmi-pack.ready"))
+        assert len(flat) == len(STAGED_BY_THE_DEAD) // RECORDS_PER_PACK
+
+        with caplog.at_level(logging.WARNING,
+                             logger="dmi.storage.native_capture"):
+            claim = claim_spool_directory(
+                NativeSinkConfig(spool_root=str(base)), config)
+        (warning,) = [record.getMessage() for record in caplog.records
+                      if "outside" in record.getMessage()]
+        key = Path(claim.directory).parent.name
+        target = base / key / "r0-00000000"
+        assert f"{len(flat)} ready pack(s)" in warning
+        assert str(target) in warning
+
+        target.mkdir()
+        shutil.move(str(base / "v1"), str(target / "v1"))
+        service = _service(config, claim.directory)
+        service.start()
+        try:
+            _wait_for(_adopted(service, 1))
+            assert not target.exists()
+            service.flush(60.0)
+            expected = {
+                capture_id: tensor.contiguous().view(-1).numpy().tobytes()
+                for capture_id, tensor in envelope.expected.items()}
+            assert _read_all(config) == expected
+        finally:
+            service.stop()
+        claim.release()
+
+
 def test_a_sibling_whose_owner_dies_after_start_is_adopted_by_a_recheck(
         fake_s3, tmp_path):
     """A sibling still owned when the service starts -- a predecessor still

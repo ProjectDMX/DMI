@@ -296,6 +296,48 @@ def test_a_dead_siblings_bytes_count_against_the_sinks_budget(tmp_path):
         claim.release()
 
 
+def test_a_claim_warns_of_packs_left_outside_the_layout(tmp_path, caplog):
+    """Before the per-process layout the engine spooled into
+    <spool_root>/v1/... and its next start swept and uploaded whatever a
+    crashed run left there; a sink-only run still writes there. Nothing
+    adopts packs outside <spool_root>/<key>/r<rank>-<inc>/ now, so a claim
+    says so -- how many, where, and how to hand them to adoption -- rather
+    than leave them silently."""
+    import logging
+
+    from dmi.storage.native_capture import (
+        NativeSinkConfig, claim_spool_directory,
+    )
+
+    root = tmp_path / "root"
+    sink = NativeSinkConfig(spool_root=str(root))
+    # Packs inside the layout are adoption's, and no reason to warn.
+    first = claim_spool_directory(sink, _config())
+    (Path(first.directory) / "v1").mkdir()
+    (Path(first.directory) / "v1" / "in.dmi-pack.ready").write_bytes(b"x")
+    first._lock.release()
+    with caplog.at_level(logging.WARNING, logger="dmi.storage.native_capture"):
+        claim = claim_spool_directory(sink, _config())
+    claim.release()
+    assert not [r for r in caplog.records if "outside" in r.getMessage()]
+
+    flat = root / "v1" / "tenant=t" / "date=2026-09-01"
+    flat.mkdir(parents=True)
+    for name in ("a", "b"):
+        (flat / f"{name}.dmi-pack.ready").write_bytes(b"pack")
+    (flat / ".c.0badf00d.open").write_bytes(b"half")  # not a pack
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="dmi.storage.native_capture"):
+        claim = claim_spool_directory(sink, _config())
+    key = Path(claim.directory).parent.name
+    claim.release()
+    (warning,) = [r.getMessage() for r in caplog.records
+                  if "outside" in r.getMessage()]
+    assert "2 ready pack(s)" in warning
+    assert str(flat) in warning
+    assert f"{root}/{key}/r0-00000000" in warning
+
+
 def test_a_dropped_spool_claim_keeps_its_directory_owned(tmp_path):
     """Only release() lets go of a claim. An engine dropped without close()
     drops its claim, while the ring and the sink it activated may still be

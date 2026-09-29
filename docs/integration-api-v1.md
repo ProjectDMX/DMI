@@ -223,7 +223,15 @@ are refused (by statfs `f_type`) unless `NativeSinkConfig.spool_allow_shared_fil
 filesystem that is itself local, such as fuse-overlayfs, needs too. Without
 `capture_storage_config` the sink owns `spool_root` itself. With an explicit
 `record_sink`, the service drains `spool_root` as that sink writes it,
-unswept and adopting nothing.
+unswept and adopting nothing. Upgrading from an engine without this layout: it
+spooled into `<spool_root>/v1/...` and its next start uploaded what a crashed
+run left there, but nothing adopts packs outside the layout now -- nor those a
+sink-only or explicit-`record_sink` run leaves in `spool_root`. Each
+`create_record_runtime` logs a warning while any are there, with their count,
+one of them, and a directory of the layout nobody owns
+(`<spool_root>/<catalog_key>/r0-00000000/`); moved into it with their paths
+below `spool_root` kept (`v1/...`), packs bound for this catalog and store are
+adopted by the next start on the node.
 To reach a secured catalog, set `clickhouse_scheme="https"` (and the server's
 TLS HTTP port, usually 8443) on `NativeCaptureStorageConfig`. The client always
 verifies the server's certificate and name, against libcurl's built-in CA
