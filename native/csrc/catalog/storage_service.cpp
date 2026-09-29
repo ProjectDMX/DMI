@@ -797,10 +797,12 @@ void CaptureStorageService::finish_adoption() {
   }
   std::string error;
   if (!adoption->lock.ReleaseAndRemoveIfEmpty(&error)) {
-    // Nothing to upload is left, only files that are not packs (a
-    // quarantined one, say): the directory stays for someone to look at.
+    // Nothing to upload is left, only files that are not its packs (a
+    // quarantined one, a spool directory nested in it): the directory
+    // stays for someone to look at.
     block_sibling(directory, "it was drained, but still holds files that "
-                             "are not packs");
+                             "are not its packs (a quarantined pack, or a "
+                             "spool directory nested in it)");
   }
 }
 

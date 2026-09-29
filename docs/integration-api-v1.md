@@ -229,7 +229,13 @@ are refused (by statfs `f_type`) unless `NativeSinkConfig.spool_allow_shared_fil
 filesystem that is itself local, such as fuse-overlayfs, needs too. Without
 `capture_storage_config` the sink owns `spool_root` itself. With an explicit
 `record_sink`, the service drains `spool_root` as that sink writes it,
-unswept and adopting nothing. Upgrading from an engine without this layout: it
+unswept and adopting nothing. Both of those modes pass over the rank
+directories under `spool_root` -- what a crashed or undrained default-mode run
+left there is the next default-mode start's to adopt -- so switching to them
+(the rollback to an explicit `record_sink` included) works after such a run.
+They are refused, naming the holder, while a default-mode process on the node
+holds a rank directory under that `spool_root`, and a default-mode start is
+refused while one of them holds `spool_root`. Upgrading from an engine without this layout: it
 spooled into `<spool_root>/v1/...` and its next start uploaded what a crashed
 run left there, but nothing adopts packs outside the layout now -- nor those a
 sink-only or explicit-`record_sink` run leaves in `spool_root`. Each

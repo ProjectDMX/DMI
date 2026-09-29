@@ -31,16 +31,20 @@
 //     naming the holder, beside another process's lock, and kBadArgument
 //     when nothing holds it. Standalone callers -- the drivers, adoption --
 //     take.
-// A directory nested under a HELD spool directory, or containing one with
-// a .owner.lock file (held or not: a dead directory's packs are for its
-// successor to adopt), is refused: Scan walks recursively, so the outer
-// spool's Recover would reach into the inner one. An unheld lock file
-// ABOVE refuses nothing -- every take leaves its file behind -- since the
-// next take of that directory meets this one's lock file below it. The
-// check runs after the lock is taken, so of two processes taking an outer
-// and a nested directory at once, at least one is refused. <root>/_refs/ is
-// never scanned: the upload handoff's ref files live there (plan section
-// 2.4). The spool must be node-local: NFS, Lustre, BeeGFS, CIFS/SMB2, FUSE,
+// A spool never walks into a subdirectory with a .owner.lock of its own --
+// another spool directory nested in it, live or dead -- to count, sweep,
+// list or upload what it holds: a dead one's packs are for its successor to
+// adopt, under its own keys. So a flat spool_root (the sink-only mode, an
+// explicit record_sink) passes over the rank directories a crashed
+// default-mode run left under it, and an adopter over a spool someone put
+// inside the dead directory it drains. A directory nested under, or
+// containing, a HELD spool directory is refused at the take, since the
+// outer spool's walk could meet the inner one before its lock file is
+// there; one nobody holds refuses nothing (every take leaves its file
+// behind). The check runs after the lock is taken, so of two processes
+// taking an outer and a nested directory at once, at least one is refused.
+// <root>/_refs/ is never scanned: the upload handoff's ref files live there
+// (plan section 2.4). The spool must be node-local: NFS, Lustre, BeeGFS, CIFS/SMB2, FUSE,
 // GPFS, 9p, AFS and OrangeFS are refused by statfs f_type unless
 // allow_shared_filesystem is set, since none guarantees a flock that
 // excludes a process on another node.
@@ -48,9 +52,9 @@
 // The Python DurablePackSpool (spool.py) takes no lock, and its recover()
 // deletes every .open file under its root; the C++ spool is deliberately
 // stricter, and that is not ported to the reference. Nor is skipping
-// <root>/_refs/: the reference counts, sweeps and quarantines .open and
-// .ready files there like any others, which the C++ spool leaves alone --
-// a C++-only divergence, deliberately not ported.
+// <root>/_refs/, or a nested spool directory: the reference counts, sweeps
+// and quarantines .open and .ready files there like any others, which the
+// C++ spool leaves alone -- C++-only divergences, deliberately not ported.
 
 #ifndef DMI_STORE_SPOOL_H_
 #define DMI_STORE_SPOOL_H_
@@ -234,8 +238,8 @@ class SpoolOwnerLock {
   // parent ever meets the directory before its owner holds it -- and records
   // this host and pid in it. kOwned, naming the holder, when another holder
   // has it; kBadArgument for a shared filesystem or a directory nested
-  // under, or containing, an owned one (see above), after letting go of
-  // the lock and of whatever this call created.
+  // under, or containing, a held one (see above), after letting go of the
+  // lock and of whatever this call created.
   static SpoolStatus Acquire(const std::string& dir,
                              bool allow_shared_filesystem,
                              SpoolOwnerLock* out, std::string* error);

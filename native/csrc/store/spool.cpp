@@ -98,6 +98,24 @@ bool AtRefsDirectory(const fs::recursive_directory_iterator& it) {
          it->is_directory(ec);
 }
 
+// Whether a recursive walk of a spool is at a subdirectory with a lock
+// file of its own: another spool directory nested in this one -- a rank
+// directory of the layout under a flat spool_root, a claim's staging copy,
+// a root someone put inside a dead rank directory -- live or dead. No walk
+// of this spool enters it, for counting, sweeping, listing or uploading: a
+// live one's owner is writing it, and a dead one's packs are its
+// successor's to adopt, under its own keys, not this spool's.
+bool AtNestedSpool(const fs::recursive_directory_iterator& it) {
+  std::error_code ec;
+  return it->is_directory(ec) && !it->is_symlink(ec) &&
+         fs::exists(it->path() / kOwnerLockFile, ec);
+}
+
+// Every walk of a spool's own files skips these two.
+bool AtSkippedDirectory(const fs::recursive_directory_iterator& it) {
+  return AtRefsDirectory(it) || AtNestedSpool(it);
+}
+
 std::string Hostname() {
   char host[256] = {0};
   if (::gethostname(host, sizeof(host) - 1) != 0 || host[0] == '\0') {
@@ -430,24 +448,28 @@ std::string CanonicalPath(const std::string& path, std::string* error) {
   return out;
 }
 
-// A spool directory must not be nested under, or contain, another owned
-// directory: Scan walks recursively, so the outer spool's Recover would
-// sweep the inner one's .open files and upload its packs under the outer
-// spool's keys. Run AFTER `dir`'s own lock is taken, so that of two takes
-// racing on an outer directory and one inside it, at least one sees the
-// other: each publishes its lock before it looks.
-//   - An ancestor refuses while its lock is HELD. A lock file nobody holds
-//     is a spool that was (every take leaves its file behind); whoever
-//     takes that ancestor next meets this directory's lock file in its own
-//     descendant walk, and is refused.
-//   - A descendant refuses when it has a lock file at all, held or not: a
-//     dead directory's packs are its successor's to adopt, not this
-//     spool's to sweep and upload under its own keys. Except a claim's
-//     staging copy (IsSpoolClaimStagingName) that nobody holds: a claim
-//     killed before its rename, which holds nothing but its lock file. (One
-//     that is held is a claim in progress, and refuses; one not yet locked
-//     publishes after this walk, so its own ancestor check sees this lock.)
+// A spool directory must not be nested under, or contain, another one that
+// is owned: Scan walks recursively, and although every walk passes over a
+// subdirectory with a lock file of its own (AtNestedSpool), the outer
+// spool's walk can reach one before its owner's lock file is there -- a
+// take of an existing directory creates it -- and sweep the .open files
+// its owner then writes. Run AFTER `dir`'s own lock is taken, so that of
+// two takes racing on an outer directory and one inside it, at least one
+// sees the other: each publishes its lock before it looks. Only a HELD
+// lock refuses, in either direction. One nobody holds is a spool that was:
+// every take leaves its file behind, a spool_root a sink-only run once
+// owned holds one, and a crashed default-mode run leaves its rank
+// directory's under spool_root. Such a directory's packs are left alone by
+// every walk of the other (AtNestedSpool) -- a dead one inside is for its
+// successor to adopt -- so it refuses nothing: the rank directories under
+// a flat spool_root and that spool_root's own modes (sink-only, explicit
+// record_sink) take turns, and never run at once.
 SpoolStatus CheckNotNested(const std::string& dir, std::string* error) {
+  const auto holder = [](const SpoolOwner& owner) {
+    return owner.pid > 0 ? "pid " + std::to_string(owner.pid) + " on host " +
+                               owner.host
+                         : std::string("another owner");
+  };
   fs::path ancestor(dir);
   while (ancestor.has_parent_path() && ancestor.parent_path() != ancestor) {
     ancestor = ancestor.parent_path();
@@ -458,11 +480,9 @@ SpoolStatus CheckNotNested(const std::string& dir, std::string* error) {
       if (error) {
         *error = "spool directory " + dir + " is nested under the spool "
                  "directory " + ancestor.string() + ", which " +
-                 (owner.pid > 0 ? "pid " + std::to_string(owner.pid) +
-                                      " on host " + owner.host
-                                : std::string("another owner")) +
-                 " holds (" + kOwnerLockFile + "), and whose recovery "
-                 "would sweep this one; use a directory outside it";
+                 holder(owner) + " holds (" + kOwnerLockFile + "), and whose "
+                 "recovery would sweep this one; use a directory outside "
+                 "it, or wait for that owner to end";
       }
       return SpoolStatus::kBadArgument;
     }
@@ -474,15 +494,14 @@ SpoolStatus CheckNotNested(const std::string& dir, std::string* error) {
     if (it->path().filename() != kOwnerLockFile) continue;
     const fs::path owned = it->path().parent_path();
     if (owned == fs::path(dir)) continue;
-    if (IsSpoolClaimStagingName(owned.filename().string()) &&
-        !ReadSpoolOwner(owned.string(), nullptr)) {
-      continue;
-    }
+    SpoolOwner owner;
+    if (!ReadSpoolOwner(owned.string(), &owner)) continue;  // dead: left be
     if (error) {
-      *error = "spool directory " + dir + " contains the owned spool "
-               "directory " + owned.string() + " (it has " + kOwnerLockFile +
-               "), which this one's recovery would sweep; use a directory "
-               "that does not contain it";
+      *error = "spool directory " + dir + " contains the spool directory " +
+               owned.string() + ", which " + holder(owner) + " holds (" +
+               kOwnerLockFile + "), and which this one's recovery could "
+               "sweep while its owner writes it; use a directory that does "
+               "not contain it, or wait for that owner to end";
     }
     return SpoolStatus::kBadArgument;
   }
@@ -1298,7 +1317,7 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
   // later retry of one of them is recognised as already counted.
   for (auto it = fs::recursive_directory_iterator(out->root_, ec);
        it != fs::recursive_directory_iterator(); ++it) {
-    if (AtRefsDirectory(it)) {
+    if (AtSkippedDirectory(it)) {
       it.disable_recursion_pending();
       continue;
     }
@@ -1367,7 +1386,7 @@ uint64_t Spool::ChargedSiblingBytes() const {
     std::error_code walk_ec;
     for (fs::recursive_directory_iterator walk(sibling, walk_ec), last;
          !walk_ec && walk != last; walk.increment(walk_ec)) {
-      if (AtRefsDirectory(walk)) {
+      if (AtSkippedDirectory(walk)) {
         walk.disable_recursion_pending();
         continue;
       }
@@ -1426,7 +1445,7 @@ void Spool::ReconcileCommittedLocked() {
   std::error_code walk_ec;
   for (auto it = fs::recursive_directory_iterator(root_, walk_ec);
        it != fs::recursive_directory_iterator(); ++it) {
-    if (AtRefsDirectory(it)) {
+    if (AtSkippedDirectory(it)) {
       it.disable_recursion_pending();
       continue;
     }
@@ -1749,7 +1768,7 @@ SpoolStatus Spool::Scan(std::vector<StagedPack>* out, bool discard_open_files,
   std::unordered_map<std::string, uint64_t> seen_ready;
   for (auto it = fs::recursive_directory_iterator(root_, ec);
        it != fs::recursive_directory_iterator(); ++it) {
-    if (AtRefsDirectory(it)) {
+    if (AtSkippedDirectory(it)) {
       it.disable_recursion_pending();
       continue;
     }

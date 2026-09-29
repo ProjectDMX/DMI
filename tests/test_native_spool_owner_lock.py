@@ -7,9 +7,11 @@ when it opens a directory with ``owner_lock="take"`` (the default), and a
 second process that tries is refused, told who holds it. What that lock
 must also refuse, and what it must leave alone:
 
-* a directory nested under a held one, or containing one with a lock file:
-  Scan walks recursively, so the outer spool's cleanup would reach into the
-  inner one;
+* a directory nested under, or containing, a held one: Scan walks
+  recursively, so the outer spool's cleanup would reach into the inner one
+  while its owner writes it -- and every walk passes over a subdirectory
+  with a lock file of its own, so a dead spool directory inside another is
+  left for its successor to adopt;
 * ``owner_lock="held_by_caller"`` unless THIS process holds the lock: that
   mode opens without a lock of its own, for a second Spool in the process
   that holds one. Beside another process's lock it is refused, naming the
@@ -27,7 +29,8 @@ The Python spool (dmi.storage.capture.spool) takes no lock; the C++ spool is
 deliberately stricter, and that is not ported to the reference. Skipping
 ``_refs/`` is C++-only as well: the reference's constructor counts, and its
 recover() sweeps and quarantines, ``.open`` and ``.ready`` files there, and
-that divergence is deliberate, not ported either.
+that divergence is deliberate, not ported either, like passing over
+nested spool directories.
 
 Build: make -C native build/conformance_spool build/conformance_sink
 """
@@ -160,21 +163,36 @@ def test_a_directory_containing_an_owned_one_is_refused(tmp_path):
         holder.close()
 
 
-def test_a_stale_lock_file_above_does_not_refuse_a_nested_directory(tmp_path):
-    """Above, only a HELD lock refuses: every take leaves its lock file
-    behind, so a spool_root some spool once owned would otherwise refuse
-    every directory under it for good. Below, the lock FILE refuses, held
-    or not: a dead directory's packs are for its successor to adopt, not
-    for the outer spool to sweep and upload under its own keys -- so the
-    next process to take the outer directory is refused."""
+def test_a_dead_spool_directory_inside_another_is_left_alone(tmp_path):
+    """Nesting refuses only while the other directory's lock is HELD. Above:
+    every take leaves its lock file behind, so a spool_root some spool once
+    owned would otherwise refuse every directory under it for good. Below:
+    a dead directory's packs are for its successor to adopt, not for the
+    outer spool to sweep and upload under its own keys -- so every walk of
+    a spool passes over a subdirectory with a lock file of its own, and the
+    outer take goes through. Refused instead, as it was, a spool_root that
+    a crashed default-mode run left a rank directory in refused the
+    sink-only and explicit-record_sink modes, the rollback included."""
     outer = tmp_path / "spool"
     assert _spool(op="recover", root=str(outer))["ok"]
     assert (outer / ".owner.lock").exists()
-    assert _spool(op="recover", root=str(outer / "inner"))["ok"]
-    assert (outer / "inner" / ".owner.lock").exists()
+    inner = outer / "inner"
+    assert _spool(op="recover", root=str(inner))["ok"]
+    assert (inner / ".owner.lock").exists()
+    (inner / "v1").mkdir()
+    stale = inner / "v1" / ".018f0000-0000-7000-8000-000000000001.abcd1234.open"
+    stale.write_bytes(b"in progress")
+    bogus = inner / "v1" / READY_NAME  # the wrong checksum: quarantined if met
+    bogus.write_bytes(b"not a pack")
+
     response = _spool(op="recover", root=str(outer))
-    assert not response["ok"], response
-    assert "contains" in response["what"], response
+
+    assert response["ok"], response
+    assert response["staged"] == []
+    assert response["snapshot"] == {"entries": 0, "bytes": 0}
+    assert stale.exists() and bogus.exists()
+    assert sorted(p.name for p in (inner / "v1").iterdir()) == sorted(
+        [stale.name, bogus.name])
 
 
 def test_held_by_caller_is_refused_beside_another_processs_holder(tmp_path):

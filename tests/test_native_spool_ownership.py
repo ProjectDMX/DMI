@@ -289,6 +289,52 @@ def test_a_spool_root_a_sink_once_owned_still_takes_rank_directories(tmp_path):
 
 
 @pytest.mark.skipif(not SINK_BUILT, reason="the native sink module is not built")
+def test_a_crashed_default_run_leaves_spool_root_to_the_other_modes(tmp_path):
+    """The reverse of the stale lock above: a default-mode run that dies
+    (or whose close did not drain) leaves its rank directory, lock file
+    and all, under spool_root. The sink-only mode (the sink takes
+    spool_root) and the explicit-record_sink rollback (the service takes
+    it) were then refused as containing an "owned" directory nobody held,
+    until a default-mode start adopted it -- the rollback blocked just when
+    it is most likely needed. Both now take spool_root, pass over the dead
+    directory, and leave it to adoption; a live one still refuses them."""
+    pytest.importorskip("torch")
+    from dmi.storage.native_capture import (
+        NativeSinkConfig, claim_spool_directory,
+    )
+
+    root = tmp_path / "root"
+    sink_config = NativeSinkConfig(spool_root=str(root))
+    crashed = claim_spool_directory(sink_config, _config())
+    dead = Path(crashed.directory)
+    (dead / "v1").mkdir()
+    left = dead / "v1" / "left.dmi-pack.ready"
+    left.write_bytes(b"pack")
+    in_flight = dead / "v1" / ".left.0badf00d.open"
+    in_flight.write_bytes(b"half")
+    crashed._lock.release()  # killed: the kernel let go, the files stay
+    assert _store().spool_owner(str(dead)) is None
+
+    service = _service(_config(), root, spool_owner_lock="take")  # rollback
+    del service
+    sink = _sink(root)  # sink-only
+    _stage_one(sink)
+    del sink
+    flat = sorted((root / "v1").rglob("*.dmi-pack.ready"))
+    assert len(flat) == 1
+    assert left.read_bytes() == b"pack" and in_flight.exists()
+
+    live = claim_spool_directory(sink_config, _config())
+    try:
+        with pytest.raises(RuntimeError, match="contains the spool directory"):
+            _service(_config(), root, spool_owner_lock="take")
+        with pytest.raises(RuntimeError, match=f"pid {os.getpid()}"):
+            _sink(root)
+    finally:
+        live.release()
+
+
+@pytest.mark.skipif(not SINK_BUILT, reason="the native sink module is not built")
 def test_a_dead_siblings_bytes_count_against_the_sinks_budget(tmp_path):
     """Each process start claims a fresh rank directory. A sink that
     charged only its own let every crash-restart add a whole

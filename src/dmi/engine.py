@@ -506,7 +506,9 @@ class MonitoringEngine:
 
         An explicit ``record_sink`` writes where it was built to: the
         service drains ``spool_root`` itself, unswept and with no siblings
-        to adopt, beside the sink's lock if this process holds one.
+        to adopt, beside the sink's lock if this process holds one. It
+        passes over the rank directories under ``spool_root``, which a
+        default-mode start adopts.
         """
         config = self._capture_storage_config
         if config is None or self._storage_backend != "persistent":

@@ -687,7 +687,8 @@ def claim_spool_directory(
     ``RANK`` (0 when unset). The directory is created with its owner lock
     already held. Raises ``SpoolOwnedError`` (a ``RuntimeError``) if another
     process holds it, and ``ValueError`` for a shared filesystem or a
-    directory nested in another spool.
+    directory nested in a spool that another owner holds (a sink-only or
+    explicit-``record_sink`` run on ``spool_root``).
 
     Ready packs under ``spool_root`` outside the layout -- an engine from
     before it spooled into ``<spool_root>/v1/...``, and a sink-only or

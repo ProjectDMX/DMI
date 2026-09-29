@@ -10,8 +10,9 @@
 //   3. A second process is refused, told the holder's pid and host; the
 //      lock goes with its holder, even one killed with SIGKILL, and a child
 //      it forked without exec does not keep it.
-//   4. Nesting: a directory under a HELD one, or containing one with a lock
-//      file, is refused -- also when two processes take the pair at once.
+//   4. Nesting: a directory under, or containing, a HELD one is refused --
+//      also when two processes take the pair at once -- and a dead one
+//      nested in a spool is left alone by all of its walks.
 //   5. The node-local check refuses NFS, Lustre, BeeGFS, CIFS/SMB2, FUSE,
 //      GPFS, 9p, AFS and OrangeFS by statfs f_type, unless explicitly
 //      allowed (a test seam stands in for statfs).
@@ -539,34 +540,126 @@ void TestAnOuterAndANestedTakeRacingNeverBothWin() {
   CHECK(outer_won + inner_won > 0);
 }
 
-// (4c) An ancestor refuses only while its lock is HELD. A lock file nobody
-// holds is a spool that was -- every take leaves its file behind -- and
-// refusing on it kept a spool_root that a sink-only run once owned from
-// ever holding rank directories. Whoever takes the outer directory next
-// meets the inner one's lock file below it and is refused, held or not.
+// (4c) Nesting refuses only while the other directory's lock is HELD. A
+// lock file nobody holds is a spool that was -- every take leaves its file
+// behind -- and a dead spool directory inside another is never the outer
+// one's to sweep, count or upload under its own keys: every walk of a
+// spool passes over a subdirectory with its own lock file. So a spool_root
+// that a sink-only run once owned still takes rank directories, and a
+// spool_root that a crashed default-mode run left a rank directory in
+// still takes the sink-only or explicit-record_sink modes (the rollback),
+// which leave that directory to adoption.
 void TestAStaleLockFileAboveDoesNotRefuseANestedDirectory() {
   const std::string base = FreshRoot("stale-above");
+  const std::string root = base + "/root";
+  const std::string rank = root + "/0123456789ab/r0-0a1b2c3d";
   std::string error;
   {
     SpoolOwnerLock once;
-    CHECK(SpoolOwnerLock::Acquire(base + "/root", false, &once, &error) ==
+    CHECK(SpoolOwnerLock::Acquire(root, false, &once, &error) ==
           SpoolStatus::kOk);
   }
-  CHECK(fs::exists(base + "/root/.owner.lock"));
+  CHECK(fs::exists(root + "/.owner.lock"));
   SpoolOwnerLock inner;
   error.clear();
-  CHECK(SpoolOwnerLock::Acquire(base + "/root/0123456789ab/r0-0a1b2c3d",
-                                false, &inner, &error) == SpoolStatus::kOk);
+  CHECK(SpoolOwnerLock::Acquire(rank, false, &inner, &error) ==
+        SpoolStatus::kOk);
   CHECK(error.empty());
   SpoolOwnerLock outer;
-  CHECK(SpoolOwnerLock::Acquire(base + "/root", false, &outer, &error) ==
+  CHECK(SpoolOwnerLock::Acquire(root, false, &outer, &error) ==
         SpoolStatus::kBadArgument);
   CHECK(Contains(error, "contains"));
-  inner.Release();  // its lock file stays: still refused
+  CHECK(Contains(error, rank));
+  CHECK(Contains(error, "pid " + std::to_string(::getpid())));
+  // The inner one stages a pack and has a stage in flight, then dies.
+  {
+    SpoolConfig config{rank, 1 << 20};
+    config.owner_lock = OwnerLock::kHeldByCaller;
+    Spool writer;
+    CHECK(Spool::Open(config, &writer, &error) == SpoolStatus::kOk);
+    CHECK(StageOne(writer, 1, &error) == SpoolStatus::kOk);
+  }
+  const std::string in_flight =
+      rank + "/v1/.018f0000-0000-7000-8000-00000000beef.0badf00d.open";
+  std::ofstream(in_flight) << "half a pack";
+  inner.Release();
+  // Its lock file stays, and nobody holds it: the outer take goes through,
+  // and nothing of the outer spool touches the dead one.
+  Spool flat;
   error.clear();
-  CHECK(SpoolOwnerLock::Acquire(base + "/root", false, &outer, &error) ==
+  CHECK(Spool::Open({root, 150}, &flat, &error) == SpoolStatus::kOk);
+  CHECK(flat.Snapshot().bytes == 0);
+  std::vector<dmi_store::StagedPack> staged;
+  CHECK(flat.Recover(&staged, &error) == SpoolStatus::kOk);
+  CHECK(staged.empty());
+  CHECK(fs::exists(in_flight));
+  CHECK(StageOne(flat, 2, &error) == SpoolStatus::kOk);  // 100 of 150
+  CHECK(flat.ListPending(&staged, &error) == SpoolStatus::kOk);
+  CHECK(staged.size() == 1 && staged[0].object_key.rfind("v1/", 0) == 0);
+  size_t dead_packs = 0;
+  for (const auto& entry : fs::recursive_directory_iterator(rank)) {
+    if (entry.path().extension() == ".ready") ++dead_packs;
+  }
+  CHECK(dead_packs == 1);
+  // And while the outer one holds the root, the rank directory cannot be
+  // taken: an adopter would first have to wait for it.
+  SpoolOwnerLock again;
+  error.clear();
+  CHECK(SpoolOwnerLock::Acquire(rank, false, &again, &error) ==
         SpoolStatus::kBadArgument);
-  CHECK(Contains(error, "contains"));
+  CHECK(Contains(error, "nested"));
+}
+
+// (4e) An adopter takes a dead directory's lock with TryAdopt, which runs
+// no nesting check, then Recovers it. A live spool nested inside that dead
+// directory -- a root put there, which the nesting rule admits under an
+// unheld lock -- had its in-flight .open files swept by that Recover, and
+// its packs listed under the outer directory's keys. Every walk passes
+// over a subdirectory with its own lock file, so the adoption drains only
+// the dead directory's own packs and leaves the directory in place.
+void TestAnAdopterLeavesASpoolNestedInADeadOneAlone() {
+  const std::string base = FreshRoot("nested-in-dead");
+  const std::string dead = base + "/0123456789ab/r0-0000dead";
+  const std::string nested = dead + "/inner";
+  std::string error;
+  {
+    Spool gone;
+    CHECK(Spool::Open({dead, 1 << 20}, &gone, &error) == SpoolStatus::kOk);
+    CHECK(StageOne(gone, 1, &error) == SpoolStatus::kOk);
+  }  // its owner died
+  SpoolOwnerLock live;
+  CHECK(SpoolOwnerLock::Acquire(nested, false, &live, &error) ==
+        SpoolStatus::kOk);
+  {
+    SpoolConfig config{nested, 1 << 20};
+    config.owner_lock = OwnerLock::kHeldByCaller;
+    Spool writer;
+    CHECK(Spool::Open(config, &writer, &error) == SpoolStatus::kOk);
+    CHECK(StageOne(writer, 2, &error) == SpoolStatus::kOk);
+  }
+  const std::string in_flight =
+      nested + "/v1/.018f0000-0000-7000-8000-00000000beef.0badf00d.open";
+  std::ofstream(in_flight) << "half a pack";
+
+  SpoolOwnerLock adopter;
+  CHECK(SpoolOwnerLock::TryAdopt(dead, &adopter, &error) == SpoolStatus::kOk);
+  SpoolConfig config{dead, 1 << 20};
+  config.owner_lock = OwnerLock::kHeldByCaller;
+  Spool adopted;
+  CHECK(Spool::Open(config, &adopted, &error) == SpoolStatus::kOk);
+  CHECK(adopted.Snapshot().bytes == 100);  // its own pack only
+  std::vector<dmi_store::StagedPack> staged;
+  CHECK(adopted.Recover(&staged, &error) == SpoolStatus::kOk);
+  CHECK(fs::exists(in_flight));
+  CHECK(staged.size() == 1);
+  if (staged.size() == 1) {
+    CHECK(staged[0].object_key.rfind("v1/", 0) == 0);
+    CHECK(adopted.Remove(staged[0], &error) == SpoolStatus::kOk);
+  }
+  // Drained of its own, it still holds the live one: it stays.
+  CHECK(!adopter.ReleaseAndRemoveIfEmpty(&error));
+  CHECK(fs::exists(in_flight));
+  CHECK(live.held());
 }
 
 // (4d) A claim killed between creating its directory's staging copy
@@ -1051,6 +1144,7 @@ int main() {
   TestAnOuterAndANestedTakeRacingNeverBothWin();
   TestAStaleLockFileAboveDoesNotRefuseANestedDirectory();
   TestAnUnheldClaimStagingDirectoryRefusesNothing();
+  TestAnAdopterLeavesASpoolNestedInADeadOneAlone();
   TestSharedFilesystemsAreRefusedUnlessAllowed();
   TestAdoptionLocksOnlyWhatExistsAndIsDead();
   TestALockOnAnUnlinkedFileIsTakenAgain();
