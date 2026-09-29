@@ -482,11 +482,16 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
     // 3. Index them.
     index_or_owe(std::move(to_index), catalog);
 
-    // 3a. A dead sibling an earlier adoption pass left undrained, under the
-    //     same rule as the uploads above: only with the lease, nothing owed
-    //     and nothing of our own failing.
-    if (catalog && adoption_owed_ && pending_index_.empty() &&
-        upload_failures == 0) {
+    // 3a. A dead sibling an earlier adoption pass left undrained, or -- on
+    //     the recheck interval -- a sibling that was alive then and may have
+    //     died since, under the same rule as the uploads above: only with
+    //     the lease, nothing owed and nothing of our own failing.
+    const bool recheck_due =
+        live_siblings_ && config_.adoption_recheck_interval_ns > 0 &&
+        steady_ns() - last_adoption_ns_ >=
+            config_.adoption_recheck_interval_ns;
+    if (catalog && (adoption_owed_ || recheck_due) &&
+        pending_index_.empty() && upload_failures == 0) {
       adopt_siblings();
     }
 
@@ -600,10 +605,17 @@ void CaptureStorageService::adopt_siblings() {
   clear_dead_claim_staging(claim_staging);
   std::sort(siblings.begin(), siblings.end());
   bool owed = false;
+  uint64_t live = 0;
   for (const std::string& sibling : siblings) {
-    if (!adopt_sibling(sibling)) owed = true;
+    bool alive = false;
+    if (!adopt_sibling(sibling, &alive)) owed = true;
+    if (alive) ++live;
   }
   adoption_owed_ = owed;
+  live_siblings_ = live != 0;
+  last_adoption_ns_ = steady_ns();
+  std::lock_guard<std::mutex> state(state_mutex_);
+  state_.live_siblings = live;
 }
 
 void CaptureStorageService::clear_dead_claim_staging(
@@ -630,12 +642,23 @@ void CaptureStorageService::clear_dead_claim_staging(
   }
 }
 
-bool CaptureStorageService::adopt_sibling(const std::string& directory) {
+bool CaptureStorageService::adopt_sibling(const std::string& directory,
+                                          bool* live) {
+  *live = false;
+  // A live owner answers a non-blocking probe at once; TryAdopt would retry
+  // for a few milliseconds first, on every recheck.
+  if (dmi_store::ReadSpoolOwner(directory, nullptr)) {
+    *live = true;
+    return true;
+  }
   dmi_store::SpoolOwnerLock lock;
   std::string error;
   const dmi_store::SpoolStatus locked =
       dmi_store::SpoolOwnerLock::TryAdopt(directory, &lock, &error);
-  if (locked == dmi_store::SpoolStatus::kOwned) return true;  // it lives
+  if (locked == dmi_store::SpoolStatus::kOwned) {  // it lives
+    *live = true;
+    return true;
+  }
   if (locked != dmi_store::SpoolStatus::kOk) {
     // Another adopter drained and removed it meanwhile: nothing is owed.
     if (!std::filesystem::exists(directory)) return true;

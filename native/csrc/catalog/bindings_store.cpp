@@ -100,6 +100,8 @@ dc::StorageServiceConfig service_config(const py::dict& d) {
       d, "spool_allow_shared_filesystem", c.spool_allow_shared_filesystem);
   c.adopt_sibling_spools =
       get<bool>(d, "adopt_sibling_spools", c.adopt_sibling_spools);
+  c.adoption_recheck_interval_ns = get<uint64_t>(
+      d, "adoption_recheck_interval_ns", c.adoption_recheck_interval_ns);
   c.s3 = s3_config(d);
   c.uploader.store_id = get<std::string>(d, "store_id", c.uploader.store_id);
   c.uploader.max_workers = get<int>(d, "uploader_max_workers", c.uploader.max_workers);
@@ -152,6 +154,7 @@ py::dict snapshot_dict(const dc::StorageServiceSnapshot& s) {
   out["adopted_spools"] = s.adopted_spools;
   out["adopted_packs"] = s.adopted_packs;
   out["adoption_owed"] = s.adoption_owed;
+  out["live_siblings"] = s.live_siblings;
   out["failed"] = s.failed;
   out["lease_state"] = s.lease_state;
   // Seconds on the monotonic clock, comparable with time.monotonic() (both

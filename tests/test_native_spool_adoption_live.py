@@ -15,7 +15,8 @@ lock held -- is left alone.
 
 When the object store is down at start, the dead directory stays as it
 was (its packs are durable there), flush() does not report drained, and
-the loop adopts it once the store is back.
+the loop adopts it once the store is back. A sibling whose owner is still
+alive at start and dies later is adopted by a later pass.
 
 Needs ClickHouse on 127.0.0.1:8123/9000 and the native sink and store
 modules: make -C native build/_dmi_native_sink build/_dmi_native_store
@@ -287,6 +288,85 @@ def test_a_dead_spool_waits_in_place_while_the_object_store_is_down(
             assert snapshot["adopted_spools"] == 1, snapshot
             assert not dead.exists()
             assert _read_all(config) == _expected()
+        finally:
+            service.stop()
+        lock.release_and_remove_if_empty()
+
+
+def _stage_into(directory: str, indexes) -> None:
+    """Stage records into a directory this process holds, as its own sink
+    would: the REAL native pack sink, held_by_caller."""
+    import torch  # noqa: F401 -- the sink extension links against it
+
+    sys.path.insert(0, str(BUILD))
+    try:
+        import _dmi_native_sink
+    finally:
+        sys.path.remove(str(BUILD))
+    sink = _dmi_native_sink.NativePackSink(
+        spool_root=directory, layout=LAYOUT,
+        max_pack_records=RECORDS_PER_PACK, max_linger_ns=600 * 10**9,
+        owner_lock="held_by_caller")
+    lease = sink.attach()
+    envelope = _envelope(indexes)
+    sink.submit_envelope(LAYOUT, envelope.rows, envelope.payload())
+    assert sink.flush_and_wait(60.0)
+    sink.rethrow_if_failed()
+    del lease, sink
+
+
+def test_a_sibling_whose_owner_dies_after_start_is_adopted_by_a_recheck(
+        fake_s3, tmp_path):
+    """A sibling still owned when the service starts -- a predecessor still
+    inside its close(), another rank that dies later -- is left alone then.
+    The service looks again every adoption_recheck_interval_ns while it
+    has such a sibling, and adopts it once its owner is gone, rather than
+    leaving its packs for the next restart on the node."""
+    base = tmp_path / "spool"
+    with _catalog() as prefix:
+        config = _storage_config(fake_s3, prefix)
+        sibling = _claim(base, config)
+        sibling_directory = Path(sibling.directory)
+        _stage_into(sibling.directory, STAGED_BY_THE_DEAD)
+        staged = sorted(sibling_directory.rglob("*.dmi-pack.ready"))
+        assert len(staged) == len(STAGED_BY_THE_DEAD) // RECORDS_PER_PACK
+
+        lock = _claim(base, config)
+        native = config._native_dict()
+        native.update(
+            spool_root=lock.directory, spool_max_bytes=1 << 30,
+            holder="recheck-test", poll_interval_ns=50_000_000,
+            sweep_spool_on_start=True, spool_owner_lock="held_by_caller",
+            adopt_sibling_spools=True,
+            adoption_recheck_interval_ns=200_000_000,
+            **config._lease_native())
+        service = _store().StorageService(native)
+        service.start()
+        try:
+            snapshot = service.snapshot()
+            assert snapshot["live_siblings"] == 1, snapshot
+            assert snapshot["adopted_spools"] == 0, snapshot
+            assert snapshot["adoption_owed"] is False, snapshot
+            assert sorted(sibling_directory.rglob(
+                "*.dmi-pack.ready")) == staged
+
+            sibling.release()  # its owner is gone
+            deadline = time.monotonic() + 30
+            while ((service.snapshot()["adopted_spools"] == 0
+                    or service.snapshot()["live_siblings"] != 0)
+                   and time.monotonic() < deadline):
+                time.sleep(0.05)
+            snapshot = service.snapshot()
+            assert snapshot["adopted_spools"] == 1, snapshot
+            assert snapshot["adopted_packs"] == len(staged), snapshot
+            assert snapshot["live_siblings"] == 0, snapshot
+            assert not sibling_directory.exists()
+            assert service.flush(60.0)
+            expected = {
+                capture_id: tensor.contiguous().view(-1).numpy().tobytes()
+                for capture_id, tensor in _envelope(
+                    STAGED_BY_THE_DEAD).expected.items()}
+            assert _read_all(config) == expected
         finally:
             service.stop()
         lock.release_and_remove_if_empty()

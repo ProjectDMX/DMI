@@ -112,8 +112,15 @@ struct StorageServiceConfig {
   // could not be drained (no lease, an upload that failed, a pack still
   // owed) is retried by the loop's cycles, and flush() does not report
   // drained until it has been. Live siblings -- another rank or job on this
-  // node -- are left alone.
+  // node, a predecessor still closing -- are left alone, and are not owed.
   bool adopt_sibling_spools = false;
+  // While a pass found a live sibling, the loop passes over the siblings
+  // again this often, so one whose owner dies later -- a predecessor that
+  // was still inside close() when this service started, a rank that
+  // crashes while this one runs -- is adopted then, not at the next
+  // restart on the node. A live sibling costs one non-blocking lock probe
+  // per pass. 0 never looks again after start().
+  uint64_t adoption_recheck_interval_ns = 30'000'000'000ull;
 
   dmi_store::S3Config s3;
   dmi_store::UploaderConfig uploader;  // uploader.store_id names the store
@@ -203,6 +210,8 @@ struct StorageServiceSnapshot {
   uint64_t adopted_spools = 0;
   uint64_t adopted_packs = 0;
   bool adoption_owed = false;
+  // Siblings whose owner was alive at the last adoption pass.
+  uint64_t live_siblings = 0;
   // A foreign lease outlived 2 x TTL: the service stopped for good.
   bool failed = false;
   // "none" before start, "held", "quarantined" (an unknown outcome set the
@@ -291,8 +300,9 @@ class CaptureStorageService {
   // adoption_owed_ to whether one was left undrained. Requires
   // cycle_mutex_. Only a lost lease propagates.
   void adopt_siblings();
-  // Adopts one sibling; false when it is owed another try.
-  bool adopt_sibling(const std::string& directory);
+  // Adopts one sibling; false when it is owed another try. Sets *live
+  // when its owner is alive (not owed: it is its owner's).
+  bool adopt_sibling(const std::string& directory, bool* live);
   // Removes the staging copies (dmi_store::IsSpoolClaimStagingName) that
   // claims killed before their rename left under the catalog key.
   void clear_dead_claim_staging(
@@ -380,6 +390,11 @@ class CaptureStorageService {
   bool reconcile_owed_ = false;
   // An adoption pass left a dead sibling undrained. Guarded by cycle_mutex_.
   bool adoption_owed_ = false;
+  // The last adoption pass found a live sibling, and when it ran: the loop
+  // passes again every adoption_recheck_interval_ns. Guarded by
+  // cycle_mutex_.
+  bool live_siblings_ = false;
+  uint64_t last_adoption_ns_ = 0;
   int failure_streak_ = 0;  // consecutive failed cycles, for the backoff
   // Uploaded, so gone from the spool, but not yet in the catalog.
   std::vector<PackRefData> pending_index_;
