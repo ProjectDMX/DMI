@@ -1,0 +1,268 @@
+"""B6 through the Python surface: one owner per spool directory.
+
+``_dmi_native_store`` binds the spool's owner lock (``SpoolOwnerLock``), the
+section 2.3 layout (``spool_rank_directory``) and who owns a directory
+(``spool_owner``); the storage service and the native pack sink each open
+their spool with ``owner_lock="take"`` or ``"held_by_caller"``.
+
+The regression this pins is the in-process one: a sink and a storage
+service on ONE directory in ONE process. Were each to take the lock, the
+second would be refused by the first -- flock binds to an open file
+description, not to the process -- so the engine holds one SpoolOwnerLock
+and opens both held_by_caller. The service is constructed, not started:
+start() needs a catalog, which the live suites bring
+(test_native_spool_adoption_live.py, test_native_capture_chain_live.py).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[1]
+BUILD = REPO / "native" / "build"
+STORE_BUILT = bool(sorted(BUILD.glob("_dmi_native_store*.so")))
+SINK_BUILT = bool(sorted(BUILD.glob("_dmi_native_sink*.so")))
+
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skipif(
+        not STORE_BUILT,
+        reason="the native store module is not built; run `make -C native "
+        "build/_dmi_native_store PYTHON=<venv>/bin/python`"),
+]
+
+LAYOUT = "capture_pack_reference_v1"
+NFS_SUPER_MAGIC = 0x6969
+
+
+def _store():
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    return _load_native_store_extension()
+
+
+def _config(**overrides):
+    from dmi.storage.native_capture import NativeCaptureStorageConfig
+
+    fields = dict(
+        s3_endpoint="http://127.0.0.1:9", s3_bucket="bucket",
+        s3_access_key="AKIA-test", s3_secret_key="secret-test",
+        s3_allow_insecure_http=True, clickhouse_port=9)
+    fields.update(overrides)
+    return NativeCaptureStorageConfig(**fields)
+
+
+def _rank_directory(base: Path, config, rank: int = 0) -> str:
+    return _store().spool_rank_directory(
+        str(base), config.database, config.table_prefix, config.store_id,
+        rank)
+
+
+def _service(config, spool_root, **options):
+    from dmi.storage.native_capture import NativeCaptureStorage
+
+    return NativeCaptureStorage(config, spool_root=str(spool_root),
+                                spool_max_bytes=1 << 30, sweep_spool=True,
+                                **options)
+
+
+def _sink(spool_root, **options):
+    sys.path.insert(0, str(BUILD))
+    try:
+        import _dmi_native_sink
+    finally:
+        sys.path.remove(str(BUILD))
+    return _dmi_native_sink.NativePackSink(
+        spool_root=str(spool_root), layout=LAYOUT, max_pack_records=4,
+        **options)
+
+
+def _stage_one(sink) -> None:
+    """One float16 capture through the sink's ring-facing submit."""
+    import torch
+    from dmi.storage.capture import CaptureMetadata
+
+    tensor = torch.arange(6, dtype=torch.float16)
+    metadata = CaptureMetadata(
+        capture_id="own-0", tenant_id="t", experiment_id="e", run_id="r",
+        session_id="s", request_id="q", sequence_id="n", model_id="m",
+        model_revision="mr", adapter_revision=None,
+        capture_policy_version="v", hook_name="resid_post", layer_number=0,
+        producer_rank=0, step_number=0, token_start=0, token_end=1,
+        batch_position=0, dtype="float16", shape=(6,),
+        captured_at_ns=1_700_000_000_000_000_000,
+    ).to_mapping()
+    lease = sink.attach()
+    sink.submit_envelope(LAYOUT, [{
+        "metadata_json": json.dumps(metadata), "offset": 0, "length": 12,
+        "dtype": 5, "shape": [6]}], tensor.view(torch.uint8))
+    assert sink.flush_and_wait(30.0)
+    sink.rethrow_if_failed()
+    del lease
+
+
+@pytest.mark.skipif(not SINK_BUILT, reason="the native sink module is not built")
+def test_the_real_sink_and_service_share_one_spool_in_one_process(tmp_path):
+    pytest.importorskip("torch")
+    config = _config()
+    directory = _rank_directory(tmp_path / "spool", config)
+    with _store().SpoolOwnerLock(directory) as lock:
+        service = _service(config, directory,
+                           spool_owner_lock="held_by_caller",
+                           adopt_sibling_spools=True)
+        sink = _sink(directory, owner_lock="held_by_caller")
+        _stage_one(sink)
+        assert len(list(Path(directory).rglob("*.dmi-pack.ready"))) == 1
+        snapshot = service.snapshot()
+        assert snapshot["adopted_spools"] == 0
+        assert snapshot["adoption_owed"] is False
+        # Neither Spool took a lock of its own: the one holder is this
+        # process, through `lock`.
+        assert _store().spool_owner(directory)["pid"] == os.getpid()
+        del sink, service
+        assert lock.held
+    assert _store().spool_owner(directory) is None
+
+
+@pytest.mark.skipif(not SINK_BUILT, reason="the native sink module is not built")
+def test_two_takes_in_one_process_refuse_each_other(tmp_path):
+    """What a per-Spool lock would do to the engine's sink and service."""
+    pytest.importorskip("torch")
+    directory = tmp_path / "spool"
+    service = _service(_config(), directory)  # take
+    with pytest.raises(RuntimeError, match=f"owned by pid {os.getpid()}"):
+        _sink(directory)  # take
+    del service
+    _sink(directory)  # the service's lock went with it
+
+
+def test_a_second_process_is_refused_naming_the_holder(tmp_path):
+    directory = tmp_path / "spool"
+    with _store().SpoolOwnerLock(str(directory)):
+        probe = (
+            "import sys; sys.path.insert(0, sys.argv[1]);"
+            "import _dmi_native_store as m\n"
+            "try:\n"
+            "    m.SpoolOwnerLock(sys.argv[2])\n"
+            "except m.SpoolOwnedError as e:\n"
+            "    print(e)\n")
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(BUILD), str(directory)],
+            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert f"owned by pid {os.getpid()} on host {socket.gethostname()}" in (
+        result.stdout), result.stdout
+
+
+def test_spool_owner_names_the_holder_while_it_holds(tmp_path):
+    store = _store()
+    directory = str(tmp_path / "spool")
+    assert store.spool_owner(directory) is None
+    lock = store.SpoolOwnerLock(directory)
+    assert lock.held
+    assert store.spool_owner(directory) == {
+        "host": socket.gethostname(), "pid": os.getpid()}
+    lock.release()
+    assert not lock.held
+    assert store.spool_owner(directory) is None
+
+
+def test_the_owned_error_is_a_runtime_error(tmp_path):
+    store = _store()
+    assert issubclass(store.SpoolOwnedError, RuntimeError)
+    with store.SpoolOwnerLock(str(tmp_path / "spool")):
+        with pytest.raises(store.SpoolOwnedError):
+            store.SpoolOwnerLock(str(tmp_path / "spool"))
+
+
+def test_a_nested_spool_directory_is_refused(tmp_path):
+    store = _store()
+    with store.SpoolOwnerLock(str(tmp_path / "outer")):
+        with pytest.raises(ValueError, match="nested"):
+            store.SpoolOwnerLock(str(tmp_path / "outer" / "inner"))
+        with pytest.raises(RuntimeError, match="nested"):
+            _service(_config(), tmp_path / "outer" / "inner")
+
+
+def test_a_shared_filesystem_is_refused_unless_allowed(tmp_path):
+    store = _store()
+    store._set_spool_filesystem_type_for_testing(NFS_SUPER_MAGIC)
+    try:
+        with pytest.raises(ValueError, match="NFS.*node-local"):
+            store.SpoolOwnerLock(str(tmp_path / "nfs"))
+        with pytest.raises(RuntimeError, match="node-local"):
+            _service(_config(), tmp_path / "nfs")
+        with store.SpoolOwnerLock(str(tmp_path / "nfs"),
+                                  allow_shared_filesystem=True):
+            pass
+        _service(_config(), tmp_path / "nfs-allowed",
+                 spool_allow_shared_filesystem=True)
+    finally:
+        store._set_spool_filesystem_type_for_testing(None)
+    with store.SpoolOwnerLock(str(tmp_path / "local")):
+        pass
+
+
+def test_the_rank_directory_layout(tmp_path):
+    store = _store()
+    key = hashlib.sha256(b"db/prefix/s3").hexdigest()[:12]
+    assert store.spool_catalog_key("db", "prefix", "s3") == key
+    assert store.spool_rank_directory(
+        "/base", "db", "prefix", "s3", 3, "0a1b2c3d") == (
+        f"/base/{key}/r3-0a1b2c3d")
+    fresh = {store.spool_rank_directory("/base", "db", "prefix", "s3", 0)
+             for _ in range(16)}
+    assert len(fresh) == 16  # a fresh incarnation each time
+    for path in fresh:
+        assert path.startswith(f"/base/{key}/r0-")
+    with pytest.raises(ValueError, match="incarnation"):
+        store.spool_rank_directory("/base", "db", "prefix", "s3", 0, "XYZ")
+
+
+def test_adoption_needs_a_rank_directory_under_this_catalogs_key(tmp_path):
+    config = _config()
+    with pytest.raises(ValueError, match="adopt_sibling_spools"):
+        _service(config, tmp_path / "spool", adopt_sibling_spools=True)
+    # A rank directory, but under another catalog's key: adopting its
+    # siblings would index that catalog's packs into this one.
+    other = _store().spool_rank_directory(
+        str(tmp_path / "base"), config.database, "another_prefix",
+        config.store_id, 0)
+    with pytest.raises(ValueError, match="adopt_sibling_spools"):
+        _service(config, other, adopt_sibling_spools=True)
+    mine = _rank_directory(tmp_path / "base", config)
+    assert _service(config, mine, adopt_sibling_spools=True).snapshot()[
+        "adopted_packs"] == 0
+
+
+def test_an_unknown_owner_lock_mode_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="spool_owner_lock"):
+        _service(_config(), tmp_path / "spool", spool_owner_lock="share")
+
+
+def test_held_by_caller_with_nothing_held_is_refused(tmp_path):
+    with pytest.raises(RuntimeError, match="held_by_caller"):
+        _service(_config(), tmp_path / "spool",
+                 spool_owner_lock="held_by_caller")
+
+
+def test_a_drained_directory_is_removed_with_its_lock(tmp_path):
+    store = _store()
+    directory = tmp_path / "spool"
+    lock = store.SpoolOwnerLock(str(directory))
+    (directory / "v1" / "tenant=t").mkdir(parents=True)
+    assert lock.release_and_remove_if_empty()
+    assert not directory.exists()
+    lock = store.SpoolOwnerLock(str(directory))
+    (directory / "kept.quarantined").write_bytes(b"x")
+    assert not lock.release_and_remove_if_empty()
+    assert (directory / "kept.quarantined").exists()
+    assert not lock.held

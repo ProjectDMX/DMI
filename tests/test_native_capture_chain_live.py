@@ -210,24 +210,33 @@ def _run_chain(config, spool_root: Path, envelopes, *, sink_overrides=None,
     which is safe only while no sink writes there), then the sink; flush
     both, and return the snapshots and what the reader reads back.
 
+    Both open the spool as the engine opens them: under ONE owner lock this
+    process holds, each with owner_lock="held_by_caller" -- two takes in one
+    process would refuse each other.
+
     The sink is the raw binding with `sink_overrides`, or, given a
     NativeSinkConfig, the one the engine builds from it."""
     from dmi.storage.native_capture import (
         NativeCaptureReader, NativeCaptureStorage,
+        _load_native_store_extension,
     )
 
+    owner = _load_native_store_extension().SpoolOwnerLock(str(spool_root))
     service = NativeCaptureStorage(config, spool_root=str(spool_root),
-                                   spool_max_bytes=1 << 40, sweep_spool=True)
+                                   spool_max_bytes=1 << 40, sweep_spool=True,
+                                   spool_owner_lock="held_by_caller")
     service.start()
     try:
         if sink_config is None:
-            sink, _lease = _open_sink(spool_root, **(sink_overrides or {}))
+            sink, _lease = _open_sink(spool_root, owner_lock="held_by_caller",
+                                      **(sink_overrides or {}))
         else:
             from dmi.storage.capture.native_sink import (
                 create_native_pack_sink,
             )
 
-            sink = create_native_pack_sink(sink_config).native_sink
+            sink = create_native_pack_sink(
+                sink_config, owner_lock="held_by_caller").native_sink
             _lease = sink.attach()
         for envelope in envelopes:
             sink.submit_envelope(LAYOUT, envelope.rows, envelope.payload())
@@ -239,6 +248,7 @@ def _run_chain(config, spool_root: Path, envelopes, *, sink_overrides=None,
         service_snapshot = service.snapshot()
     finally:
         service.stop()
+        owner.release()
 
     reader = NativeCaptureReader(config)
     selection = reader.select(tenant_id="t")

@@ -124,6 +124,11 @@ class NativeSinkConfig:
     A record larger than ``max_queue_bytes`` or ``max_pack_bytes`` can
     never be admitted; ``validate_capture_bounds`` refuses such a bound at
     attach, before any forward runs.
+
+    ``spool_root`` must be node-local, and a spool directory has one owner
+    process, held by an flock on its ``.owner.lock``. A root on NFS or
+    Lustre is refused unless ``spool_allow_shared_filesystem``: flock there
+    does not keep out a process on another node.
     """
 
     spool_root: str
@@ -136,10 +141,13 @@ class NativeSinkConfig:
     max_linger_ns: int = 1_000_000_000
     overload: str = "block"
     admission_timeout_s: Optional[float] = 2.0
+    spool_allow_shared_filesystem: bool = False
 
     def __post_init__(self) -> None:
         if not self.spool_root:
             raise ValueError("spool_root is required")
+        if type(self.spool_allow_shared_filesystem) is not bool:
+            raise TypeError("spool_allow_shared_filesystem must be bool")
         for name in (
             "spool_max_bytes",
             "num_workers",
@@ -554,8 +562,25 @@ def validate_capture_bounds(
             "uploader_max_in_flight_bytes")
 
 
+# The spool directory's owner-lock modes (native/csrc/store/spool.h).
+SPOOL_OWNER_LOCKS = ("take", "held_by_caller")
+
+
 class NativeCaptureStorage:
-    """The in-process storage service: spool -> object store -> catalog."""
+    """The in-process storage service: spool -> object store -> catalog.
+
+    The spool directory has one owner process, held by an flock on
+    ``<spool_root>/.owner.lock``. ``spool_owner_lock="take"`` makes this
+    service its owner for the service's life, and refuses a directory
+    another process owns, naming it. A process that also runs the sink on
+    the directory -- the engine -- holds one ``SpoolOwnerLock`` and passes
+    ``"held_by_caller"`` here and to the sink: two takes in one process
+    refuse each other.
+
+    ``adopt_sibling_spools`` needs ``spool_root`` to be a rank directory of
+    the spool layout (``spool_rank_directory``); ``start`` then drains the
+    sibling directories whose owners have died into this catalog.
+    """
 
     def __init__(
         self,
@@ -564,9 +589,22 @@ class NativeCaptureStorage:
         spool_root: str,
         spool_max_bytes: int,
         sweep_spool: bool,
+        spool_owner_lock: str = "take",
+        adopt_sibling_spools: bool = False,
+        spool_allow_shared_filesystem: bool = False,
     ) -> None:
         if not isinstance(config, NativeCaptureStorageConfig):
             raise TypeError("config must be a NativeCaptureStorageConfig")
+        if spool_owner_lock not in SPOOL_OWNER_LOCKS:
+            raise ValueError(
+                f"spool_owner_lock must be one of {SPOOL_OWNER_LOCKS}, got "
+                f"{spool_owner_lock!r}")
+        for name, value in (
+                ("adopt_sibling_spools", adopt_sibling_spools),
+                ("spool_allow_shared_filesystem",
+                 spool_allow_shared_filesystem)):
+            if type(value) is not bool:
+                raise TypeError(f"{name} must be bool")
         module = _load_native_store_extension()
         native = config._native_dict()
         native.update(
@@ -579,6 +617,9 @@ class NativeCaptureStorage:
             reconcile_prefix=config.reconcile_prefix,
             reconcile_interval_ns=int(config.reconcile_interval_s * 1e9),
             sweep_spool_on_start=sweep_spool,
+            spool_owner_lock=spool_owner_lock,
+            adopt_sibling_spools=adopt_sibling_spools,
+            spool_allow_shared_filesystem=spool_allow_shared_filesystem,
             **config._lease_native(),
         )
         self._config = config
@@ -812,6 +853,7 @@ class NativeCaptureReader:
 __all__ = [
     "PACK_FRAMING_RESERVE_BYTES",
     "SINK_OVERLOAD_POLICIES",
+    "SPOOL_OWNER_LOCKS",
     "NativeSinkConfig",
     "NativeCapture",
     "NativeCapturePage",

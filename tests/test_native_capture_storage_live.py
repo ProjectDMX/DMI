@@ -113,12 +113,43 @@ def _storage_config(endpoint, prefix, **overrides):
     return NativeCaptureStorageConfig(**fields)
 
 
+# Every spool directory a test points a service or a driver at is owned by
+# the harness for the rest of the test: one SpoolOwnerLock held here, and
+# each service, sink driver and store driver opens the directory with
+# owner_lock="held_by_caller". That is the engine's arrangement -- it holds
+# the lock around its sink and its service -- stretched over the processes a
+# test uses: the drivers stage and upload from processes of their own while
+# a service is up, and a test often builds a second service on a directory
+# the first still has open. Each taking the lock would refuse the others.
+_HARNESS_LOCKS: dict = {}
+
+
+@pytest.fixture(autouse=True)
+def _harness_spool_locks():
+    yield
+    for lock in _HARNESS_LOCKS.values():
+        lock.release()
+    _HARNESS_LOCKS.clear()
+
+
+def _held(spool_root) -> str:
+    """Hold spool_root's owner lock for the test; the mode to open it in."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    key = str(spool_root)
+    if key not in _HARNESS_LOCKS:
+        _HARNESS_LOCKS[key] = _load_native_store_extension().SpoolOwnerLock(
+            key)
+    return "held_by_caller"
+
+
 def _service(config, spool_root: Path, *, sweep_spool=True):
     from dmi.storage.native_capture import NativeCaptureStorage
 
     return NativeCaptureStorage(config, spool_root=str(spool_root),
                                 spool_max_bytes=1 << 40,
-                                sweep_spool=sweep_spool)
+                                sweep_spool=sweep_spool,
+                                spool_owner_lock=_held(spool_root))
 
 
 def _record(index: int):
@@ -150,7 +181,7 @@ def _stage(spool_root: Path, indexes, *, records_per_pack: int = 2):
             max_queue_records=256, max_queue_bytes=1 << 24,
             max_pack_bytes=8 << 20, max_pack_records=records_per_pack,
             max_linger_ns=1_000_000_000, overload="drop_newest",
-            admission_timeout=-1)["ok"]
+            admission_timeout=-1, owner_lock=_held(spool_root))["ok"]
         for index in indexes:
             metadata, tensor = _record(index)
             response = sink.call(
@@ -587,7 +618,8 @@ def test_a_pack_uploaded_but_never_indexed_is_reconciled_at_start(
             region=REGION, access=ACCESS, secret=SECRET, token=None,
             insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
             store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
-            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30,
+            owner_lock=_held(spool_root))
         assert uploaded["ok"], uploaded
         # And a foreign object where packs live, which must not be indexed.
         foreign = store.call(
@@ -632,7 +664,9 @@ def test_a_failed_head_is_an_error_not_a_foreign_object(fake_s3, tmp_path):
                               "etag": '"0"'}
     with _catalog() as (_client, catalog):
         native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
-        native.update(spool_root=str(tmp_path / "spool"), holder="head-test",
+        native.update(spool_root=str(tmp_path / "spool"),
+                      spool_owner_lock=_held(tmp_path / "spool"),
+                      holder="head-test",
                       reconcile_prefix="fault/", s3_max_attempts=1)
         service = _load_native_store_extension().StorageService(native)
         service.start()  # reconciles once
@@ -682,7 +716,8 @@ def test_the_loop_backs_off_while_the_object_store_is_down(tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(dead, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="backoff-test",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="backoff-test",
             poll_interval_ns=20_000_000, max_backoff_ns=10_000_000_000,
             reconcile_on_start=False, s3_max_attempts=1,
             uploader_max_attempts=1)
@@ -715,7 +750,8 @@ def test_a_pack_too_big_to_index_is_set_aside_and_the_rest_still_index(
         config = _storage_config(fake_s3, catalog.table_prefix)
         native = config._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="poison-test",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="poison-test",
             poll_interval_ns=50_000_000, reconcile_on_start=False,
             # One descriptor fits, forty do not.
             indexer_max_estimated_bytes=4000)
@@ -750,7 +786,8 @@ def test_a_batch_over_the_budget_splits_until_every_pack_indexes(
         config = _storage_config(fake_s3, catalog.table_prefix)
         native = config._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="split-test",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="split-test",
             poll_interval_ns=50_000_000, reconcile_on_start=False,
             # A two-record pack renders ~720 bytes: two fit, ten do not.
             indexer_max_estimated_bytes=2000)
@@ -785,7 +822,8 @@ def test_flush_returns_on_time_when_the_catalog_stops_answering(
         native = _storage_config(
             fake_s3, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
-        native.update(spool_root=str(spool_root), holder="stall-test",
+        native.update(spool_root=str(spool_root),
+                      spool_owner_lock=_held(spool_root), holder="stall-test",
                       poll_interval_ns=20_000_000, reconcile_on_start=False,
                       clickhouse_request_timeout_s=5.0)
         service = _load_native_store_extension().StorageService(native)
@@ -835,7 +873,8 @@ def test_dropping_a_running_service_does_not_hold_the_gil(fake_s3, tmp_path):
         native = _storage_config(
             fake_s3, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
-        native.update(spool_root=str(spool_root), holder="gil-test",
+        native.update(spool_root=str(spool_root),
+                      spool_owner_lock=_held(spool_root), holder="gil-test",
                       poll_interval_ns=20_000_000, reconcile_on_start=False,
                       clickhouse_request_timeout_s=2.0)
         service = _load_native_store_extension().StorageService(native)
@@ -878,7 +917,8 @@ def test_the_lease_holds_through_an_object_store_outage(tmp_path):
         def _native(spool, holder):
             native = _storage_config(dead, catalog.table_prefix)._native_dict()
             native.update(
-                spool_root=str(spool), holder=holder,
+                spool_root=str(spool), spool_owner_lock=_held(spool),
+                holder=holder,
                 poll_interval_ns=20_000_000, max_backoff_ns=10_000_000_000,
                 lease_ttl_ns=3_000_000_000, publish_timeout_ns=1_000_000_000,
                 clock_skew_ns=0, reconcile_on_start=False,
@@ -1437,7 +1477,8 @@ def test_a_pass_whose_lease_changed_while_it_read_rereads_the_replay_guard(
             region=REGION, access=ACCESS, secret=SECRET, token=None,
             insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
             store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
-            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30,
+            owner_lock=_held(spool_root))
         assert uploaded["ok"], uploaded
     finally:
         store.close()
@@ -1507,7 +1548,8 @@ def test_a_conflicted_publish_reports_the_conflict_unless_the_lease_was_lost(
             region=REGION, access=ACCESS, secret=SECRET, token=None,
             insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
             store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
-            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30,
+            owner_lock=_held(spool_root))
         assert uploaded["ok"], uploaded
     finally:
         store.close()
@@ -1688,7 +1730,8 @@ def _upload_behind_the_service(spool_root: Path, endpoint: str) -> list:
             region=REGION, access=ACCESS, secret=SECRET, token=None,
             insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
             store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
-            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30,
+            owner_lock=_held(spool_root))
         assert uploaded["ok"], uploaded
     finally:
         store.close()
@@ -2368,7 +2411,8 @@ def test_a_64_mib_pack_over_https_with_a_private_ca_hydrates_exactly(
             max_queue_records=records, max_queue_bytes=2 * records * record_bytes,
             max_pack_bytes=2 * records * record_bytes,
             max_pack_records=records, max_linger_ns=60_000_000_000,
-            overload="drop_newest", admission_timeout=-1)["ok"]
+            overload="drop_newest", admission_timeout=-1,
+            owner_lock=_held(spool_root))["ok"]
         for index in range(records):
             metadata = CaptureMetadata(
                 capture_id=f"tls-{index:04d}", tenant_id="t",

@@ -157,8 +157,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        uint64_t max_pack_bytes, uint64_t max_pack_records,
                        uint64_t max_linger_ns, uint64_t spool_max_bytes,
                        const std::string& overload,
-                       std::optional<double> admission_timeout_s) {
+                       std::optional<double> admission_timeout_s,
+                       const std::string& owner_lock,
+                       bool allow_shared_filesystem) {
              dmi_sink::SinkConfig config;
+             if (!dmi_store::ParseOwnerLock(owner_lock,
+                                            &config.spool_owner_lock)) {
+               throw py::value_error(
+                   "owner_lock must be 'take' or 'held_by_caller', got '" +
+                   owner_lock + "'");
+             }
+             config.spool_allow_shared_filesystem = allow_shared_filesystem;
              config.overload = ParseOverload(overload);
              config.admission_timeout_s =
                  ParseAdmissionTimeout(admission_timeout_s);
@@ -185,7 +194,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            // SinkConfig's own defaults: the Python NativeSinkConfig, which
            // the ring-fed sink is built from, picks block with 2 s.
            py::arg("overload") = "drop_newest",
-           py::arg("admission_timeout_s") = py::none())
+           py::arg("admission_timeout_s") = py::none(),
+           // The spool directory's owner lock (store/spool.h): "take" owns
+           // it for the sink's life; "held_by_caller" when the caller holds
+           // a SpoolOwnerLock on it, as the engine does around its sink and
+           // storage service.
+           py::arg("owner_lock") = "take",
+           py::arg("allow_shared_filesystem") = false)
       .def("attach",
            [](std::shared_ptr<dmi_sink::NativePackSink> self) {
              // Simulates engine ownership for tests (the real engine takes

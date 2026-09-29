@@ -20,6 +20,14 @@
 //     already committed, and indexes the rest. It runs at start(), and
 //     periodically when reconcile_interval_ns is non-zero.
 //
+// One owner per spool directory. The service's spool is opened under the
+// directory's owner lock (store/spool.h), so a second process on it is
+// refused at construction, naming the holder. With adopt_sibling_spools
+// the service's directory is one rank directory of the plan's section 2.3
+// layout, and at start() it adopts the siblings whose owner has died: a
+// crashed process's spool is recovered by the next process on the node for
+// the same catalog, whatever run it belongs to.
+//
 // Deployment shape: the service holds the catalog's single publisher lease, so
 // run ONE service per (database, table_prefix). A second one waits up to
 // start_lease_wait_ns for the lease at start(), then fails naming the holder.
@@ -84,6 +92,27 @@ struct StorageServiceConfig {
   // sink writes.
   std::string spool_root;
   uint64_t spool_max_bytes = 1ull << 40;
+  // The spool directory's owner lock (store/spool.h). kTake owns it for the
+  // service's life, and refuses a directory another process owns. A process
+  // that also runs the sink on it -- the engine -- holds one SpoolOwnerLock
+  // and opens both with kHeldByCaller: two takes in one process refuse each
+  // other.
+  dmi_store::OwnerLock spool_owner_lock = dmi_store::OwnerLock::kTake;
+  bool spool_allow_shared_filesystem = false;
+  // Adopt the spools of dead processes bound for this catalog. spool_root
+  // must then be a rank directory of the plan's section 2.3 layout,
+  //   <base>/<catalog_key>/r<producer_rank>-<incarnation>/
+  // under THIS catalog's key (SpoolCatalogKey of writer.database,
+  // writer.table_prefix and uploader.store_id), or construction throws.
+  // start(), after the lease and the sweep of its own directory, tries the
+  // owner lock of every sibling rank directory; each one whose owner is
+  // gone has its .open files swept, its .ready packs uploaded and indexed,
+  // and is removed once nothing but its lock file is left. A sibling that
+  // could not be drained (no lease, an upload that failed, a pack still
+  // owed) is retried by the loop's cycles, and flush() does not report
+  // drained until it has been. Live siblings -- another rank or job on this
+  // node -- are left alone.
+  bool adopt_sibling_spools = false;
 
   dmi_store::S3Config s3;
   dmi_store::UploaderConfig uploader;  // uploader.store_id names the store
@@ -143,8 +172,9 @@ struct StorageServiceConfig {
   // past its row: until it resumes and next checks, or -- after a system
   // suspend, which the steady clock the deadline runs on does not count --
   // until a renewal or publish is refused. Two on different (database,
-  // table_prefix) pairs each hold a lease and upload freely. The spool
-  // itself is not locked; one process per spool is the caller's job.
+  // table_prefix) pairs each hold a lease and upload freely. The spool's
+  // owner lock (spool_owner_lock) is what keeps a second process off the
+  // directory itself: it is refused at construction, before any of this.
   bool sweep_spool_on_start = true;
   bool reconcile_on_start = true;
 };
@@ -167,6 +197,11 @@ struct StorageServiceSnapshot {
   uint64_t swept_on_start = 0;  // ready packs Recover() found at start
   uint64_t pending_index = 0;   // uploaded packs awaiting a retried index
   uint64_t rejected_packs = 0;  // set aside: cannot be indexed (see flush)
+  // adopt_sibling_spools: dead siblings drained, the ready packs of theirs
+  // that were uploaded, and whether one is still owed a retry.
+  uint64_t adopted_spools = 0;
+  uint64_t adopted_packs = 0;
+  bool adoption_owed = false;
   // A foreign lease outlived 2 x TTL: the service stopped for good.
   bool failed = false;
   // "none" before start, "held", "quarantined" (an unknown outcome set the
@@ -198,8 +233,9 @@ class CaptureStorageService {
   // Ensure the catalog schema, take the publisher lease (waiting up to
   // start_lease_wait_ns for another holder's to expire, or for a claim that
   // timed out to go through -- past it, once, to wait out the quarantine
-  // such a claim left), sweep the spool, reconcile once, then start the
-  // background cycle. The lease renews from the moment it is taken.
+  // such a claim left), sweep the spool, adopt dead siblings
+  // (adopt_sibling_spools), reconcile once, then start the background
+  // cycle. The lease renews from the moment it is taken.
   // Throws if the lease is still held by another publisher when the wait
   // ends, or its claim still times out. A lease lost while the reconcile
   // runs does not fail start(): the loop takes a fresh one, as it would
@@ -247,9 +283,19 @@ class CaptureStorageService {
   class LeaseScope;
 
   void loop();
-  // start()'s spool sweep and reconcile, with the lease held and the lease
-  // thread renewing it. Requires cycle_mutex_.
+  // start()'s spool sweep, adoption and reconcile, with the lease held and
+  // the lease thread renewing it. Requires cycle_mutex_.
   void sweep_and_reconcile_at_start();
+  // One adoption pass over the sibling rank directories; sets
+  // adoption_owed_ to whether one was left undrained. Requires
+  // cycle_mutex_. Only a lost lease propagates.
+  void adopt_siblings();
+  // Adopts one sibling; false when it is owed another try.
+  bool adopt_sibling(const std::string& directory);
+  // Indexes refs that are gone from their spool, keeping whatever does not
+  // index in pending_index_ -- the only record of it in-process. With no
+  // catalog, keeps them all. Requires cycle_mutex_.
+  void index_or_owe(std::vector<PackRefData> refs, bool catalog);
   // Stops the lease thread and waits for it.
   void stop_lease_thread();
   CycleOutcome run_cycle();  // requires cycle_mutex_
@@ -327,6 +373,8 @@ class CaptureStorageService {
   // The reconcile at start() lost the lease before it finished; the loop
   // runs one once it holds a lease again. Guarded by cycle_mutex_.
   bool reconcile_owed_ = false;
+  // An adoption pass left a dead sibling undrained. Guarded by cycle_mutex_.
+  bool adoption_owed_ = false;
   int failure_streak_ = 0;  // consecutive failed cycles, for the backoff
   // Uploaded, so gone from the spool, but not yet in the catalog.
   std::vector<PackRefData> pending_index_;
