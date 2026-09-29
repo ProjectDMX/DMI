@@ -80,9 +80,11 @@ bool IsRetryableStatus(long status) {
 // False when `cancel` (may be null) woke it before the wait was out.
 bool Backoff(int attempt, const Cancellation* cancel) {
   // 0.2s * 2^attempt, capped at 5s. Deterministic: the fault-matrix tests
-  // assert attempt counts, not wall time, so no jitter.
+  // assert attempt counts, not wall time, so no jitter. The shift is capped
+  // too: max_attempts goes up to 1000, and 200 << 56 overflows int64 (a
+  // negative wait, so no backoff at all), 200 << 64 is undefined.
   using namespace std::chrono;
-  const int64_t ms = std::min<int64_t>(5000, 200LL << attempt);
+  const int64_t ms = std::min<int64_t>(5000, 200LL << std::min(attempt, 5));
   if (cancel != nullptr) return cancel->SleepFor(milliseconds(ms));
   std::this_thread::sleep_for(milliseconds(ms));
   return true;
