@@ -536,14 +536,25 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
     //    reconcile_on_start off, a crash would leave it in the bucket and
     //    never in the catalog. Left in the spool it survives the crash.
     //    A cancel (the flush deadline, or stop()) starts no upload, and cuts
-    //    those in flight: those packs stay staged too. Past a flush's
-    //    deadline the uploader still lists the spool, so that a flush whose
-    //    time ran out before this point -- flush(0) -- reports an empty
-    //    spool as drained; after stop() nothing asks.
+    //    those in flight: those packs stay staged too. A flush whose time
+    //    ran out before this point -- flush(0) -- does not list the spool
+    //    through the uploader, since a listing re-hashes every staged pack
+    //    and would hold the flush for as long as a backlog takes to hash:
+    //    whether any pack is staged at all, which the file names say, is
+    //    all it needs, so that an empty spool still reports drained. After
+    //    stop() nothing asks.
     dmi_store::UploadBatchResult batch;
     if (catalog && pending_index_.empty()) {
       if (upload_cancel_.cancelled_for_good()) {
         outcome.cut_short = true;
+      } else if (upload_cancel_.cancelled()) {
+        bool staged = false;
+        std::string error;
+        if (spool_.HasReady(&staged, &error) != dmi_store::SpoolStatus::kOk) {
+          record_error("spool listing failed: " + error);
+          staged = true;  // not known to be drained
+        }
+        if (staged) outcome.cut_short = true;
       } else {
         batch = uploader_->UploadPending(-1);
       }

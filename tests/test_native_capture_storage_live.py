@@ -915,6 +915,54 @@ def test_the_stop_after_a_flush_runs_no_further_cycle(fake_s3, tmp_path):
     assert stop_s < request_timeout + 1.5, (stop_s, snapshot)
 
 
+def test_a_flush_out_of_time_does_not_hash_the_spool(fake_s3, tmp_path):
+    """Past its deadline a flush's cycle starts no upload, but it still
+    listed the spool through the uploader, and a listing re-hashes every
+    staged pack: flush(0) -- what flush_and_wait and close() pass once the
+    sink's flush has spent the budget -- held its caller for as long as
+    hashing the whole backlog took. It now asks only whether any pack is
+    staged, by name. One sparse 1 GiB pack stands in for a backlog."""
+    import hashlib
+
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    size = 1 << 30
+    digest = hashlib.sha256()
+    zeros = bytes(1 << 24)
+    for _ in range(size // len(zeros)):
+        digest.update(zeros)
+    spool_root = tmp_path / "spool"
+    spool_root.mkdir()
+    ready = spool_root / (f"{uuid.uuid4()}.1.1.{digest.hexdigest()}"
+                          ".dmi-pack.ready")
+    with open(ready, "wb") as sparse:
+        sparse.truncate(size)  # no blocks on disk
+    with _catalog() as (_client, catalog):
+        native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="flush-out-of-time",
+            # The loop sleeps through the test, and nothing uploads.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            sweep_spool_on_start=False,
+            uploader_max_in_flight_bytes=2 * size)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            started = time.monotonic()
+            drained = service.flush(0.0)
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+
+    assert drained is False  # a pack is staged
+    assert elapsed < 0.25, (elapsed, snapshot)
+    assert snapshot["uploaded_packs"] == 0, snapshot
+    # Not tried, so not cancelled either: it was never listed.
+    assert snapshot["cancelled_uploads"] == 0, snapshot
+    assert ready.exists()
+
+
 def _put(request: bytes) -> bool:
     return request.startswith(b"PUT ")
 

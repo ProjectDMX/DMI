@@ -627,6 +627,25 @@ SpoolStatus Spool::ListPending(std::vector<StagedPack>* out, std::string* error)
   return Scan(out, false, error);
 }
 
+SpoolStatus Spool::HasReady(bool* any, std::string* error) const {
+  *any = false;
+  std::error_code ec;
+  for (fs::recursive_directory_iterator it(root_, ec), end; !ec && it != end;
+       it.increment(ec)) {
+    std::error_code type_ec;
+    if (!it->is_regular_file(type_ec)) continue;
+    if (HasSuffix(it->path().filename().string(), kReadySuffix)) {
+      *any = true;
+      return SpoolStatus::kOk;
+    }
+  }
+  if (ec) {
+    if (error) *error = "spool walk failed: " + ec.message();
+    return SpoolStatus::kIo;
+  }
+  return SpoolStatus::kOk;
+}
+
 SpoolStatus Spool::Scan(std::vector<StagedPack>* out, bool discard_open_files,
                         std::string* error) {
   out->clear();
