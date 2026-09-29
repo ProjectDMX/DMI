@@ -285,6 +285,22 @@ def test_a_dropped_spool_claim_keeps_its_directory_owned(tmp_path):
     assert _store().spool_owner(directory) is None
 
 
+@pytest.mark.parametrize("f_type, name", [
+    (0x6969, "NFS"), (0x0BD00BD0, "Lustre"), (0x19830326, "BeeGFS"),
+    (0xFF534D42, "CIFS"), (0xFE534D42, "SMB2"), (0x65735546, "FUSE")])
+def test_each_shared_filesystem_is_refused_by_name(tmp_path, f_type, name):
+    store = _store()
+    store._set_spool_filesystem_type_for_testing(f_type)
+    try:
+        with pytest.raises(ValueError, match=f"is on {name} .*node-local"):
+            store.SpoolOwnerLock(str(tmp_path / "shared"))
+        with store.SpoolOwnerLock(str(tmp_path / "shared"),
+                                  allow_shared_filesystem=True):
+            pass
+    finally:
+        store._set_spool_filesystem_type_for_testing(None)
+
+
 def test_a_shared_filesystem_is_refused_unless_allowed(tmp_path):
     store = _store()
     store._set_spool_filesystem_type_for_testing(NFS_SUPER_MAGIC)

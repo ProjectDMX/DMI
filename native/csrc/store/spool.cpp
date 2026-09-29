@@ -38,9 +38,18 @@ constexpr const char* kClaimStagingSuffix = ".creating";
 // is ever staged under it.
 constexpr const char* kRefsDirectory = "_refs";
 
-// statfs(2) f_type values (linux/magic.h has NFS; Lustre's is its own).
+// statfs(2) f_type values of filesystems whose flock does not keep out a
+// process on another node (linux/magic.h has NFS, SMB2, CIFS and FUSE;
+// Lustre's and BeeGFS's are their own). BeeGFS keeps flock client-local
+// unless tuneUseGlobalFileLocks is set. FUSE covers network filesystems
+// (sshfs, s3fs, gcsfuse, GlusterFS) and local ones alike, and f_type cannot
+// tell them apart, so a local one needs the override.
 constexpr uint32_t kNfsSuperMagic = 0x6969;
 constexpr uint32_t kLustreSuperMagic = 0x0BD00BD0;
+constexpr uint32_t kBeeGfsSuperMagic = 0x19830326;
+constexpr uint32_t kCifsSuperMagic = 0xFF534D42;
+constexpr uint32_t kSmb2SuperMagic = 0xFE534D42;
+constexpr uint32_t kFuseSuperMagic = 0x65735546;
 
 std::atomic<int64_t> g_filesystem_type_for_testing{-1};
 
@@ -439,6 +448,10 @@ const char* SharedFilesystemName(int64_t f_type) {
   switch (static_cast<uint32_t>(f_type)) {
     case kNfsSuperMagic: return "NFS";
     case kLustreSuperMagic: return "Lustre";
+    case kBeeGfsSuperMagic: return "BeeGFS";
+    case kCifsSuperMagic: return "CIFS";
+    case kSmb2SuperMagic: return "SMB2";
+    case kFuseSuperMagic: return "FUSE";
     default: return nullptr;
   }
 }
@@ -469,7 +482,11 @@ SpoolStatus CheckNodeLocal(const std::string& dir,
              "since its owner lock (flock) does not keep out a process on "
              "another node there. Use a local disk, or set "
              "allow_shared_filesystem if no process on another node can "
-             "reach this directory";
+             "reach this directory" +
+             (std::string(shared) == "FUSE"
+                  ? " (a FUSE filesystem that is itself local, such as "
+                    "fuse-overlayfs or ntfs-3g, is one)"
+                  : std::string());
   }
   return SpoolStatus::kBadArgument;
 }

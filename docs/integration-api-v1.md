@@ -204,8 +204,9 @@ directories under the same catalog key whose owners have died: their stale
 `.open` files are swept, their ready packs uploaded and indexed, and the
 directory removed, so a crashed process's packs reach the catalog through the
 next one on the node, whatever run it belongs to. The spool root must be
-node-local: NFS and Lustre are refused unless
-`NativeSinkConfig.spool_allow_shared_filesystem`. Without
+node-local: NFS, Lustre, BeeGFS, CIFS/SMB2 and FUSE are refused (by statfs
+`f_type`) unless `NativeSinkConfig.spool_allow_shared_filesystem`, which a FUSE
+filesystem that is itself local, such as fuse-overlayfs, needs too. Without
 `capture_storage_config` the sink owns `spool_root` itself. With an explicit
 `record_sink`, the service drains `spool_root` as that sink writes it,
 unswept and adopting nothing.

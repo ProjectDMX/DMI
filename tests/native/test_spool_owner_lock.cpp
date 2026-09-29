@@ -12,8 +12,9 @@
 //      it forked without exec does not keep it.
 //   4. Nesting: a directory under a HELD one, or containing one with a lock
 //      file, is refused -- also when two processes take the pair at once.
-//   5. The node-local check refuses NFS and Lustre by statfs f_type, unless
-//      explicitly allowed (a test seam stands in for statfs).
+//   5. The node-local check refuses NFS, Lustre, BeeGFS, CIFS/SMB2 and FUSE
+//      by statfs f_type, unless explicitly allowed (a test seam stands in
+//      for statfs).
 //   6. Adoption's try-lock never creates a directory, and a released
 //      directory that holds nothing but its lock file can be removed.
 //   7. The directory layout of the plan's section 2.3.
@@ -494,20 +495,31 @@ void TestAnUnheldClaimStagingDirectoryRefusesNothing() {
 // (5) The node-local check, through the test seam.
 void TestSharedFilesystemsAreRefusedUnlessAllowed() {
   const std::string root = FreshRoot("statfs") + "/spool";
-  CHECK(std::string(dmi_store::SharedFilesystemName(0x6969)) == "NFS");
-  CHECK(std::string(dmi_store::SharedFilesystemName(0x0BD00BD0)) ==
-        "Lustre");
+  // Each one's flock does not keep out a process on another node: NFS and
+  // Lustre (the plan's two), BeeGFS (client-local unless
+  // tuneUseGlobalFileLocks), CIFS/SMB2, and FUSE, which cannot tell sshfs,
+  // s3fs, gcsfuse or GlusterFS from a local filesystem.
+  const std::vector<std::pair<int64_t, std::string>> shared = {
+      {0x6969, "NFS"},        {0x0BD00BD0, "Lustre"},
+      {0x19830326, "BeeGFS"}, {0xFF534D42, "CIFS"},
+      {0xFE534D42, "SMB2"},   {0x65735546, "FUSE"}};
+  for (const auto& [magic, name] : shared) {
+    const char* named = dmi_store::SharedFilesystemName(magic);
+    CHECK(named != nullptr && std::string(named) == name);
+  }
   CHECK(dmi_store::SharedFilesystemName(0xEF53) == nullptr);  // ext4
   CHECK(dmi_store::SharedFilesystemName(0x58465342) == nullptr);  // xfs
+  CHECK(dmi_store::SharedFilesystemName(0x794C7630) == nullptr);  // overlayfs
+  CHECK(dmi_store::SharedFilesystemName(0x01021994) == nullptr);  // tmpfs
 
   std::string error;
-  for (const int64_t magic : {int64_t{0x6969}, int64_t{0x0BD00BD0}}) {
+  for (const auto& [magic, name] : shared) {
     dmi_store::SetFilesystemTypeForTesting(magic);
     SpoolOwnerLock lock;
     error.clear();
     CHECK(SpoolOwnerLock::Acquire(root, false, &lock, &error) ==
           SpoolStatus::kBadArgument);
-    CHECK(Contains(error, magic == 0x6969 ? "NFS" : "Lustre"));
+    CHECK(Contains(error, " is on " + name + " "));
     CHECK(Contains(error, "node-local"));
     CHECK(!lock.held());
     Spool spool;

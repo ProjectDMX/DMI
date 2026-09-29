@@ -137,9 +137,10 @@ class NativeSinkConfig:
     under it, ``<spool_root>/<catalog_key>/r<rank>-<incarnation>/`` (see
     :func:`claim_spool_directory`), and its storage service adopts the
     directories of dead processes beside it. Without one, the sink owns
-    ``spool_root`` itself. A root on NFS or Lustre is refused unless
-    ``spool_allow_shared_filesystem``: flock there does not keep out a
-    process on another node.
+    ``spool_root`` itself. A root on NFS, Lustre, BeeGFS, CIFS/SMB2 or FUSE
+    is refused unless ``spool_allow_shared_filesystem``: flock there does
+    not keep out a process on another node (a FUSE filesystem that is local,
+    such as fuse-overlayfs, needs the override too).
     """
 
     spool_root: str
