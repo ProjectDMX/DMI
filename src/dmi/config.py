@@ -161,8 +161,12 @@ class MonitoringConfig:
     # The rest of the native capture storage path, after the spool: set it
     # and the engine runs an in-process C++ service that uploads every pack
     # the sink stages to the object store and indexes it into the ClickHouse
-    # catalog, and ``flush_and_wait`` returns only once they are queryable.
-    # Unset, packs stay in the spool for something else to drain. Needs
+    # catalog, and ``flush_and_wait`` returns only once they are queryable
+    # (raising TimeoutError when they are not by its timeout). ``close()``
+    # drains it too, best effort, within the config's
+    # ``close_flush_timeout_s``. Unset, packs stay in the spool for
+    # something else to drain; the sink's open pack reaches the spool when
+    # the ring releases the sink at close. Needs
     # ``storage_backend="persistent"`` and ``capture_sink_config``, whose
     # spool it drains.
     capture_storage_config: Optional["NativeCaptureStorageConfig"] = None

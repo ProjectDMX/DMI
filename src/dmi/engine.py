@@ -613,7 +613,10 @@ class MonitoringEngine:
         deadline = time.monotonic() + float(timeout_s)
         transport.flush_records_and_wait(float(timeout_s))
         # The sink's boundary is a staged pack; with the storage service it
-        # is a pack in the catalog. Its flush runs one cycle even at zero.
+        # is a pack in the catalog. The service's flush returns on time:
+        # past the deadline it uploads nothing more, overrunning it only by
+        # the catalog work in flight. At zero it still runs one cycle, so a
+        # drained spool reports drained.
         storage = self._capture_storage
         if storage is not None:
             storage.flush(max(0.0, deadline - time.monotonic()))
@@ -824,11 +827,13 @@ class MonitoringEngine:
         return gid
 
     def _seal_capture_sink(self, deadline: float) -> None:
-        """Flush the record sink before its ring stops.
+        """Flush the record sink before its ring stops, within ``deadline``.
 
-        Stopping the ring releases the sink WITHOUT flushing it, so the
-        records of its open pack would still be in memory while the service
-        drains a spool that does not hold them yet.
+        Releasing the sink from the stopping ring flushes it too (the native
+        pack sink's release backstop), but only as a last resort: bounded
+        by its own timeout, and with nothing but a line on stderr when it
+        fails. This flush comes first, inside close()'s budget, and logs
+        why it failed.
         """
         try:
             self._ring_transport.flush_records_and_wait(
@@ -842,9 +847,10 @@ class MonitoringEngine:
             return
         self._capture_storage = None
         # Best effort: once the sink is sealed, a pack that does not reach
-        # the catalog here is still in the spool or the bucket, and the next
-        # start uploads or reconciles it. flush_and_wait is the boundary
-        # that reports.
+        # the catalog here is still in the spool, which the next start on it
+        # uploads, or uploaded but unindexed, which only the next start's
+        # reconcile finds (reconcile_on_start, on by default).
+        # flush_and_wait is the boundary that reports.
         try:
             storage.flush(max(0.0, deadline - time.monotonic()))
         except Exception as exc:
@@ -853,7 +859,19 @@ class MonitoringEngine:
             storage.stop()
 
     def close(self) -> None:
-        """Tear down backend resources."""
+        """Tear down backend resources.
+
+        A record ring is stopped, which drains its queued records into the
+        sink and releases the sink; the native pack sink stages its open
+        pack in the spool on that release. With a storage service
+        (``capture_storage_config``), close() drains capture first, best
+        effort, within ``close_flush_timeout_s``: it flushes the sink, stops
+        the ring, waits for the service to get the staged packs into the
+        catalog, then stops the service. What does not drain in time is
+        logged, not raised, and stays where the next start recovers it
+        (see ``NativeCaptureStorageConfig.close_flush_timeout_s``);
+        ``flush_and_wait`` is the call that raises.
+        """
 
         storage = self._capture_storage
         # One budget for the whole capture drain: sealing the sink's open

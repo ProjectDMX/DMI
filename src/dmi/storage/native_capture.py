@@ -265,8 +265,18 @@ class NativeCaptureStorageConfig:
     # 0 disables the periodic pass; in-process index failures are retried
     # regardless.
     reconcile_interval_s: float = 0.0
-    # engine.close()'s total budget for draining capture: sealing the sink's
-    # open pack, then getting every staged pack into the catalog.
+    # engine.close()'s budget for draining capture, best effort: it flushes
+    # the sink (sealing its open pack), then waits for the service to get
+    # the staged packs into the catalog, and stops the service when the
+    # budget is spent, whatever is left. That stays in the spool, which the
+    # next start on it uploads, or -- uploaded but not yet indexed -- in the
+    # bucket, which only the next start's reconcile indexes
+    # (reconcile_on_start). The drain can outlast the budget by the catalog
+    # work in flight when it ends -- against a catalog that stopped
+    # answering, one clickhouse_request_timeout_s -- never by an upload,
+    # which the deadline cancels; and, when the sink itself is stuck, by
+    # the flush its release from the ring makes (30 s at most). close()
+    # logs what did not drain; flush_and_wait is what raises.
     close_flush_timeout_s: float = 60.0
     # Bytes of packs the uploader holds in flight at once. A staged pack
     # larger than this is never uploaded, so the sink's max_pack_bytes must
