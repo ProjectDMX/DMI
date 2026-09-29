@@ -629,6 +629,50 @@ def test_a_sibling_whose_owner_dies_after_start_is_adopted_by_a_recheck(
         lock.release_and_remove_if_empty()
 
 
+def test_flush_adopts_nothing_while_the_loop_is_idle(fake_s3, tmp_path):
+    """flush() covers this process's records, and its cycles never adopt:
+    a dead backlog is the loop's. With the object store down, a flush that
+    adopted sat through a dead pack's retry chain, past its deadline by a
+    round (minutes against a stalled store). Here the loop is idle -- its
+    first round has failed and its poll interval is an hour -- so the flush
+    holds the cycle itself and would be seen adopting: uploading (and
+    failing) dead packs and overrunning its deadline."""
+    from tests.test_native_capture_storage_live import _Switch
+
+    base = tmp_path / "spool"
+    with _catalog() as prefix:
+        store = _Switch.to_url(fake_s3)
+        config = _storage_config(store.url, prefix, poll_interval_s=3600.0)
+        sibling = _claim(base, config)
+        dead = Path(sibling.directory)
+        _stage_into(sibling.directory, STAGED_BY_THE_DEAD)
+        sibling.release()  # its owner is gone
+        staged = sorted(dead.rglob("*.dmi-pack.ready"))
+        assert staged
+        store.cut()
+        lock = _claim(base, config)
+        service = _service(config, lock.directory)
+        service.start()
+        try:
+            # The loop's first cycle, which start() kicks, begins adopting
+            # and fails its first round; then it waits out its interval.
+            _wait_for(lambda: service.snapshot()["upload_failures"] > 0
+                      and service.snapshot()["cycles"] >= 1, 60.0)
+            before = service.snapshot()
+            assert before["adoption_owed"] is True, before
+            flushed = time.monotonic()
+            service.flush(0.5)  # nothing of its own: drained
+            assert time.monotonic() - flushed < 2.0
+            after = service.snapshot()
+            assert after["upload_failures"] == before["upload_failures"], after
+            assert after["adopted_packs"] == 0, after
+            assert after["adoption_owed"] is True, after
+            assert sorted(dead.rglob("*.dmi-pack.ready")) == staged
+        finally:
+            service.stop()
+        lock.release_and_remove_if_empty()
+
+
 def test_a_latched_service_lets_go_of_the_sibling_it_was_adopting(
         fake_s3, tmp_path):
     """A service whose catalog another publisher keeps for 2 x TTL latches,
