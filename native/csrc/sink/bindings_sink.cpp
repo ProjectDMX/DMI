@@ -157,7 +157,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        uint64_t max_pack_bytes, uint64_t max_pack_records,
                        uint64_t max_linger_ns, uint64_t spool_max_bytes,
                        const std::string& overload,
-                       std::optional<double> admission_timeout_s) {
+                       std::optional<double> admission_timeout_s,
+                       double release_flush_timeout_s) {
              dmi_sink::SinkConfig config;
              config.overload = ParseOverload(overload);
              config.admission_timeout_s =
@@ -170,9 +171,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              config.max_pack_bytes = max_pack_bytes;
              config.max_pack_records = max_pack_records;
              config.max_linger_ns = max_linger_ns;
+             if (!std::isfinite(release_flush_timeout_s) ||
+                 release_flush_timeout_s < 0.0) {
+               throw py::value_error(
+                   "release_flush_timeout_s must be a finite, non-negative "
+                   "number");
+             }
              auto sink = std::make_unique<dmi_sink::PackSink>(config);
              return std::make_shared<dmi_sink::NativePackSink>(
-                 std::move(sink), layout);
+                 std::move(sink), layout,
+                 std::chrono::ceil<ring::RecordSink::Duration>(
+                     std::chrono::duration<double>(release_flush_timeout_s)));
            }),
            py::arg("spool_root"), py::arg("layout"),
            py::arg("num_workers") = 1,
@@ -185,7 +194,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            // SinkConfig's own defaults: the Python NativeSinkConfig, which
            // the ring-fed sink is built from, picks block with 2 s.
            py::arg("overload") = "drop_newest",
-           py::arg("admission_timeout_s") = py::none())
+           py::arg("admission_timeout_s") = py::none(),
+           // How long releasing the sink from its engine waits for the open
+           // pack to reach the spool; 0 turns that flush off.
+           py::arg("release_flush_timeout_s") =
+               std::chrono::duration<double>(
+                   dmi_sink::NativePackSink::kDefaultReleaseFlushTimeout)
+                   .count())
       .def("attach",
            [](std::shared_ptr<dmi_sink::NativePackSink> self) {
              // Simulates engine ownership for tests (the real engine takes
@@ -220,6 +235,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "overload",
           [](const dmi_sink::NativePackSink& self) {
             return std::string(OverloadName(self.sink().config().overload));
+          })
+      .def_property_readonly(
+          "release_flush_timeout_s",
+          [](const dmi_sink::NativePackSink& self) {
+            return std::chrono::duration<double>(self.release_flush_timeout())
+                .count();
           })
       .def_property_readonly(
           "admission_timeout_s",
