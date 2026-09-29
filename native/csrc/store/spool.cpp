@@ -741,8 +741,9 @@ bool SpoolOwnedByThisProcess(const std::string& dir) {
 
 namespace {
 
-// Every descriptor this binary has open on a spool owner lock file: held,
-// or between its open() and its flock, or on its way to close(). The fork
+// Every descriptor this binary has open on a spool owner lock file, or on
+// the directory it locks with it: held, or between its open() and its
+// flock, or on its way to close(). The fork
 // handlers close the child's copies of all of them. Tracking starts at the
 // open() and ends at the close(), each under the mutex that BeforeFork
 // takes, so no fork -- from any thread, at any point of a take or a
