@@ -1292,12 +1292,18 @@ def test_a_flush_that_cuts_a_multipart_upload_waits_for_its_abort(
     outlasts the request timeout. Here the store holds the part and the
     abort both, so the flush pays the whole bound, and no more. The pack is
     a sparse file of zeros named for its checksum, over the client's
-    64 MiB multipart threshold; it stays staged."""
+    64 MiB multipart threshold; it stays staged. The budget has to see the
+    part stalled before it ends: the listing and the upload each hash the
+    pack first, and a HEAD and the CreateMultipartUpload go before the
+    part, which on a loaded runner outlasted a 1 s budget -- the deadline
+    then cut the upload before its part was sent, and nothing was left to
+    abort."""
     import hashlib
 
     from dmi.storage.native_capture import _load_native_store_extension
 
     size = 65 << 20
+    budget = 4.0
     digest = hashlib.sha256()
     zeros = bytes(1 << 20)
     for _ in range(size // len(zeros)):
@@ -1323,7 +1329,7 @@ def test_a_flush_that_cuts_a_multipart_upload_waits_for_its_abort(
         try:
             s3.stall_requests(_multipart_part_or_abort)
             started = time.monotonic()
-            drained = service.flush(1.0)
+            drained = service.flush(budget)
             elapsed = time.monotonic() - started
             snapshot = service.snapshot()
         finally:
@@ -1333,7 +1339,7 @@ def test_a_flush_that_cuts_a_multipart_upload_waits_for_its_abort(
     assert drained is False
     assert len(s3.stalled) == 2, s3.stalled  # the part, then the abort
     # The deadline, up to a second for the cut, and the 5 s abort.
-    assert elapsed < 1.0 + 1.0 + 5.0 + 1.0, (elapsed, snapshot)
+    assert elapsed < budget + 1.0 + 5.0 + 1.0, (elapsed, snapshot)
     assert snapshot["cancelled_uploads"] == 1, snapshot
     assert snapshot["upload_failures"] == 0, snapshot
     assert _ready(spool_root) == [ready]
