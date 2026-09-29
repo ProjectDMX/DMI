@@ -254,6 +254,49 @@ def test_held_by_caller_with_nothing_held_is_refused(tmp_path):
                  spool_owner_lock="held_by_caller")
 
 
+class _OtherProcessHolder:
+    """Another process holding a directory's SpoolOwnerLock until closed."""
+
+    def __init__(self, directory):
+        script = (
+            "import sys; sys.path.insert(0, sys.argv[1]);"
+            "import _dmi_native_store as m\n"
+            "lock = m.SpoolOwnerLock(sys.argv[2])\n"
+            "print('held', flush=True)\n"
+            "sys.stdin.read()\n")
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", script, str(BUILD), str(directory)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        assert self.proc.stdout.readline().strip() == "held"
+
+    @property
+    def pid(self) -> int:
+        return self.proc.pid
+
+    def close(self) -> None:
+        self.proc.stdin.close()
+        self.proc.wait(timeout=30)
+
+
+def test_held_by_caller_beside_another_processs_lock_is_refused(tmp_path):
+    """held_by_caller is for the process that holds the lock. The service
+    and the sink opened that way beside ANOTHER process's lock are refused,
+    naming it, rather than sweeping and uploading from its directory."""
+    directory = tmp_path / "spool"
+    holder = _OtherProcessHolder(directory)
+    try:
+        with pytest.raises(RuntimeError,
+                           match=f"held_by_caller.*pid {holder.pid}"):
+            _service(_config(), directory, spool_owner_lock="held_by_caller")
+        if SINK_BUILT:
+            pytest.importorskip("torch")
+            with pytest.raises(RuntimeError,
+                               match=f"held_by_caller.*pid {holder.pid}"):
+                _sink(directory, owner_lock="held_by_caller")
+    finally:
+        holder.close()
+
+
 def test_a_drained_directory_is_removed_with_its_lock(tmp_path):
     store = _store()
     directory = tmp_path / "spool"

@@ -8,11 +8,13 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <random>
 #include <thread>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -465,6 +467,54 @@ bool ReadSpoolOwner(const std::string& dir, SpoolOwner* owner) {
   return held;
 }
 
+bool SpoolOwnedByThisProcess(const std::string& dir) {
+  const std::string file = dir + "/" + kOwnerLockFile;
+  struct stat target{};
+  if (::stat(file.c_str(), &target) != 0) return false;
+  // /proc/self/fdinfo/<fd> lists the flocks each open file description
+  // holds ("lock: 1: FLOCK  ADVISORY  WRITE ..."), so the kernel says
+  // whether one of this process's descriptors on the file holds the lock --
+  // a SpoolOwnerLock's, or one a Spool took with kTake. The record in the
+  // file is only a fallback: it is written after the lock is taken, and a
+  // pid says nothing across pid namespaces.
+  DIR* fds = ::opendir("/proc/self/fd");
+  if (fds == nullptr) {
+    SpoolOwner owner;
+    return ReadSpoolOwner(dir, &owner) && owner.pid == ::getpid() &&
+           owner.host == Hostname();
+  }
+  const int listing = ::dirfd(fds);
+  bool held = false;
+  while (!held) {
+    const dirent* entry = ::readdir(fds);
+    if (entry == nullptr) break;
+    char* end = nullptr;
+    const long fd = std::strtol(entry->d_name, &end, 10);
+    if (end == entry->d_name || *end != '\0' || fd == listing) continue;
+    struct stat by_fd{};
+    if (::fstat(static_cast<int>(fd), &by_fd) != 0 ||
+        by_fd.st_dev != target.st_dev || by_fd.st_ino != target.st_ino) {
+      continue;
+    }
+    const std::string info =
+        std::string("/proc/self/fdinfo/") + entry->d_name;
+    std::FILE* in = std::fopen(info.c_str(), "re");
+    if (in == nullptr) continue;
+    char line[512];
+    while (std::fgets(line, sizeof(line), in) != nullptr) {
+      if (std::strncmp(line, "lock:", 5) == 0 &&
+          std::strstr(line, " FLOCK ") != nullptr &&
+          std::strstr(line, " WRITE ") != nullptr) {
+        held = true;
+        break;
+      }
+    }
+    std::fclose(in);
+  }
+  ::closedir(fds);
+  return held;
+}
+
 namespace {
 
 // Locks the lock file of an existing directory, creating the file if it has
@@ -795,8 +845,9 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
   } else {
     // The caller took the lock, so the directory and its lock file exist.
     char held[4096];
+    SpoolOwner owner;
     if (::realpath(config.root.c_str(), held) == nullptr ||
-        !ReadSpoolOwner(held, nullptr)) {
+        !ReadSpoolOwner(held, &owner)) {
       if (error) {
         *error = "spool owner_lock=held_by_caller, but nothing holds " +
                  config.root + "/" + kOwnerLockFile +
@@ -804,6 +855,19 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
                  "it with owner_lock=take";
       }
       return SpoolStatus::kBadArgument;
+    }
+    // Held, but by THIS process? "Someone holds it" passes exactly when
+    // another live process owns the directory, and this Spool's Recover
+    // would then delete that owner's in-flight .open files.
+    if (!SpoolOwnedByThisProcess(held)) {
+      if (error) {
+        *error = "spool owner_lock=held_by_caller, but this process does "
+                 "not hold the owner lock of " + std::string(held) + ": " +
+                 OwnedMessage(held, owner) + ". held_by_caller is for a "
+                 "second Spool in the process that holds the directory's "
+                 "SpoolOwnerLock";
+      }
+      return SpoolStatus::kOwned;
     }
     const SpoolStatus local =
         CheckNodeLocal(held, config.allow_shared_filesystem, error);

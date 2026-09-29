@@ -4,8 +4,9 @@
 //      even in one process: flock binds to an open file description, not to
 //      the process. That is why the engine holds one SpoolOwnerLock and both
 //      of its Spools (sink and service) open with held_by_caller.
-//   2. held_by_caller opens beside a holder, and is refused when nothing
-//      holds the lock.
+//   2. held_by_caller opens beside a holder in this process, and is
+//      refused beside another process's holder or when nothing holds the
+//      lock.
 //   3. A second process is refused, told the holder's pid and host; the
 //      lock goes with its holder, even one killed with SIGKILL.
 //   4. Nesting: a directory under, or containing, an owned one is refused.
@@ -129,6 +130,46 @@ void TestHeldByCallerOpensBesideTheHolder() {
   // A take is still refused while the engine's lock is held.
   Spool rival;
   CHECK(Spool::Open({root, 1 << 20}, &rival, &error) == SpoolStatus::kOwned);
+}
+
+// (2b) held_by_caller is for a Spool in the process that holds the lock.
+// Beside ANOTHER process's lock it is refused, naming that holder: were
+// "something holds it" enough, any process could open a live writer's
+// directory that way, and its Recover would delete the writer's .open file.
+void TestHeldByCallerBesideAnotherProcessIsRefused() {
+  const std::string root = FreshRoot("held-elsewhere") + "/spool";
+  int ready[2];
+  CHECK(::pipe(ready) == 0);
+  const pid_t child = ::fork();
+  if (child == 0) {
+    ::close(ready[0]);
+    SpoolOwnerLock lock;
+    std::string error;
+    const bool ok = SpoolOwnerLock::Acquire(root, false, &lock, &error) ==
+                    SpoolStatus::kOk;
+    const char byte = ok ? '1' : '0';
+    if (::write(ready[1], &byte, 1) != 1) ::_exit(3);
+    ::pause();  // until killed
+    ::_exit(0);
+  }
+  ::close(ready[1]);
+  char byte = 0;
+  CHECK(::read(ready[0], &byte, 1) == 1);
+  CHECK(byte == '1');
+  ::close(ready[0]);
+
+  SpoolConfig config{root, 1 << 20};
+  config.owner_lock = OwnerLock::kHeldByCaller;
+  Spool spool;
+  std::string error;
+  CHECK(Spool::Open(config, &spool, &error) == SpoolStatus::kOwned);
+  CHECK(Contains(error, "held_by_caller"));
+  CHECK(Contains(error, "pid " + std::to_string(child)));
+  CHECK(Contains(error, Hostname()));
+
+  ::kill(child, SIGKILL);
+  int status = 0;
+  ::waitpid(child, &status, 0);
 }
 
 void TestHeldByCallerWithoutAHolderIsRefused() {
@@ -373,6 +414,7 @@ void TestTheDirectoryLayout() {
 int main() {
   TestTwoTakesInOneProcessRefuseEachOther();
   TestHeldByCallerOpensBesideTheHolder();
+  TestHeldByCallerBesideAnotherProcessIsRefused();
   TestHeldByCallerWithoutAHolderIsRefused();
   TestTheLockGoesWithItsSpool();
   TestASecondProcessIsRefusedUntilTheHolderDies();

@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import shutil
 import socket
 import subprocess
 import threading
@@ -113,14 +114,20 @@ def _storage_config(endpoint, prefix, **overrides):
     return NativeCaptureStorageConfig(**fields)
 
 
-# Every spool directory a test points a service or a driver at is owned by
-# the harness for the rest of the test: one SpoolOwnerLock held here, and
-# each service, sink driver and store driver opens the directory with
-# owner_lock="held_by_caller". That is the engine's arrangement -- it holds
-# the lock around its sink and its service -- stretched over the processes a
-# test uses: the drivers stage and upload from processes of their own while
-# a service is up, and a test often builds a second service on a directory
-# the first still has open. Each taking the lock would refuse the others.
+# Every spool directory a test points a service at is owned by the harness
+# for the rest of the test: one SpoolOwnerLock held here, and each service
+# opens the directory with owner_lock="held_by_caller". That is the engine's
+# arrangement -- it holds the lock around its sink and its service -- and a
+# test often builds a second service on a directory the first still has
+# open; each taking the lock would refuse the others.
+#
+# The drivers are processes of their own, so they cannot open a directory
+# this process owns: held_by_caller is refused unless the opening process
+# holds the lock. They take it, as the plan has standalone callers do. The
+# sink driver stages into a scratch directory it owns, and _stage moves its
+# sealed packs into the spool, where a sink in this process would have
+# staged them; the store driver uploads from a spool before any service of
+# the test has opened it.
 _HARNESS_LOCKS: dict = {}
 
 
@@ -172,16 +179,22 @@ def _record(index: int):
 
 
 def _stage(spool_root: Path, indexes, *, records_per_pack: int = 2):
-    """Stage records through the native sink core; return the tensors."""
+    """Stage records through the native sink core; return the tensors.
+
+    The driver takes a scratch directory of its own beside spool_root, and
+    once its sink is closed the sealed packs move into spool_root under the
+    same relative paths -- one rename each, so a service scanning the spool
+    meets a whole ready file or none."""
+    scratch = spool_root.parent / f".stage-{uuid.uuid4().hex[:8]}"
     sink = _Driver(SINK_DRIVER)
     tensors = {}
     try:
         assert sink.call(
-            op="open", root=str(spool_root), max_bytes=1 << 40,
+            op="open", root=str(scratch), max_bytes=1 << 40,
             max_queue_records=256, max_queue_bytes=1 << 24,
             max_pack_bytes=8 << 20, max_pack_records=records_per_pack,
             max_linger_ns=1_000_000_000, overload="drop_newest",
-            admission_timeout=-1, owner_lock=_held(spool_root))["ok"]
+            admission_timeout=-1)["ok"]
         for index in indexes:
             metadata, tensor = _record(index)
             response = sink.call(
@@ -195,6 +208,11 @@ def _stage(spool_root: Path, indexes, *, records_per_pack: int = 2):
         assert snapshot["persisted_records"] == len(tensors), snapshot
     finally:
         sink.close()
+    for ready in sorted(scratch.rglob("*.dmi-pack.ready")):
+        target = spool_root / ready.relative_to(scratch)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        ready.replace(target)
+    shutil.rmtree(scratch)
     return tensors
 
 
@@ -618,8 +636,7 @@ def test_a_pack_uploaded_but_never_indexed_is_reconciled_at_start(
             region=REGION, access=ACCESS, secret=SECRET, token=None,
             insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
             store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
-            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30,
-            owner_lock=_held(spool_root))
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
         assert uploaded["ok"], uploaded
         # And a foreign object where packs live, which must not be indexed.
         foreign = store.call(
@@ -1477,8 +1494,7 @@ def test_a_pass_whose_lease_changed_while_it_read_rereads_the_replay_guard(
             region=REGION, access=ACCESS, secret=SECRET, token=None,
             insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
             store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
-            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30,
-            owner_lock=_held(spool_root))
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
         assert uploaded["ok"], uploaded
     finally:
         store.close()
@@ -1548,8 +1564,7 @@ def test_a_conflicted_publish_reports_the_conflict_unless_the_lease_was_lost(
             region=REGION, access=ACCESS, secret=SECRET, token=None,
             insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
             store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
-            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30,
-            owner_lock=_held(spool_root))
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
         assert uploaded["ok"], uploaded
     finally:
         store.close()
@@ -1730,8 +1745,7 @@ def _upload_behind_the_service(spool_root: Path, endpoint: str) -> list:
             region=REGION, access=ACCESS, secret=SECRET, token=None,
             insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
             store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
-            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30,
-            owner_lock=_held(spool_root))
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
         assert uploaded["ok"], uploaded
     finally:
         store.close()
@@ -2411,8 +2425,7 @@ def test_a_64_mib_pack_over_https_with_a_private_ca_hydrates_exactly(
             max_queue_records=records, max_queue_bytes=2 * records * record_bytes,
             max_pack_bytes=2 * records * record_bytes,
             max_pack_records=records, max_linger_ns=60_000_000_000,
-            overload="drop_newest", admission_timeout=-1,
-            owner_lock=_held(spool_root))["ok"]
+            overload="drop_newest", admission_timeout=-1)["ok"]
         for index in range(records):
             metadata = CaptureMetadata(
                 capture_id=f"tls-{index:04d}", tenant_id="t",

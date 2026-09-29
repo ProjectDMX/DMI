@@ -20,13 +20,16 @@
 // it. The lock goes with its holder, even one killed with SIGKILL.
 //   - owner_lock=kTake (the default) takes it in Open(), before anything
 //     reads the directory, and holds it for the Spool object's life.
-//   - owner_lock=kHeldByCaller takes none: the caller holds a
+//   - owner_lock=kHeldByCaller takes none: the calling process holds a
 //     SpoolOwnerLock on the directory already. Two Spools in ONE process
 //     that both take refuse each other (flock binds to an open file
 //     description, not to the process), so a process running a sink and a
 //     storage service on one directory holds one SpoolOwnerLock and opens
-//     both Spools with kHeldByCaller. Open() refuses it when nothing holds
-//     the lock; it cannot tell who does.
+//     both Spools with kHeldByCaller. Open() refuses it unless one of THIS
+//     process's descriptors holds the lock (SpoolOwnedByThisProcess): kOwned,
+//     naming the holder, beside another process's lock, and kBadArgument
+//     when nothing holds it. Standalone callers -- the drivers, adoption --
+//     take.
 // A directory nested under, or containing, an owned directory (one with a
 // .owner.lock file, held or not) is refused: Scan walks recursively, so the
 // outer spool's Recover would reach into the inner one. <root>/_refs/ is
@@ -135,6 +138,11 @@ struct SpoolOwner {
 // locked but not yet written its record reads as an empty host and pid 0.
 bool ReadSpoolOwner(const std::string& dir, SpoolOwner* owner);
 
+// Whether one of THIS process's descriptors holds <dir>/.owner.lock, as the
+// kernel reports it in /proc/self/fdinfo (falling back to the recorded host
+// and pid where /proc cannot be read). What kHeldByCaller requires.
+bool SpoolOwnedByThisProcess(const std::string& dir);
+
 // The owner lock of one spool directory: flock(LOCK_EX) on <dir>/.owner.lock,
 // released with the object (or Release()), and by the kernel when the
 // process dies. The descriptor is close-on-exec; a child forked WITHOUT exec
@@ -214,7 +222,7 @@ class Spool {
  public:
   // Opens (creating) the root, after the node-local check and, with kTake,
   // after taking its owner lock (kOwned when another holder has it);
-  // kHeldByCaller is refused when nothing holds it. Recovery of
+  // kHeldByCaller is refused unless this process holds it. Recovery of
   // pre-existing files is explicit via Recover(), matching the Python
   // constructor + recover() split.
   static SpoolStatus Open(SpoolConfig config, Spool* out, std::string* error);

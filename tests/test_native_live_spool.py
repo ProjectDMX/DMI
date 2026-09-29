@@ -72,13 +72,13 @@ def _start_writer(binary: Path, spool: Path, packs: int = 1):
         f"writer never opened its temp file: {seen} {process.stderr.read()}")
 
 
-def _recover(spool: Path) -> dict:
+def _recover(spool: Path, **fields) -> dict:
     import json
 
     proc = subprocess.run(
         [str(SPOOL_DRIVER)],
         input=json.dumps({"op": "recover", "root": str(spool),
-                          "max_bytes": 1 << 30}) + "\n",
+                          "max_bytes": 1 << 30, **fields}) + "\n",
         capture_output=True, text=True, timeout=30)
     return json.loads(proc.stdout.strip())
 
@@ -108,6 +108,30 @@ def test_an_upload_scan_is_refused_while_a_writer_holds_the_spool(
         assert list(spool.rglob("*.dmi-pack.ready")) == []
     finally:
         uploader.close()
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+
+
+def test_held_by_caller_cannot_sweep_a_live_writers_spool(tmp_path, writer_binary):
+    """owner_lock=held_by_caller opens without a lock of its own, for a
+    second Spool in the process that holds the directory. From any other
+    process it is refused, naming the writer: it used to pass on "something
+    holds the lock", and its Recover then deleted the writer's .open file,
+    failing the writer's stage with "cannot link ready file"."""
+    spool = tmp_path / "spool"
+    process = _start_writer(writer_binary, spool)
+    try:
+        result = _recover(spool, owner_lock="held_by_caller")
+        assert not result["ok"], result
+        assert "held_by_caller" in result["what"], result
+        assert f"pid {process.pid}" in result["what"], result
+        assert len(list(spool.rglob("*.open"))) == 1
+
+        output, error = process.communicate("continue\n", timeout=10)
+        assert process.returncode == 0, output + error
+        assert len(list(spool.rglob("*.dmi-pack.ready"))) == 1
+    finally:
         if process.poll() is None:
             process.kill()
             process.communicate()

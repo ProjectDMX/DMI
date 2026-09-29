@@ -9,8 +9,11 @@ must also refuse, and what it must leave alone:
 
 * a directory nested under, or containing, an owned directory: Scan walks
   recursively, so the outer spool's cleanup would reach into the inner one;
-* ``owner_lock="held_by_caller"`` with nothing holding the lock: that mode
-  opens without a lock of its own, on the caller's word that one is held;
+* ``owner_lock="held_by_caller"`` unless THIS process holds the lock: that
+  mode opens without a lock of its own, for a second Spool in the process
+  that holds one. Beside another process's lock it is refused, naming the
+  holder -- else any process could open a live writer's directory that way
+  and sweep its in-flight ``.open`` files;
 * ``<dir>/_refs/``, where the upload handoff's ref files will live: no scan
   may sweep, quarantine or list anything under it.
 
@@ -165,14 +168,22 @@ def test_a_stale_lock_file_still_marks_an_owned_directory(tmp_path):
     assert "nested" in response["what"], response
 
 
-def test_held_by_caller_opens_beside_the_holder(tmp_path):
+def test_held_by_caller_is_refused_beside_another_processs_holder(tmp_path):
+    """A process that does not hold the lock cannot open held_by_caller:
+    the holder is another process, so the open is refused, naming it, and
+    its Recover never runs."""
     root = tmp_path / "spool"
     holder = _Holder(root)
     try:
         assert holder.opened["ok"], holder.opened
         response = _spool(op="recover", root=str(root),
                           owner_lock="held_by_caller")
-        assert response["ok"], response
+        assert not response["ok"], response
+        assert response["status"] == "open", response
+        what = response["what"]
+        assert "held_by_caller" in what, what
+        assert f"pid {holder.pid}" in what, what
+        assert socket.gethostname() in what, what
     finally:
         holder.close()
 
