@@ -1405,6 +1405,50 @@ def test_a_flush_against_a_slow_catalog_indexes_one_batch_past_its_deadline(
         assert sorted(_read_all(direct)) == sorted(tensors)
 
 
+def test_the_one_batch_past_a_flushs_deadline_is_a_full_one(fake_s3,
+                                                           tmp_path):
+    """Past its deadline a flush starts no index batch but the first. The
+    pass cut its packs into batches of indexer_max_packs from the front and
+    then took them from the back, so that first batch was the remainder:
+    three packs in batches of two indexed one, and a remainder of one pack
+    is what a flush out of time made progress by however many it owed. The
+    first batch is a full one now."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(
+            fake_s3, catalog.table_prefix,
+            clickhouse_port=switch.port)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="full-batch-flush",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            indexer_max_packs=2, clickhouse_request_timeout_s=60.0)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(6))  # three packs
+            # Slow enough that one batch outlasts the 1 s deadline.
+            switch.delay_requests(_slow_catalog(0.4, 0.4))
+            drained = service.flush(1.0)
+            snapshot = service.snapshot()
+            assert drained is False
+            assert snapshot["indexed_packs"] == 2, snapshot
+            assert snapshot["index_failures"] == 0, snapshot
+
+            switch.restore()
+            assert service.flush(60.0)
+            assert service.snapshot()["indexed_packs"] == 3
+        finally:
+            switch.close()
+            service.stop()
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
 def test_only_the_loop_reconciles_never_a_flush(fake_s3, tmp_path):
     """A flush's cycles skip the periodic reconcile, which lists the whole
     bucket and asks the catalog about every page -- work no deadline

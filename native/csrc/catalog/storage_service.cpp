@@ -684,21 +684,30 @@ size_t CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
   // independent, so packs that each fit can still overflow together.
   const size_t max_packs =
       static_cast<size_t>(std::max(1, config_.indexer.max_packs));
+  // A stack, the next batch at the back. The chunks go on it in reverse, so
+  // the pass runs them front to back and its first batch is a full one:
+  // past a flush's deadline that batch is the only one, and the remainder
+  // chunk can be a single pack. A split pushes its halves the same way.
   std::vector<std::vector<PackRefData>> work;
-  for (size_t i = 0; i < refs.size(); i += max_packs) {
-    work.emplace_back(refs.begin() + i,
-                      refs.begin() + std::min(refs.size(), i + max_packs));
+  for (size_t chunk = (refs.size() + max_packs - 1) / max_packs; chunk-- > 0;) {
+    const size_t begin = chunk * max_packs;
+    work.emplace_back(refs.begin() + begin,
+                      refs.begin() + std::min(refs.size(), begin + max_packs));
   }
+  // What is still queued, in the order it would have run.
+  const auto drain_queued = [&](uint64_t* count) {
+    for (auto queued = work.rbegin(); queued != work.rend(); ++queued) {
+      *count += queued->size();
+      unindexed->insert(unindexed->end(), queued->begin(), queued->end());
+    }
+    work.clear();
+  };
   // A batch that threw indexed nothing, and neither did anything still queued.
   const auto give_up = [&](std::vector<PackRefData>& failed,
                            const std::string& message) {
     uint64_t count = failed.size();
     unindexed->insert(unindexed->end(), failed.begin(), failed.end());
-    for (std::vector<PackRefData>& queued : work) {
-      count += queued.size();
-      unindexed->insert(unindexed->end(), queued.begin(), queued.end());
-    }
-    work.clear();
+    drain_queued(&count);
     record_error(message);
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_.index_failures += count;
@@ -707,13 +716,10 @@ size_t CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
   // pass short.
   size_t deferred = 0;
   const auto defer = [&](std::vector<PackRefData>& cut) {
-    deferred += cut.size();
+    uint64_t count = cut.size();
     unindexed->insert(unindexed->end(), cut.begin(), cut.end());
-    for (std::vector<PackRefData>& queued : work) {
-      deferred += queued.size();
-      unindexed->insert(unindexed->end(), queued.begin(), queued.end());
-    }
-    work.clear();
+    drain_queued(&count);
+    deferred += static_cast<size_t>(count);
   };
   bool first = true;
   while (!work.empty()) {
