@@ -1311,6 +1311,38 @@ def test_a_flush_against_a_slow_catalog_indexes_one_batch_past_its_deadline(
         assert sorted(_read_all(direct)) == sorted(tensors)
 
 
+def test_only_the_loop_reconciles_never_a_flush(fake_s3, tmp_path):
+    """A flush's cycles skip the periodic reconcile, which lists the whole
+    bucket and asks the catalog about every page -- work no deadline
+    bounds; the loop runs it. A reconcile is due on every cycle here, and
+    the loop's first wake is 2 s off: the flush drains without one, and the
+    loop's first cycle runs it."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    with _catalog() as (_client, catalog):
+        native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="flush-no-reconcile",
+            poll_interval_ns=2_000_000_000, reconcile_on_start=False,
+            reconcile_interval_ns=1_000_000)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(2))
+            assert service.flush(30.0)
+            snapshot = service.snapshot()
+            assert snapshot["indexed_packs"] == 1, snapshot
+            assert snapshot["reconcile_passes"] == 0, snapshot
+            _wait_for(lambda: service.snapshot()["reconcile_passes"] >= 1,
+                      timeout_s=10.0)
+        finally:
+            service.stop()
+
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
 def test_dropping_a_running_service_does_not_hold_the_gil(fake_s3, tmp_path):
     """A service collected without stop() stops itself in its destructor,
     joining a cycle that may be waiting on the catalog. That ran with the
