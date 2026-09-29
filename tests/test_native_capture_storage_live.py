@@ -858,6 +858,63 @@ def test_a_flush_against_a_black_hole_catalog_overruns_by_one_request(
     assert elapsed < 1.0 + request_timeout + 1.0, elapsed
 
 
+def test_the_stop_after_a_flush_runs_no_further_cycle(fake_s3, tmp_path):
+    """close() runs flush(budget) and then stop(). A loop that woke while
+    the flush held the cycle lock took the lock the moment the flush let
+    go -- before stop() could say anything -- and ran a whole cycle of its
+    own, which stop() then joined: against a catalog that accepts
+    connections and never answers, one more request timeout on top of the
+    flush's and the lease release's. The loop now waits out its interval
+    from the end of the last cycle, anyone's, so a stop() right after a
+    flush finds it waiting and it leaves at once."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    request_timeout = 4.0
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(
+            fake_s3, catalog.table_prefix,
+            clickhouse_port=switch.port)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="stop-after-flush",
+            # Wakes while the flush below holds the cycle lock.
+            poll_interval_ns=3_000_000_000, reconcile_on_start=False,
+            # No renewal falls due while the test runs (a third of the TTL).
+            lease_ttl_ns=60_000_000_000, publish_timeout_ns=5_000_000_000,
+            clickhouse_request_timeout_s=request_timeout)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        stopped = False
+        try:
+            # Right after one of the loop's cycles, so that it next wakes
+            # while the flush's cycle waits on the catalog.
+            _wait_for(lambda: service.snapshot()["cycles"] >= 1,
+                      timeout_s=10.0)
+            _stage(spool_root, range(2))
+            switch.stall()
+            started = time.monotonic()
+            drained = service.flush(1.0)
+            flushed = time.monotonic() - started
+            cycles = service.snapshot()["cycles"]
+            started = time.monotonic()
+            service.stop()
+            stopped = True
+            stop_s = time.monotonic() - started
+            snapshot = service.snapshot()
+        finally:
+            switch.close()  # releases the stalled connections
+            if not stopped:
+                service.stop()
+
+    assert drained is False
+    assert flushed < 1.0 + request_timeout + 1.0, flushed
+    # No cycle after the flush's: stop() waited for the lease release
+    # alone, one request timeout against this catalog, not two.
+    assert snapshot["cycles"] == cycles, (cycles, stop_s, snapshot)
+    assert stop_s < request_timeout + 1.5, (stop_s, snapshot)
+
+
 def _put(request: bytes) -> bool:
     return request.startswith(b"PUT ")
 

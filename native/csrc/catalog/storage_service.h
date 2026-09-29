@@ -393,6 +393,10 @@ class CaptureStorageService {
   // runs one once it holds a lease again. Guarded by cycle_mutex_.
   bool reconcile_owed_ = false;
   int failure_streak_ = 0;  // consecutive failed cycles, for the backoff
+  // steady ns at which the last cycle -- the loop's or a flush's -- ended;
+  // 0 before the first. The loop waits its interval from it. Guarded by
+  // cycle_mutex_.
+  uint64_t last_cycle_end_ns_ = 0;
   // Uploaded, so gone from the spool, but not yet in the catalog.
   std::vector<PackRefData> pending_index_;
   std::map<std::string, int> index_attempts_;  // by pack id

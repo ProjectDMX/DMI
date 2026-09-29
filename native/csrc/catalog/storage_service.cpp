@@ -416,12 +416,15 @@ void CaptureStorageService::rethrow_if_failed() const {
 
 void CaptureStorageService::loop() {
   uint64_t wait_ns = config_.poll_interval_ns;
+  bool waited_again = false;  // the last wake gave way to a flush's cycle
   while (true) {
+    bool kicked = false;
     {
       std::unique_lock<std::mutex> lock(wake_mutex_);
       wake_.wait_for(lock, std::chrono::nanoseconds(wait_ns),
                      [this] { return stop_requested_ || kick_; });
       if (stop_requested_) return;
+      kicked = kick_;
       kick_ = false;
     }
     {
@@ -429,6 +432,26 @@ void CaptureStorageService::loop() {
       if (failure_) return;  // another publisher holds the catalog
     }
     std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
+    {
+      std::lock_guard<std::mutex> lock(wake_mutex_);
+      if (stop_requested_) return;
+    }
+    // The wait runs from the end of the last cycle, anyone's. A flush that
+    // held the lock while this waited for it has just run one; running
+    // another straight after it would only delay a stop() that follows the
+    // flush -- close()'s order -- by that cycle's catalog work, which stop()
+    // cannot cut. So wait out the rest of the interval first, unless a
+    // fresh lease asked for a cycle now -- once: flushes that keep coming
+    // do every cycle's work but the reconcile, which only this loop runs,
+    // so the next wake runs a cycle whatever they did.
+    const uint64_t since_ns = steady_ns() - last_cycle_end_ns_;
+    if (!kicked && !waited_again && last_cycle_end_ns_ != 0 &&
+        since_ns < wait_ns) {
+      wait_ns -= since_ns;
+      waited_again = true;
+      continue;
+    }
+    waited_again = false;
     run_cycle(0, true);
     // poll_interval * 2^streak, capped: flush() shares the streak, so an
     // outage it saw also slows the loop, and a success from either resets it.
@@ -444,6 +467,15 @@ void CaptureStorageService::loop() {
 CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
     uint64_t deadline_ns, bool allow_reconcile) {
   CycleOutcome outcome;
+  // stop() has begun: it cancelled the uploads and the reads for good, so a
+  // cycle could only make catalog requests -- a lease claim, a replay guard
+  // -- that stop() would have to wait out. Neither drained nor failed.
+  if (upload_cancel_.cancelled_for_good()) {
+    outcome.failed = false;
+    outcome.cut_short = true;
+    last_cycle_end_ns_ = steady_ns();
+    return outcome;
+  }
   // flush()'s deadline cancels this cycle's uploads at that moment, and its
   // index reads one catalog request timeout later: an upload cut short
   // leaves its pack in the spool, but a read cut short leaves an uploaded
@@ -621,6 +653,7 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
   } else if (!outcome.cut_short) {
     failure_streak_ = 0;
   }
+  last_cycle_end_ns_ = steady_ns();
   return outcome;
 }
 
