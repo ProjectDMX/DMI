@@ -208,6 +208,35 @@ def test_a_forked_worker_does_not_keep_a_dead_owners_lock(tmp_path):
             owner.wait(timeout=30)
 
 
+def test_a_removed_lock_file_leaves_a_live_directory_owned(tmp_path):
+    """Something other than the owner -- an age-based cleaner such as
+    systemd-tmpfiles, a person -- can remove .owner.lock from under a live
+    owner. Judged by that file alone, another process then saw nobody
+    holding the directory, took it, and could sweep the owner's stages in
+    flight. The owner locks the directory itself as well."""
+    directory = tmp_path / "spool"
+    with _store().SpoolOwnerLock(str(directory)) as lock:
+        (directory / ".owner.lock").unlink()
+        probe = (
+            "import sys; sys.path.insert(0, sys.argv[1]);"
+            "import _dmi_native_store as m\n"
+            "print(m.spool_owner(sys.argv[2]) is not None)\n"
+            "try:\n"
+            "    m.SpoolOwnerLock(sys.argv[2])\n"
+            "    print('taken')\n"
+            "except m.SpoolOwnedError:\n"
+            "    print('owned')\n")
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(BUILD), str(directory)],
+            capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.split() == ["True", "owned"], result.stdout
+        assert lock.held
+    assert _store().spool_owner(str(directory)) is None
+    with _store().SpoolOwnerLock(str(directory)):
+        pass
+
+
 def test_spool_owner_names_the_holder_while_it_holds(tmp_path):
     store = _store()
     directory = str(tmp_path / "spool")

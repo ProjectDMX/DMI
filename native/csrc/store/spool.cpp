@@ -552,20 +552,41 @@ SpoolStatus CheckNodeLocal(const std::string& dir,
   return SpoolStatus::kBadArgument;
 }
 
+namespace {
+// A probe of one flock: if it can be taken nobody holds it, and it is let
+// go at once. (A take racing the probe retries, see LockInPlace.) An
+// unlock on the probe's own description, so a child forked meanwhile
+// keeps nothing either.
+bool FlockHeld(int fd) {
+  if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
+    ::flock(fd, LOCK_UN);
+    return false;
+  }
+  return errno == EWOULDBLOCK;
+}
+}  // namespace
+
 bool ReadSpoolOwner(const std::string& dir, SpoolOwner* owner) {
   const std::string file = dir + "/" + kOwnerLockFile;
   const int fd = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) return false;
-  // A probe: if the lock can be taken nobody holds it, and it is let go at
-  // once. (A take racing the probe retries, see LockInPlace.)
-  if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
-    ::flock(fd, LOCK_UN);
-    ::close(fd);
-    return false;
+  bool held = fd >= 0 && FlockHeld(fd);
+  if (!held) {
+    // The directory's own lock, which its owner keeps however its lock
+    // file is replaced (SpoolOwnerLock).
+    const int dir_fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd >= 0) {
+      held = FlockHeld(dir_fd);
+      ::close(dir_fd);
+    }
   }
-  const bool held = errno == EWOULDBLOCK;
-  if (held && owner != nullptr) ReadOwnerRecord(fd, owner);
-  ::close(fd);
+  if (held && owner != nullptr) {
+    if (fd >= 0) {
+      ReadOwnerRecord(fd, owner);
+    } else {
+      *owner = SpoolOwner{};
+    }
+  }
+  if (fd >= 0) ::close(fd);
   return held;
 }
 
@@ -585,8 +606,17 @@ bool IsSpoolClaimStagingName(const std::string& name) {
 
 bool SpoolOwnedByThisProcess(const std::string& dir) {
   const std::string file = dir + "/" + kOwnerLockFile;
-  struct stat target{};
-  if (::stat(file.c_str(), &target) != 0) return false;
+  // The lock file, and the directory itself, which its owner locks too: a
+  // lock file replaced behind the owner's back is no longer the one it
+  // holds, but the directory is.
+  struct stat targets[2]{};
+  size_t n_targets = 0;
+  if (::stat(file.c_str(), &targets[n_targets]) == 0) ++n_targets;
+  if (::stat(dir.c_str(), &targets[n_targets]) == 0 &&
+      S_ISDIR(targets[n_targets].st_mode)) {
+    ++n_targets;
+  }
+  if (n_targets == 0) return false;
   // /proc/self/fdinfo/<fd> lists the flocks each open file description
   // holds ("lock: 1: FLOCK  ADVISORY  WRITE ..."), so the kernel says
   // whether one of this process's descriptors on the file holds the lock --
@@ -608,10 +638,13 @@ bool SpoolOwnedByThisProcess(const std::string& dir) {
     const long fd = std::strtol(entry->d_name, &end, 10);
     if (end == entry->d_name || *end != '\0' || fd == listing) continue;
     struct stat by_fd{};
-    if (::fstat(static_cast<int>(fd), &by_fd) != 0 ||
-        by_fd.st_dev != target.st_dev || by_fd.st_ino != target.st_ino) {
-      continue;
+    if (::fstat(static_cast<int>(fd), &by_fd) != 0) continue;
+    bool on_target = false;
+    for (size_t i = 0; i < n_targets; ++i) {
+      on_target = on_target || (by_fd.st_dev == targets[i].st_dev &&
+                                by_fd.st_ino == targets[i].st_ino);
     }
+    if (!on_target) continue;
     const std::string info =
         std::string("/proc/self/fdinfo/") + entry->d_name;
     std::FILE* in = std::fopen(info.c_str(), "re");
@@ -688,15 +721,66 @@ void CloseLockDescriptor(int fd) {
   ::close(fd);  // closing the last descriptor unlocks
 }
 
-// Locks the lock file of an existing directory, creating the file if it has
-// none. Retries a lock lost to a remover's unlink, and a refusal as brief as
-// another process's ReadSpoolOwner probe.
-SpoolStatus LockInPlace(const std::string& dir, int* fd_out,
+// The two locks of a held spool directory: its lock file's, which records
+// the holder, and the directory's own. The directory cannot be unlinked
+// while it holds anything, so a lock file removed behind a live owner's
+// back -- by an age-based cleaner such as systemd-tmpfiles, which also
+// skips a directory that is flocked, or by a person -- leaves the
+// directory owned: the next take meets its lock and is refused, where by
+// the new lock file alone it took the live directory for a dead one.
+struct HeldLock {
+  int file_fd = -1;
+  int dir_fd = -1;
+};
+
+void CloseHeldLock(HeldLock* lock) {
+  CloseLockDescriptor(lock->dir_fd);
+  CloseLockDescriptor(lock->file_fd);
+  *lock = HeldLock{};
+}
+
+// Takes `dir`'s own lock beside its lock file's, which `lock` holds. kOwned
+// while another holder has it: an owner whose lock file was replaced (or
+// is being probed, which a retry outlasts).
+SpoolStatus LockDirectory(const std::string& dir, HeldLock* lock,
+                          std::string* error) {
+  lock->dir_fd = OpenLockDescriptor(dir.c_str(),
+                                    O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+  if (lock->dir_fd < 0) {
+    if (error) *error = "cannot open spool directory " + dir + ": " +
+                        Errno(errno);
+    return SpoolStatus::kIo;
+  }
+  if (::flock(lock->dir_fd, LOCK_EX | LOCK_NB) == 0) return SpoolStatus::kOk;
+  const int failure = errno;
+  CloseLockDescriptor(lock->dir_fd);
+  lock->dir_fd = -1;
+  if (failure != EWOULDBLOCK) {
+    if (error) *error = "cannot lock spool directory " + dir + ": " +
+                        Errno(failure);
+    return SpoolStatus::kIo;
+  }
+  if (error) {
+    *error = "spool directory " + dir + " is owned by another process, "
+             "which holds the directory's own lock: its " + kOwnerLockFile +
+             " was replaced since, so that file does not name it; a spool "
+             "directory has one owner process";
+  }
+  return SpoolStatus::kOwned;
+}
+
+// Locks an existing directory -- its lock file, creating the file if it
+// has none, and the directory itself. Retries a lock lost to a remover's
+// unlink, and a refusal as brief as another process's ReadSpoolOwner
+// probe.
+SpoolStatus LockInPlace(const std::string& dir, HeldLock* out,
                         std::string* error) {
   const std::string file = dir + "/" + kOwnerLockFile;
   for (int attempt = 0; attempt < 8; ++attempt) {
-    const int fd =
+    HeldLock lock;
+    lock.file_fd =
         OpenLockDescriptor(file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    const int fd = lock.file_fd;
     if (fd < 0) {
       if (error) *error = "cannot open " + file + ": " + Errno(errno);
       return SpoolStatus::kIo;
@@ -706,7 +790,7 @@ SpoolStatus LockInPlace(const std::string& dir, int* fd_out,
       const int failure = errno;
       SpoolOwner owner;
       ReadOwnerRecord(fd, &owner);
-      CloseLockDescriptor(fd);
+      CloseHeldLock(&lock);
       if (failure != EWOULDBLOCK) {
         if (error) *error = "cannot lock " + file + ": " + Errno(failure);
         return SpoolStatus::kIo;
@@ -719,7 +803,7 @@ SpoolStatus LockInPlace(const std::string& dir, int* fd_out,
       return SpoolStatus::kOwned;
     }
     if (!IsFileAt(fd, file)) {
-      CloseLockDescriptor(fd);
+      CloseHeldLock(&lock);
       if (!fs::is_directory(dir)) {
         if (error) *error = "spool directory " + dir + " was removed while "
                             "it was being locked";
@@ -727,20 +811,29 @@ SpoolStatus LockInPlace(const std::string& dir, int* fd_out,
       }
       continue;
     }
+    const SpoolStatus directory = LockDirectory(dir, &lock, error);
+    if (directory != SpoolStatus::kOk) {
+      CloseHeldLock(&lock);
+      if (directory == SpoolStatus::kOwned && attempt < 2) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        continue;
+      }
+      return directory;
+    }
     WriteOwnerRecord(fd);
-    *fd_out = fd;
+    *out = lock;
     return SpoolStatus::kOk;
   }
   if (error) *error = "cannot lock " + file + ": it keeps being replaced";
   return SpoolStatus::kIo;
 }
 
-// Creates `dir` with its lock file already held: built under a hidden name
+// Creates `dir` with its locks already held: built under a hidden name
 // beside it, then renamed into place, so a scan of the parent never meets
 // the directory unowned (an adopter would otherwise take a brand-new
 // sibling for a dead one). Falls back to LockInPlace if `dir` appears
 // meanwhile.
-SpoolStatus CreateLocked(const std::string& dir, int* fd_out,
+SpoolStatus CreateLocked(const std::string& dir, HeldLock* out,
                          std::string* error) {
   const fs::path target(dir);
   const std::string parent = target.parent_path().string();
@@ -759,14 +852,23 @@ SpoolStatus CreateLocked(const std::string& dir, int* fd_out,
       return SpoolStatus::kIo;
     }
     const std::string file = staging + "/" + kOwnerLockFile;
-    const int fd = OpenLockDescriptor(
+    HeldLock lock;
+    lock.file_fd = OpenLockDescriptor(
         file.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    const int fd = lock.file_fd;
     if (fd < 0 || ::flock(fd, LOCK_EX | LOCK_NB) != 0) {
       const int failure = errno;
-      CloseLockDescriptor(fd);
+      CloseHeldLock(&lock);
       ::unlink(file.c_str());
       ::rmdir(staging.c_str());
       if (error) *error = "cannot lock " + file + ": " + Errno(failure);
+      return SpoolStatus::kIo;
+    }
+    // Nobody else knows the staging copy yet, so its own lock is free.
+    if (LockDirectory(staging, &lock, error) != SpoolStatus::kOk) {
+      CloseHeldLock(&lock);
+      ::unlink(file.c_str());
+      ::rmdir(staging.c_str());
       return SpoolStatus::kIo;
     }
     WriteOwnerRecord(fd);
@@ -793,11 +895,11 @@ SpoolStatus CreateLocked(const std::string& dir, int* fd_out,
 #endif
     if (renamed != 0) {
       const int failure = errno;
-      CloseLockDescriptor(fd);
+      CloseHeldLock(&lock);
       ::unlink(file.c_str());
       ::rmdir(staging.c_str());
       if (failure == EEXIST || failure == ENOTEMPTY) {
-        return LockInPlace(dir, fd_out, error);
+        return LockInPlace(dir, out, error);
       }
       if (error) {
         *error = "cannot create spool directory " + dir + ": " +
@@ -806,7 +908,7 @@ SpoolStatus CreateLocked(const std::string& dir, int* fd_out,
       return SpoolStatus::kIo;
     }
     FsyncDir(parent, nullptr);
-    *fd_out = fd;
+    *out = lock;  // the directory's lock went with the rename
     return SpoolStatus::kOk;
   }
   if (error) *error = "cannot create spool directory " + dir;
@@ -815,8 +917,9 @@ SpoolStatus CreateLocked(const std::string& dir, int* fd_out,
 
 }  // namespace
 
-void SpoolOwnerLock::Hold(int fd, std::string dir) {
+void SpoolOwnerLock::Hold(int fd, int dir_fd, std::string dir) {
   fd_ = fd;
+  dir_fd_ = dir_fd;
   dir_ = std::move(dir);
   generation_ = g_fork_generation.load(std::memory_order_relaxed);
 }
@@ -831,10 +934,12 @@ SpoolOwnerLock::~SpoolOwnerLock() { Release(); }
 SpoolOwnerLock::SpoolOwnerLock(SpoolOwnerLock&& other) noexcept {
   if (other.held()) {
     fd_ = other.fd_;
+    dir_fd_ = other.dir_fd_;
     dir_ = std::move(other.dir_);
     generation_ = other.generation_;
   }
   other.fd_ = -1;
+  other.dir_fd_ = -1;
   other.dir_.clear();
 }
 
@@ -843,21 +948,27 @@ SpoolOwnerLock& SpoolOwnerLock::operator=(SpoolOwnerLock&& other) noexcept {
     Release();
     if (other.held()) {
       fd_ = other.fd_;
+      dir_fd_ = other.dir_fd_;
       dir_ = std::move(other.dir_);
       generation_ = other.generation_;
     }
     other.fd_ = -1;
+    other.dir_fd_ = -1;
     other.dir_.clear();
   }
   return *this;
 }
 
 void SpoolOwnerLock::Release() {
-  // Untracked and closed in one step (CloseLockDescriptor). In a forked
-  // child the fork handler closed the descriptor already, and its number
-  // may be another file's by now: nothing to close.
-  if (held()) CloseLockDescriptor(fd_);
+  // Each untracked and closed in one step (CloseLockDescriptor). In a
+  // forked child the fork handler closed them already, and their numbers
+  // may be other files' by now: nothing to close.
+  if (held()) {
+    CloseLockDescriptor(dir_fd_);
+    CloseLockDescriptor(fd_);
+  }
   fd_ = -1;
+  dir_fd_ = -1;
   dir_.clear();
 }
 
@@ -891,11 +1002,11 @@ SpoolStatus SpoolOwnerLock::Acquire(const std::string& dir,
   if (status != SpoolStatus::kOk) return status;
   const std::string lock_file = canonical + "/" + kOwnerLockFile;
   const bool had_lock_file = exists && fs::exists(lock_file, ec);
-  int fd = -1;
-  status = exists ? LockInPlace(canonical, &fd, error)
-                  : CreateLocked(canonical, &fd, error);
+  HeldLock lock;
+  status = exists ? LockInPlace(canonical, &lock, error)
+                  : CreateLocked(canonical, &lock, error);
   if (status != SpoolStatus::kOk) return status;
-  out->Hold(fd, canonical);
+  out->Hold(lock.file_fd, lock.dir_fd, canonical);
   // Only now, with this lock published: see CheckNotNested.
   status = CheckNotNested(canonical, error);
   if (status != SpoolStatus::kOk) {
@@ -923,10 +1034,10 @@ SpoolStatus SpoolOwnerLock::TryAdopt(const std::string& dir,
     if (error) *error = "no spool directory to adopt at " + dir;
     return SpoolStatus::kBadArgument;
   }
-  int fd = -1;
-  const SpoolStatus status = LockInPlace(resolved, &fd, error);
+  HeldLock lock;
+  const SpoolStatus status = LockInPlace(resolved, &lock, error);
   if (status != SpoolStatus::kOk) return status;
-  out->Hold(fd, resolved);
+  out->Hold(lock.file_fd, lock.dir_fd, resolved);
   return SpoolStatus::kOk;
 }
 

@@ -15,9 +15,10 @@
 // One owner per directory (B6). Recover() deletes every .open file this
 // object is not writing, so it is only safe while no other PROCESS writes
 // there. A spool directory therefore has an owner lock -- flock(LOCK_EX) on
-// <root>/.owner.lock, whose content records the holder's host and pid --
-// and a second process that tries to take it is refused, told who holds
-// it. The lock goes with its holder, even one killed with SIGKILL.
+// <root>/.owner.lock, whose content records the holder's host and pid, and
+// on <root> itself -- and a second process that tries to take it is
+// refused, told who holds it. The lock goes with its holder, even one
+// killed with SIGKILL.
 //   - owner_lock=kTake (the default) takes it in Open(), before anything
 //     reads the directory, and holds it for the Spool object's life.
 //   - owner_lock=kHeldByCaller takes none: the calling process holds a
@@ -161,9 +162,11 @@ struct SpoolOwner {
   int64_t pid = 0;
 };
 
-// Whether <dir>/.owner.lock is held right now (by any process, this one
-// included), and if so who recorded themselves in it. A holder that has
-// locked but not yet written its record reads as an empty host and pid 0.
+// Whether <dir>'s owner lock is held right now (by any process, this one
+// included) -- its lock file's, or the directory's own -- and if so who
+// recorded themselves in the lock file. A holder that has locked but not
+// yet written its record, or whose lock file was replaced, reads as an
+// empty host and pid 0.
 bool ReadSpoolOwner(const std::string& dir, SpoolOwner* owner);
 
 // Whether `name` is the staging copy of a directory SpoolOwnerLock::Acquire
@@ -173,14 +176,19 @@ bool ReadSpoolOwner(const std::string& dir, SpoolOwner* owner);
 // ignored by the nesting check, and an adopter clears it.
 bool IsSpoolClaimStagingName(const std::string& name);
 
-// Whether one of THIS process's descriptors holds <dir>/.owner.lock, as the
-// kernel reports it in /proc/self/fdinfo (falling back to the recorded host
-// and pid where /proc cannot be read). What kHeldByCaller requires.
+// Whether one of THIS process's descriptors holds <dir>'s owner lock (its
+// lock file's, or the directory's own), as the kernel reports it in
+// /proc/self/fdinfo (falling back to the recorded host and pid where /proc
+// cannot be read). What kHeldByCaller requires.
 bool SpoolOwnedByThisProcess(const std::string& dir);
 
-// The owner lock of one spool directory: flock(LOCK_EX) on <dir>/.owner.lock,
-// released with the object (or Release()), and by the kernel when the
-// process dies. flock binds to an open file description, which a child
+// The owner lock of one spool directory: flock(LOCK_EX) on <dir>/.owner.lock
+// and on <dir> itself, released with the object (or Release()), and by the
+// kernel when the process dies. The directory's lock keeps a live owner's
+// directory owned should its lock file be removed from under it -- by an
+// age-based cleaner (systemd-tmpfiles, which also leaves a flocked
+// directory and everything below it alone) or by a person: the next take
+// meets the directory's lock, not only a new lock file nobody holds. flock binds to an open file description, which a child
 // shares after fork(): the descriptor is close-on-exec, and a child forked
 // WITHOUT exec (a fork-started worker) closes its copy of every lock
 // descriptor at once (pthread_atfork) -- held, or opened and not yet locked
@@ -230,10 +238,12 @@ class SpoolOwnerLock {
   bool ReleaseAndRemoveIfEmpty(std::string* error);
 
  private:
-  // Takes over `fd`, which the fork handler has tracked since its open().
-  void Hold(int fd, std::string dir);
+  // Takes over the two descriptors, which the fork handler has tracked
+  // since their open().
+  void Hold(int fd, int dir_fd, std::string dir);
 
-  int fd_ = -1;
+  int fd_ = -1;      // on <dir>/.owner.lock
+  int dir_fd_ = -1;  // on <dir> itself
   std::string dir_;
   // The fork generation the lock was taken in (spool.cpp): in a forked
   // child, whose copies of the descriptors the fork handler closed, the

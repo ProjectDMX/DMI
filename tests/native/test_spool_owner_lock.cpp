@@ -675,6 +675,65 @@ void TestALockOnAnUnlinkedFileIsTakenAgain() {
   CHECK(SpoolOwnerLock::TryAdopt(dir, &rival, &error) == SpoolStatus::kOwned);
 }
 
+// (6c) Liveness is not the lock file's alone. Something other than its
+// holder -- an age-based cleaner such as systemd-tmpfiles, a person -- can
+// unlink <dir>/.owner.lock while the owner lives: the owner's descriptor is
+// then on the unlinked file, and whoever opens the path next meets a new
+// one that nobody holds. Judged by that file alone the live directory read
+// as dead, an adopter took it, and its Recover swept the owner's in-flight
+// .open files. The owner also locks the directory itself, which cannot be
+// unlinked while it holds anything.
+void TestAReplacedLockFileLeavesTheDirectoryOwned() {
+  const std::string dir = FreshRoot("replaced") + "/spool";
+  int ready[2];
+  CHECK(::pipe(ready) == 0);
+  const pid_t owner = ::fork();
+  if (owner == 0) {
+    ::close(ready[0]);
+    SpoolOwnerLock lock;
+    std::string error;
+    const bool ok = SpoolOwnerLock::Acquire(dir, false, &lock, &error) ==
+                    SpoolStatus::kOk;
+    const char byte = ok ? '1' : '0';
+    if (::write(ready[1], &byte, 1) != 1) ::_exit(3);
+    ::pause();  // until killed
+    ::_exit(0);
+  }
+  ::close(ready[1]);
+  char byte = 0;
+  CHECK(::read(ready[0], &byte, 1) == 1);
+  CHECK(byte == '1');
+  ::close(ready[0]);
+
+  CHECK(fs::remove(dir + "/.owner.lock"));
+  CHECK(dmi_store::ReadSpoolOwner(dir, nullptr));  // still owned
+  std::string error;
+  SpoolOwnerLock adopter;
+  CHECK(SpoolOwnerLock::TryAdopt(dir, &adopter, &error) ==
+        SpoolStatus::kOwned);
+  CHECK(!adopter.held());
+  Spool spool;
+  CHECK(Spool::Open({dir, 1 << 20}, &spool, &error) == SpoolStatus::kOwned);
+
+  ::kill(owner, SIGKILL);
+  int status = 0;
+  ::waitpid(owner, &status, 0);
+  CHECK(!dmi_store::ReadSpoolOwner(dir, nullptr));
+  CHECK(SpoolOwnerLock::TryAdopt(dir, &adopter, &error) == SpoolStatus::kOk);
+
+  // In the owner's own process too: its held_by_caller Spools still open.
+  adopter.Release();
+  SpoolOwnerLock mine;
+  CHECK(SpoolOwnerLock::Acquire(dir, false, &mine, &error) ==
+        SpoolStatus::kOk);
+  CHECK(fs::remove(dir + "/.owner.lock"));
+  CHECK(dmi_store::SpoolOwnedByThisProcess(dir));
+  SpoolConfig beside{dir, 1 << 20};
+  beside.owner_lock = OwnerLock::kHeldByCaller;
+  Spool held;
+  CHECK(Spool::Open(beside, &held, &error) == SpoolStatus::kOk);
+}
+
 void TestANewDirectoryAppearsWithItsLockHeld() {
   // Created beside its lock file and renamed into place, so no scan of the
   // parent can meet the directory before its owner holds it.
@@ -878,6 +937,7 @@ int main() {
   TestSharedFilesystemsAreRefusedUnlessAllowed();
   TestAdoptionLocksOnlyWhatExistsAndIsDead();
   TestALockOnAnUnlinkedFileIsTakenAgain();
+  TestAReplacedLockFileLeavesTheDirectoryOwned();
   TestANewDirectoryAppearsWithItsLockHeld();
   TestTheDirectoryLayout();
   TestDeadSiblingsCountAgainstTheBudget();

@@ -192,9 +192,12 @@ hex digits of a sha256 of where the packs go -- the ClickHouse host and port,
 `database`, `table_prefix`, the S3 endpoint and bucket, and `store_id`, as
 spelled in the config -- the rank torchrun's
 `RANK`, 0 when unset, and the incarnation fresh on every
-`create_record_runtime`), and owns it: an flock on its `.owner.lock`, taken
-before the service starts and let go after the sink and the service are done,
-when a drained directory is removed. If the sink did not seal within
+`create_record_runtime`), and owns it: an flock on its `.owner.lock` and on the
+directory itself, taken before the service starts and let go after the sink and
+the service are done, when a drained directory is removed. The directory's own
+lock keeps it owned should its `.owner.lock` be removed from under it, and
+systemd-tmpfiles skips a flocked directory when it ages `/tmp`; other cleaners
+may not, so keep `spool_root` out of what they age. If the sink did not seal within
 `close_flush_timeout_s`, it may still be staging, so the directory stays owned
 by the process until it exits (a warning names it) and the next process on the
 node adopts it; so does the directory of an engine dropped without `close()`.
