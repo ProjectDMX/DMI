@@ -356,6 +356,9 @@ class _Switch:
         self.refused: list[float] = []
         self._lock = threading.Lock()
         self._sockets: set[socket.socket] = set()
+        # close() has run: a request held back by a delay is not forwarded
+        # once it has.
+        self._closed = False
         threading.Thread(target=self._accept, daemon=True).start()
 
     @classmethod
@@ -421,6 +424,7 @@ class _Switch:
         what delay_requests() says; anything else goes straight through."""
         request = b""
         continued = False
+        whole = False  # the head and all Content-Length bytes of body
         try:
             client.settimeout(2.0)
             while True:
@@ -428,6 +432,7 @@ class _Switch:
                 if found:
                     length = re.search(rb"(?i)content-length:\s*(\d+)", head)
                     if length is None or len(body) >= int(length.group(1)):
+                        whole = True
                         break
                     # libcurl holds a body over 1 KiB back until the server
                     # says 100 Continue, or for a second; answer for it, so
@@ -442,6 +447,12 @@ class _Switch:
                 request += chunk
             client.settimeout(None)
         except OSError:
+            client.close()
+            return
+        if not whole:
+            # The client went away mid-request -- a cancel that landed
+            # after the head, say. Forwarded, the fake S3 stored the short
+            # body under the key, over what a later upload put there.
             client.close()
             return
         if continued:
@@ -467,6 +478,10 @@ class _Switch:
                 and b"_publisher_lease" in request)
         if late:
             time.sleep(late_by)
+        if self._closed:
+            # Held back past close(): the test is done with this server.
+            client.close()
+            return
         try:
             upstream = socket.create_connection(self._target)
             upstream.sendall(request)
@@ -536,7 +551,9 @@ class _Switch:
         listener does not wake a thread blocked in accept(), which still
         takes one more queued connection: the stall settings go first, so
         that connection is refused rather than held open for its client's
-        whole timeout (a stop()'s lease release after a stall() did)."""
+        whole timeout (a stop()'s lease release after a stall() did).
+        A request a delay still holds back is dropped, not forwarded."""
+        self._closed = True
         self._stalled = False
         self._stall_if = None
         self._slow_once = None
@@ -544,6 +561,83 @@ class _Switch:
         self._late_by = 0.0
         self.cut()
         self._listener.close()
+
+
+class _Recorder:
+    """A TCP server that keeps every byte it is sent, by connection."""
+
+    def __init__(self):
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self.port = self._listener.getsockname()[1]
+        self.received: list[bytes] = []
+        self._lock = threading.Lock()
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                connection, _ = self._listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._keep, args=(connection,),
+                             daemon=True).start()
+
+    def _keep(self, connection):
+        data = b""
+        try:
+            while chunk := connection.recv(65536):
+                data += chunk
+        except OSError:
+            pass
+        connection.close()
+        with self._lock:
+            self.received.append(data)
+
+    def close(self):
+        self._listener.close()
+
+
+def test_the_switch_forwards_no_request_its_client_did_not_finish(tmp_path):
+    """The harness itself. A client that went away after a request's head
+    -- a flush deadline's cancel landing between libcurl's head and body,
+    which the switch had answered 100 Continue for -- was forwarded all
+    the same, its body short: the fake S3, whose signature check trusts
+    x-amz-content-sha256, then stored an empty object over what a later
+    upload put at the key. Nor does a request a delay still holds back
+    when close() runs reach the server after it."""
+    recorder = _Recorder()
+    switch = _Switch("127.0.0.1", recorder.port)
+    switch.delay_requests(lambda request: 0.3)
+    head = (b"PUT /b/k HTTP/1.1\r\nHost: x\r\nContent-Length: 2048\r\n"
+            b"Expect: 100-continue\r\n\r\n")
+    try:
+        with socket.create_connection(("127.0.0.1", switch.port),
+                                      timeout=10) as client:
+            client.sendall(head)
+            assert client.recv(64).startswith(b"HTTP/1.1 100 Continue")
+        # The control: a whole request, held back and then forwarded.
+        with socket.create_connection(("127.0.0.1", switch.port),
+                                      timeout=10) as client:
+            client.sendall(head + bytes(2048))
+            client.shutdown(socket.SHUT_WR)
+            time.sleep(1.0)
+        with recorder._lock:
+            forwarded = list(recorder.received)
+        assert len(forwarded) == 1, forwarded
+        assert forwarded[0].endswith(bytes(2048)), forwarded
+
+        # Held back when close() runs, then dropped.
+        with socket.create_connection(("127.0.0.1", switch.port),
+                                      timeout=10) as client:
+            client.sendall(head + bytes(2048))
+            time.sleep(0.1)
+            switch.close()
+            time.sleep(1.0)
+        with recorder._lock:
+            assert recorder.received == forwarded, recorder.received
+    finally:
+        switch.close()
+        recorder.close()
 
 
 def test_an_index_failure_keeps_the_pack_owed_until_it_lands(fake_s3, tmp_path):
