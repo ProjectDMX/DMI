@@ -151,6 +151,10 @@ SpoolStatus CheckNodeLocal(const std::string& dir,
 // calling statfs(2). A negative value restores statfs.
 void SetFilesystemTypeForTesting(int64_t f_type);
 
+// Test seam: every /proc/self/fdinfo read in this binary sees no "lock:"
+// lines, as under gVisor or WSL1, whose procfs lists none.
+void SetFdinfoHidesLocksForTesting(bool hide);
+
 // Test seam: taking an existing directory's lock calls `hook` with the lock
 // file's path after opening the file and before locking it -- the window in
 // which a remover can unlink it. An empty function removes the hook.
@@ -179,7 +183,8 @@ bool IsSpoolClaimStagingName(const std::string& name);
 // Whether one of THIS process's descriptors holds <dir>'s owner lock (its
 // lock file's, or the directory's own), as the kernel reports it in
 // /proc/self/fdinfo (falling back to the recorded host and pid where /proc
-// cannot be read). What kHeldByCaller requires.
+// cannot be read, or its fdinfo lists no flocks at all, as under gVisor or
+// WSL1). What kHeldByCaller requires.
 bool SpoolOwnedByThisProcess(const std::string& dir);
 
 // The owner lock of one spool directory: flock(LOCK_EX) on <dir>/.owner.lock

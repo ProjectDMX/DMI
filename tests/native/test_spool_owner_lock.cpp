@@ -176,6 +176,61 @@ void TestHeldByCallerBesideAnotherProcessIsRefused() {
   ::waitpid(child, &status, 0);
 }
 
+// (2c) Where the kernel lists no flocks in /proc/self/fdinfo -- gVisor's
+// procfs prints only pos/flags/mnt_id, WSL1's none either -- the check
+// fell back to the owner record only when /proc/self/fd could not be
+// opened, so the process that really held the lock was refused its own
+// held_by_caller Spools, naming its own pid, and no default-mode capture
+// could start. There the record decides: this host and pid, or not.
+void TestHeldByCallerWhereTheKernelListsNoFlocks() {
+  const std::string root = FreshRoot("no-fdinfo-locks") + "/spool";
+  dmi_store::SetFdinfoHidesLocksForTesting(true);
+  SpoolOwnerLock lock;
+  std::string error;
+  CHECK(SpoolOwnerLock::Acquire(root, false, &lock, &error) ==
+        SpoolStatus::kOk);
+  CHECK(dmi_store::SpoolOwnedByThisProcess(root));
+  SpoolConfig config{root, 1 << 20};
+  config.owner_lock = OwnerLock::kHeldByCaller;
+  Spool spool;
+  error.clear();
+  CHECK(Spool::Open(config, &spool, &error) == SpoolStatus::kOk);
+  CHECK(error.empty());
+
+  // Beside another process's lock it is still refused, naming that holder.
+  const std::string other = FreshRoot("no-fdinfo-locks-other") + "/spool";
+  int ready[2];
+  CHECK(::pipe(ready) == 0);
+  const pid_t child = ::fork();
+  if (child == 0) {
+    ::close(ready[0]);
+    SpoolOwnerLock held;
+    std::string child_error;
+    const bool ok = SpoolOwnerLock::Acquire(other, false, &held,
+                                            &child_error) == SpoolStatus::kOk;
+    const char byte = ok ? '1' : '0';
+    if (::write(ready[1], &byte, 1) != 1) ::_exit(3);
+    ::pause();  // until killed
+    ::_exit(0);
+  }
+  ::close(ready[1]);
+  char byte = 0;
+  CHECK(::read(ready[0], &byte, 1) == 1);
+  CHECK(byte == '1');
+  ::close(ready[0]);
+  CHECK(!dmi_store::SpoolOwnedByThisProcess(other));
+  SpoolConfig beside{other, 1 << 20};
+  beside.owner_lock = OwnerLock::kHeldByCaller;
+  Spool refused;
+  error.clear();
+  CHECK(Spool::Open(beside, &refused, &error) == SpoolStatus::kOwned);
+  CHECK(Contains(error, "pid " + std::to_string(child)));
+  ::kill(child, SIGKILL);
+  int status = 0;
+  ::waitpid(child, &status, 0);
+  dmi_store::SetFdinfoHidesLocksForTesting(false);
+}
+
 void TestHeldByCallerWithoutAHolderIsRefused() {
   const std::string root = FreshRoot("unheld") + "/spool";
   SpoolConfig config{root, 1 << 20};
@@ -925,6 +980,7 @@ int main() {
   TestTwoTakesInOneProcessRefuseEachOther();
   TestHeldByCallerOpensBesideTheHolder();
   TestHeldByCallerBesideAnotherProcessIsRefused();
+  TestHeldByCallerWhereTheKernelListsNoFlocks();
   TestHeldByCallerWithoutAHolderIsRefused();
   TestTheLockGoesWithItsSpool();
   TestASecondProcessIsRefusedUntilTheHolderDies();

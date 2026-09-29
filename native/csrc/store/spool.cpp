@@ -604,6 +604,48 @@ bool IsSpoolClaimStagingName(const std::string& name) {
   });
 }
 
+namespace {
+std::atomic<bool> g_fdinfo_hides_locks_for_testing{false};
+
+// Whether /proc/self/fdinfo/<fd> lists a write flock on the descriptor's
+// open file description ("lock: 1: FLOCK  ADVISORY  WRITE ...").
+bool FdinfoShowsWriteFlock(const std::string& fd) {
+  if (g_fdinfo_hides_locks_for_testing.load()) return false;
+  std::FILE* in = std::fopen(("/proc/self/fdinfo/" + fd).c_str(), "re");
+  if (in == nullptr) return false;
+  bool shown = false;
+  char line[512];
+  while (!shown && std::fgets(line, sizeof(line), in) != nullptr) {
+    shown = std::strncmp(line, "lock:", 5) == 0 &&
+            std::strstr(line, " FLOCK ") != nullptr &&
+            std::strstr(line, " WRITE ") != nullptr;
+  }
+  std::fclose(in);
+  return shown;
+}
+// Whether this kernel lists flocks in /proc/self/fdinfo at all. Linux does
+// (since 3.8); gVisor's procfs prints only pos, flags and mnt_id, and
+// WSL1's lists no locks either. Probed once, on a flock taken on a
+// temporary file; no temporary file, no telling, and the record decides.
+bool FdinfoListsFlocks() {
+  if (g_fdinfo_hides_locks_for_testing.load()) return false;
+  static const bool lists = [] {
+    std::FILE* temp = std::tmpfile();
+    if (temp == nullptr) return false;
+    const int fd = ::fileno(temp);
+    const bool shown = ::flock(fd, LOCK_EX | LOCK_NB) == 0 &&
+                       FdinfoShowsWriteFlock(std::to_string(fd));
+    std::fclose(temp);
+    return shown;
+  }();
+  return lists;
+}
+}  // namespace
+
+void SetFdinfoHidesLocksForTesting(bool hide) {
+  g_fdinfo_hides_locks_for_testing.store(hide);
+}
+
 bool SpoolOwnedByThisProcess(const std::string& dir) {
   const std::string file = dir + "/" + kOwnerLockFile;
   // The lock file, and the directory itself, which its owner locks too: a
@@ -621,9 +663,10 @@ bool SpoolOwnedByThisProcess(const std::string& dir) {
   // holds ("lock: 1: FLOCK  ADVISORY  WRITE ..."), so the kernel says
   // whether one of this process's descriptors on the file holds the lock --
   // a SpoolOwnerLock's, or one a Spool took with kTake. The record in the
-  // file is only a fallback: it is written after the lock is taken, and a
-  // pid says nothing across pid namespaces.
-  DIR* fds = ::opendir("/proc/self/fd");
+  // file is only a fallback, where /proc cannot be read or lists no flocks
+  // (FdinfoListsFlocks): it is written after the lock is taken, and a pid
+  // says nothing across pid namespaces.
+  DIR* fds = FdinfoListsFlocks() ? ::opendir("/proc/self/fd") : nullptr;
   if (fds == nullptr) {
     SpoolOwner owner;
     return ReadSpoolOwner(dir, &owner) && owner.pid == ::getpid() &&
@@ -645,20 +688,7 @@ bool SpoolOwnedByThisProcess(const std::string& dir) {
                                 by_fd.st_ino == targets[i].st_ino);
     }
     if (!on_target) continue;
-    const std::string info =
-        std::string("/proc/self/fdinfo/") + entry->d_name;
-    std::FILE* in = std::fopen(info.c_str(), "re");
-    if (in == nullptr) continue;
-    char line[512];
-    while (std::fgets(line, sizeof(line), in) != nullptr) {
-      if (std::strncmp(line, "lock:", 5) == 0 &&
-          std::strstr(line, " FLOCK ") != nullptr &&
-          std::strstr(line, " WRITE ") != nullptr) {
-        held = true;
-        break;
-      }
-    }
-    std::fclose(in);
+    held = FdinfoShowsWriteFlock(entry->d_name);
   }
   ::closedir(fds);
   return held;
