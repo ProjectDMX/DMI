@@ -271,12 +271,20 @@ class NativeCaptureStorageConfig:
     # budget is spent, whatever is left. That stays in the spool, which the
     # next start on it uploads, or -- uploaded but not yet indexed -- in the
     # bucket, which only the next start's reconcile indexes
-    # (reconcile_on_start). The drain can outlast the budget by the catalog
-    # work in flight when it ends -- against a catalog that stopped
-    # answering, one clickhouse_request_timeout_s -- never by an upload,
-    # which the deadline cancels; and, when the sink itself is stuck, by
-    # the flush its release from the ring makes (30 s at most). close()
-    # logs what did not drain; flush_and_wait is what raises.
+    # (reconcile_on_start). Past the budget the drain starts no upload -- one
+    # in flight is cut, and a multipart one then aborted, one request of at
+    # most 5 s -- and at most one index batch: its object-store reads are
+    # cut one clickhouse_request_timeout_s past the budget, and its catalog
+    # statements are never cut, each bounded by that timeout (under the
+    # publisher lease, by the lease's deadline when that is sooner).
+    # Stopping the service then releases the lease: one more catalog
+    # request, bounded the same way. So against a catalog or an object
+    # store that stopped answering, close() outlasts the budget by up to
+    # about two request timeouts; against a slow catalog that still
+    # answers, by one batch of statements and the release. When the sink
+    # itself is stuck, the flush its release from the ring makes adds up
+    # to 30 s. close() logs what did not drain; flush_and_wait is what
+    # raises.
     close_flush_timeout_s: float = 60.0
     # Bytes of packs the uploader holds in flight at once. A staged pack
     # larger than this is never uploaded, so the sink's max_pack_bytes must
@@ -630,6 +638,9 @@ class NativeCaptureStorage:
 
         Call after the sink's own flush. Raises TimeoutError, carrying the
         last upload or index error, if the spool has not drained in time.
+        Returns on time: past ``timeout_s`` it starts no upload and at most
+        one index batch, leaving the rest to the background loop (see
+        ``NativeCaptureStorageConfig.close_flush_timeout_s``).
         """
         if not self._service.flush(float(timeout_s)):
             snapshot = self._service.snapshot()

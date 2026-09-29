@@ -337,7 +337,11 @@ drains capture, best effort, within `close_flush_timeout_s`: it flushes the
 sink, stops the ring, waits for the storage service to get the staged packs
 into the catalog, and stops the service. What misses the budget is logged and
 left for the next start (the spool, or the reconcile); `flush_and_wait` is the
-call that raises when captures are not queryable in time.
+call that raises when captures are not queryable in time. Past the budget the
+drain starts no upload and at most one index batch, so against a catalog or
+object store that stops answering, `close()` outlasts the budget by up to about
+two `clickhouse_request_timeout_s` (the request in flight, and the lease
+release); `close_flush_timeout_s` documents the full bound.
 
 Closing does not disable or uninstall HookPoints: they retain hook IDs and the
 old payload tensor. Treat the attached model as terminal too. A later CUDA
