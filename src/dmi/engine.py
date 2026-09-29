@@ -870,12 +870,14 @@ class MonitoringEngine:
         sink and releases the sink; the native pack sink stages its open
         pack in the spool on that release. With a storage service
         (``capture_storage_config``), close() drains capture first, best
-        effort, within ``close_flush_timeout_s``: it flushes the sink, stops
-        the ring, waits for the service to get the staged packs into the
-        catalog, then stops the service. What does not drain in time is
-        logged, not raised, and stays where the next start recovers it
-        (see ``NativeCaptureStorageConfig.close_flush_timeout_s``);
-        ``flush_and_wait`` is the call that raises.
+        effort, with a budget of ``close_flush_timeout_s``: it flushes the
+        sink, stops the ring, waits for the service to get the staged packs
+        into the catalog, then stops the service. The drain can outlast
+        the budget -- stopping the service is not bounded by it -- and
+        ``NativeCaptureStorageConfig.close_flush_timeout_s`` says by how
+        much. What does not drain in time is logged, not raised, and stays
+        where the next start recovers it; ``flush_and_wait`` is the call
+        that raises.
         """
 
         storage = self._capture_storage
