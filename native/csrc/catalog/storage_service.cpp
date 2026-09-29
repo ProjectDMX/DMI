@@ -417,6 +417,15 @@ void CaptureStorageService::stop_lease_thread() {
 }
 
 bool CaptureStorageService::flush(double timeout_s) {
+  // The loop's adoption gives way to this call at its next step, so the
+  // cycle lock is not held for the rest of an adoption slice.
+  struct InProgress {
+    explicit InProgress(std::atomic<int>* count) : count_(count) {
+      count_->fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~InProgress() { count_->fetch_sub(1, std::memory_order_acq_rel); }
+    std::atomic<int>* count_;
+  } in_progress(&flushes_in_progress_);
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::duration<double>(timeout_s));
@@ -819,6 +828,10 @@ bool CaptureStorageService::adopt_step(uint64_t deadline_ns, size_t* deferred,
     if (!scan_siblings()) return false;
   }
   bool ok = true;
+  // Whether this call has taken a step yet: a lock taken and a listing, a
+  // round, or a finish. Each call takes one at least, so flushes that keep
+  // coming slow adoption down but never stop it.
+  bool stepped = false;
   while (!stop_requested()) {
     // The service's uploads' Cancellation is adoption's too: stop() cuts
     // it between rounds, and in a round (its listing, its uploads, and,
@@ -827,6 +840,13 @@ bool CaptureStorageService::adopt_step(uint64_t deadline_ns, size_t* deferred,
       *cut_short = true;
       break;
     }
+    // A flush() is waiting for the cycle: the rest of the slice is the
+    // next cycle's, which the loop runs once the flush is done.
+    if (stepped &&
+        flushes_in_progress_.load(std::memory_order_acquire) > 0) {
+      break;
+    }
+    stepped = true;
     if (adopting_ == nullptr) {
       if (adoption_queue_.empty()) break;
       const std::string next = adoption_queue_.front();

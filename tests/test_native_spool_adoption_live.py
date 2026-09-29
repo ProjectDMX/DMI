@@ -18,7 +18,8 @@ was (its packs are durable there), flush() does not report drained, and
 the loop adopts it once the store is back. A sibling whose owner is still
 alive at start and dies later is adopted by a later pass. stop() cuts an
 adoption as it cuts the service's own work -- its uploads, and its listing
-of a dead backlog -- and leaves the dead directory with every pack in it.
+of a dead backlog -- and leaves the dead directory with every pack in it;
+a flush waits for the adoption step in flight, not for a whole slice.
 
 Needs ClickHouse on 127.0.0.1:8123/9000 and the native sink and store
 modules: make -C native build/_dmi_native_sink build/_dmi_native_store
@@ -795,6 +796,63 @@ def test_stop_cuts_an_adoption_listing_a_dead_backlog(fake_s3, tmp_path):
             assert store.stalled == [], store.stalled
             assert sorted(dead.rglob("*.dmi-pack.ready")) == backlog
             assert _store().spool_owner(str(dead)) is None
+        finally:
+            service.stop()
+            store.close()
+        lock.release_and_remove_if_empty()
+
+
+def test_a_flush_waits_for_the_adoption_step_in_flight_not_its_slice(
+        fake_s3, tmp_path):
+    """flush() never adopts, and it does not wait out the loop's adoption
+    either: a cycle adopting lets go of the cycle at its next step while a
+    flush is running. Here each adopted PUT takes a second and the slice is
+    a minute, so a cycle would hold the cycle for the whole dead backlog,
+    five rounds; a flush(4.0) of a process with nothing of its own used to
+    time out behind it. It now returns drained after the round in flight,
+    and the adoption goes on afterwards."""
+    from tests.test_native_capture_storage_live import _Switch
+
+    base = tmp_path / "spool"
+    backlog = range(100, 140)  # 20 packs: five rounds of four
+    with _catalog() as prefix:
+        store = _Switch.to_url(fake_s3)
+        config = _storage_config(store.url, prefix, reconcile_on_start=False)
+        sibling = _claim(base, config)
+        dead = Path(sibling.directory)
+        _stage_into(sibling.directory, backlog)
+        sibling.release()  # its owner is gone
+        assert len(sorted(dead.rglob("*.dmi-pack.ready"))) == 20
+        store.delay_requests(
+            lambda request: 1.0 if request.startswith(b"PUT ") else 0.0)
+        lock = _claim(base, config)
+        native = config._native_dict()
+        native.update(
+            spool_root=lock.directory, spool_max_bytes=1 << 30,
+            holder="flush-yield-test", poll_interval_ns=50_000_000,
+            sweep_spool_on_start=True, reconcile_on_start=False,
+            spool_owner_lock="held_by_caller", adopt_sibling_spools=True,
+            adoption_slice_ns=60_000_000_000, **config._lease_native())
+        service = _store().StorageService(native)
+        service.start()
+        try:
+            _wait_for(lambda: service.snapshot()["adopted_packs"] >= 4, 30.0)
+            flushing = time.monotonic()
+            assert service.flush(4.0)
+            elapsed = time.monotonic() - flushing
+            assert elapsed < 2.5, elapsed
+            snapshot = service.snapshot()
+            assert snapshot["adopted_packs"] < 20, snapshot
+            assert snapshot["adoption_owed"] is True, snapshot
+
+            store.restore()
+            _wait_for(_adopted(service, 1), 60.0)
+            assert not dead.exists()
+            assert service.flush(60.0)
+            expected = {
+                capture_id: tensor.contiguous().view(-1).numpy().tobytes()
+                for capture_id, tensor in _envelope(backlog).expected.items()}
+            assert _read_all(config) == expected
         finally:
             service.stop()
             store.close()

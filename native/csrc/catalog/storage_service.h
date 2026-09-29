@@ -143,7 +143,9 @@ struct StorageServiceConfig {
   // path, at most uploader.max_workers and indexer.max_packs packs, each
   // indexed before the next is uploaded -- under the cycle's upload rules,
   // the lease and nothing owed to the catalog checked before every round,
-  // until adoption_slice_ns has passed or a stop is requested. Its
+  // until adoption_slice_ns has passed, a stop is requested, or a flush()
+  // is running -- a flush waits for the step the adoption is in (one round,
+  // or one sibling's listing), not for the rest of a slice. Its
   // listing, uploads and index reads go through the service's own clients
   // and Cancellations, so stop() cuts an adoption as it cuts the service's
   // own work: what it did not upload stays in the dead spool, which is let
@@ -177,8 +179,10 @@ struct StorageServiceConfig {
   // per pass. 0 never looks again after the first pass.
   uint64_t adoption_recheck_interval_ns = 30'000'000'000ull;
   // How long one cycle may spend adopting before it lets go of the cycle --
-  // to a flush(), the service's own uploads, stop() -- and carries on in
-  // the next. Checked between rounds, so a cycle can outrun it by one.
+  // to the service's own uploads, stop() -- and carries on in the next.
+  // Checked between rounds, so a cycle can outrun it by one. A flush()
+  // does not wait for it: a cycle that has made one step of adoption lets
+  // go of the cycle at the next one while a flush is running.
   uint64_t adoption_slice_ns = 1'000'000'000ull;
 
   dmi_store::S3Config s3;
@@ -574,6 +578,9 @@ class CaptureStorageService {
   std::set<std::string> blocked_siblings_;
   bool live_siblings_ = false;
   uint64_t last_adoption_scan_ns_ = 0;
+  // flush() calls in progress. A cycle adopting lets go of the cycle at
+  // its next step while one is, so a flush never waits out a slice.
+  std::atomic<int> flushes_in_progress_{0};
   int failure_streak_ = 0;  // consecutive failed cycles, for the backoff
   // steady ns at which the last cycle -- the loop's or a flush's -- ended;
   // 0 before the first. The loop waits its interval from it. Guarded by
