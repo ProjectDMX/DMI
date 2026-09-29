@@ -1,12 +1,17 @@
 // Cancellation for object-store work: a flag set once to stop for good, and
 // a deadline armed for one bounded stretch.
 //
-// The storage service owns one and hands it to the S3 client and the
-// uploader that do its uploads. stop() cancels for good, so a stalled PUT
-// or a retry backoff cannot hold it; a flush arms its deadline for the
-// cycle it runs, so its uploads cannot hold the flush past it. What a
-// cancel cuts short is left where it was: a pack whose upload was cancelled
-// stays in the spool, which is where a pack waits for an object store.
+// The storage service owns two. One cuts its uploads: it goes to the S3
+// client and the uploader that do them, and a flush arms it at its
+// deadline. The other cuts its index reads and the reconcile's requests:
+// it goes to the S3 client those read through, and a flush arms it one
+// catalog request timeout past its deadline. stop() cancels both for good,
+// so a stalled PUT or GET or a retry backoff cannot hold it. What a cancel
+// cuts short is left where it was: a pack whose upload was cancelled stays
+// in the spool, which is where a pack waits for an object store; one
+// uploaded but not yet indexed, whose read was cut, stays owed to the
+// catalog (in memory, or in the bucket for a start's reconcile once stop()
+// drops it).
 //
 // Header-only, so every target that builds the S3 client gets it without a
 // source list to keep in step.
