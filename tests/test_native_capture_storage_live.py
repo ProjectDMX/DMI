@@ -483,6 +483,16 @@ class _Switch:
         self._delay_by = None
 
     def close(self):
+        """Refuse new connections and drop the live ones. Closing the
+        listener does not wake a thread blocked in accept(), which still
+        takes one more queued connection: the stall settings go first, so
+        that connection is refused rather than held open for its client's
+        whole timeout (a stop()'s lease release after a stall() did)."""
+        self._stalled = False
+        self._stall_if = None
+        self._slow_once = None
+        self._delay_by = None
+        self._late_by = 0.0
         self.cut()
         self._listener.close()
 
