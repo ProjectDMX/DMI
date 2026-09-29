@@ -1706,6 +1706,8 @@ def test_stop_cuts_a_reconcile_whose_listing_stalls(fake_s3, tmp_path):
             assert outcome["elapsed"] < 3.0, (outcome, snapshot)
             assert snapshot["lease_state"] == "released", snapshot
             assert snapshot["reconcile_passes"] == 0, snapshot
+            # Quietly: a listing stop() cut is no failed pass.
+            assert "reconcile" not in snapshot["last_error"], snapshot
             assert len(s3.stalled) == 1, s3.stalled
         finally:
             s3.close()  # releases the stalled listing
