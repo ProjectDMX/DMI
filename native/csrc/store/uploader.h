@@ -13,9 +13,10 @@
 //      bytes contradict the staged checksum deletes the upload and fails.
 //   3. Post-upload HEAD must show the object, else the upload is refused.
 //
-// Cancellation (set_cancellation): no pack starts once cancelled, and a
-// pack's retries and their backoff end at once. A cancelled pack stays in
-// the spool and is reported as cancelled, not failed.
+// Cancellation (set_cancellation): the spool listing stops between packs,
+// no pack starts once cancelled, and a pack's retries and their backoff end
+// at once. A cancelled pack stays in the spool and is reported as
+// cancelled, not failed.
 
 #ifndef DMI_STORE_UPLOADER_H_
 #define DMI_STORE_UPLOADER_H_
@@ -85,6 +86,9 @@ struct UploadBatchResult {
   std::vector<PackRef> refs;
   std::vector<UploadFailure> failures;
   UploadSnapshot snapshot;
+  // A cancel cut the spool listing short, before any upload started: the
+  // batch is empty whatever the spool holds.
+  bool listing_cancelled = false;
 };
 
 class SpoolUploader {
@@ -94,11 +98,12 @@ class SpoolUploader {
   SpoolUploader(const SpoolUploader&) = delete;
   SpoolUploader& operator=(const SpoolUploader&) = delete;
 
-  // From now on UploadPending starts no pack once `cancel` is cancelled,
-  // and UploadOne stops retrying (its backoff wakes for it); the pack stays
-  // staged. A transfer in flight is cut only when the S3 client has the
-  // same Cancellation (S3Client::set_cancellation). nullptr: none. Keep
-  // `cancel` alive as long as the uploader.
+  // From now on, once `cancel` is cancelled, UploadPending stops listing
+  // the spool (listing_cancelled, if it had not listed it all) and starts
+  // no pack, and UploadOne stops retrying (its backoff wakes for it); the
+  // pack stays staged. A transfer in flight is cut only when the S3 client
+  // has the same Cancellation (S3Client::set_cancellation). nullptr: none.
+  // Keep `cancel` alive as long as the uploader.
   void set_cancellation(const Cancellation* cancel) { cancel_ = cancel; }
 
   // Recover the spool and upload every entry (or the first `limit`, which

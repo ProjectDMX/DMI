@@ -377,6 +377,44 @@ def test_a_cancel_wakes_the_uploaders_own_backoff(fake_s3, tmp_path):
         store.close()
 
 
+def test_a_cancel_stops_the_listing_between_packs(fake_s3, tmp_path):
+    """UploadPending lists the spool before it uploads anything, and a
+    listing re-hashes every staged pack: over a backlog, seconds a GiB of
+    it, all before a single worker looked at the cancel. The listing now
+    stops between packs once cancelled, and nothing is tried. 16 sparse
+    packs of 256 MiB, zeros named for their checksum, take it about 3 s."""
+    import hashlib
+    import uuid
+
+    size = 256 << 20
+    digest = hashlib.sha256()
+    zeros = bytes(1 << 20)
+    for _ in range(size // len(zeros)):
+        digest.update(zeros)
+    root = tmp_path / "spool"
+    root.mkdir()
+    backlog = []
+    for _ in range(16):
+        ready = root / f"{uuid.uuid4()}.1.1.{digest.hexdigest()}.dmi-pack.ready"
+        with open(ready, "wb") as sparse:
+            sparse.truncate(size)
+        backlog.append(ready)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        started = time.monotonic()
+        result = _upload_pending(store, fake_s3, root, cancel_after_ms=300)
+        elapsed = time.monotonic() - started
+    finally:
+        store.close()
+    assert result["ok"], result
+    assert result["listing_cancelled"] is True, result
+    assert result["refs"] == [] and result["failures"] == [], result
+    assert result["snapshot"]["cancelled_packs"] == 0, result
+    assert elapsed < 1.0, elapsed
+    assert sorted(root.rglob("*.dmi-pack.ready")) == sorted(backlog)
+    assert STATE.calls == []
+
+
 @pytest.mark.parametrize("request_cut", [False, True],
                          ids=["failed-on-its-own", "cut-by-the-cancel"])
 def test_a_cancel_counts_only_when_it_ended_the_upload(fake_s3, tmp_path,

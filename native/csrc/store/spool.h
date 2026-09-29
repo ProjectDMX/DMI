@@ -25,6 +25,8 @@
 
 namespace dmi_store {
 
+class Cancellation;  // cancel.h
+
 struct SpoolConfig {
   std::string root;
   uint64_t max_bytes = 0;
@@ -91,6 +93,13 @@ class Spool {
 
   // Validate and list ready packs without deleting in-progress writes.
   SpoolStatus ListPending(std::vector<StagedPack>* out, std::string* error);
+  // The same, but stops between packs once `cancel` is cancelled: *cut then
+  // says so, *out is empty, and the spool's account is left as it was (a
+  // partial listing must not recount it). Validating hashes every byte of
+  // every pack, so a backlog makes a listing slow; this bounds the wait a
+  // cancel has for it by one pack's hash.
+  SpoolStatus ListPending(std::vector<StagedPack>* out, std::string* error,
+                          const Cancellation* cancel, bool* cut);
 
   // Whether any ready pack is on disk, from the file names alone: nothing
   // is hashed, quarantined or re-accounted, so it costs a directory walk
@@ -111,7 +120,8 @@ class Spool {
 
  private:
   SpoolStatus Scan(std::vector<StagedPack>* out, bool discard_open_files,
-                  std::string* error);
+                  std::string* error, const Cancellation* cancel = nullptr,
+                  bool* cut = nullptr);
   // Count/uncount one ready path in the committed account, at most once each
   // -- Python's _account_ready_locked / _unaccount_ready_locked. `mutex_`
   // must be held. Both return whether they actually changed the account.

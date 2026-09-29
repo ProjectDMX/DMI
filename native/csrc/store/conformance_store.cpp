@@ -418,7 +418,8 @@ int main() {
         if (armed) uploader.set_cancellation(&canceller.cancel);
         const dmi_store::UploadBatchResult result =
             uploader.UploadPending(limit < 0 ? -1 : static_cast<int>(limit));
-        out += "true,\"refs\":[";
+        out += std::string("true,\"listing_cancelled\":") +
+               (result.listing_cancelled ? "true" : "false") + ",\"refs\":[";
         bool first = true;
         for (const auto& ref : result.refs) {
           if (!first) out.push_back(',');

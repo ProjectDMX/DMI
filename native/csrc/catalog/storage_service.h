@@ -67,7 +67,9 @@
 // and only this process remembers it. A cancel starts no further request,
 // aborts a transfer in flight (a multipart upload is then aborted, one
 // attempt bounded by 5 s) and ends a retry backoff; a cancelled upload
-// leaves its pack in the spool, a cancelled read leaves its pack owed.
+// leaves its pack in the spool, a cancelled read leaves its pack owed. The
+// uploads' cancel also stops a spool listing between packs, since listing
+// hashes every staged pack and a backlog would hold it for as long.
 // Catalog statements are never cut mid-flight: each is bounded by the
 // client's request timeout, or under the lease by the lease deadline.
 // An index pass ends at its first failure: a batch that threw, or a pack
@@ -253,14 +255,16 @@ class CaptureStorageService {
   bool flush(double timeout_s);
 
   // Stop the background cycle and release the lease. Does not flush. Its
-  // object-store work is cancelled first: an upload in flight is aborted,
-  // its pack left in the spool for the next start; an index read in flight
-  // is cut, its pack left owed -- which stop() drops, so it waits in the
-  // bucket for a start's reconcile (reconcile_on_start); a retry backoff
-  // ends, and so does the reconcile. What stop() still waits for is the
-  // catalog work in flight, never cut mid-flight, and the lease release,
-  // each request bounded by the client's request timeout (under the lease,
-  // by the lease deadline); the lease renews until the loop is done.
+  // object-store work is cancelled first: a spool listing stops between
+  // packs; an upload in flight is aborted, its pack left in the spool for
+  // the next start; an index read in flight is cut, its pack left owed --
+  // which stop() drops, so it waits in the bucket for a start's reconcile
+  // (reconcile_on_start); a retry backoff ends, and so does the
+  // reconcile. What stop() still waits for is the catalog work in flight,
+  // never cut mid-flight, the abort of a multipart upload it cut (one
+  // attempt, 5 s at most), and the lease release, each catalog request
+  // bounded by the client's request timeout (under the lease, by the lease
+  // deadline); the lease renews until the loop is done.
   void stop();
 
   StorageServiceSnapshot snapshot() const;

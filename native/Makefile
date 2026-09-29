@@ -388,7 +388,7 @@ build/conformance_catalog: csrc/catalog/clickhouse_client.cpp csrc/catalog/lease
 	    $(CURL_CPPFLAGS) $(CURL_LDFLAGS) -lcrypto -lcurl -lpthread
 
 # A3a spool conformance driver: no network, no torch; runs in any CI job.
-build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/store/spool.h csrc/common/json.cpp csrc/common/json.h
+build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/store/spool.h csrc/store/cancel.h csrc/common/json.cpp csrc/common/json.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
 	    csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/common/json.cpp \

@@ -973,6 +973,100 @@ def test_a_flush_out_of_time_does_not_hash_the_spool(fake_s3, tmp_path):
     assert ready.exists()
 
 
+def _sparse_backlog(spool_root: Path, packs: int, size: int) -> list:
+    """`packs` ready packs of `size` zero bytes, sparse on disk and named
+    for their checksum. Listing the spool hashes every byte of them, so
+    they stand in for a backlog without taking its disk."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    zeros = bytes(1 << 20)
+    for _ in range(size // len(zeros)):
+        digest.update(zeros)
+    spool_root.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for _ in range(packs):
+        ready = spool_root / (f"{uuid.uuid4()}.1.1.{digest.hexdigest()}"
+                              ".dmi-pack.ready")
+        with open(ready, "wb") as sparse:
+            sparse.truncate(size)
+        paths.append(ready)
+    return sorted(paths)
+
+
+def test_stop_cuts_a_listing_that_hashes_a_backlog(fake_s3, tmp_path):
+    """A cycle lists the spool before it uploads, and a listing re-hashes
+    every staged pack: about 0.8 s a GiB here, over a backlog an outage
+    can grow to the spool's limit (a TiB by default). stop() waited for
+    the loop's listing to end before its cancel could turn a single
+    upload away. The listing stops between packs once cancelled now, so
+    stop() waits for one pack's hash at most, and nothing was tried. 16
+    sparse packs of 256 MiB take the listing about 3 s."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    backlog = _sparse_backlog(spool_root, 16, 256 << 20)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="listing-stop",
+            poll_interval_ns=20_000_000, reconcile_on_start=False,
+            sweep_spool_on_start=False,
+            uploader_max_in_flight_bytes=1 << 30)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        stopped = False
+        try:
+            time.sleep(0.5)  # the loop's first cycle is listing the backlog
+            started = time.monotonic()
+            service.stop()
+            stopped = True
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+        finally:
+            if not stopped:
+                service.stop()
+
+    assert elapsed < 1.0, (elapsed, snapshot)
+    assert snapshot["uploaded_packs"] == 0, snapshot
+    # Never listed to the end, so never tried: nothing to cancel.
+    assert snapshot["cancelled_uploads"] == 0, snapshot
+    assert _ready(spool_root) == backlog
+
+
+def test_a_flush_cuts_the_listing_its_deadline_passes_in(fake_s3, tmp_path):
+    """A flush whose deadline passes while its cycle lists the spool gave
+    up only once the listing had hashed the whole backlog, and then turned
+    every pack away. The listing stops at the deadline now."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    backlog = _sparse_backlog(spool_root, 16, 256 << 20)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="listing-flush",
+            # The loop sleeps through the test, so the flush runs the cycle.
+            poll_interval_ns=60_000_000_000, reconcile_on_start=False,
+            sweep_spool_on_start=False,
+            uploader_max_in_flight_bytes=1 << 30)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            started = time.monotonic()
+            drained = service.flush(0.5)
+            elapsed = time.monotonic() - started
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+
+    assert drained is False
+    assert elapsed < 1.2, (elapsed, snapshot)
+    assert snapshot["uploaded_packs"] == 0, snapshot
+    assert snapshot["cancelled_uploads"] == 0, snapshot
+    assert _ready(spool_root) == backlog
+
+
 def _put(request: bytes) -> bool:
     return request.startswith(b"PUT ")
 

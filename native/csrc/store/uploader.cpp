@@ -267,8 +267,16 @@ UploadBatchResult SpoolUploader::UploadPending(int limit) {
   if (limit != -1 && limit <= 0) return result;  // invalid limit: empty result
   std::vector<StagedPack> pending;
   {
+    // Listing hashes every staged pack; a cancel stops it between packs
+    // rather than after the whole backlog.
     std::string error;
-    if (spool_->ListPending(&pending, &error) != SpoolStatus::kOk) {
+    bool cut = false;
+    if (spool_->ListPending(&pending, &error, cancel_, &cut) !=
+        SpoolStatus::kOk) {
+      return result;
+    }
+    if (cut) {
+      result.listing_cancelled = true;
       return result;
     }
   }

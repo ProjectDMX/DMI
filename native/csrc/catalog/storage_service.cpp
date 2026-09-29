@@ -535,8 +535,9 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
     //    owed, and pending_index_ dies with the process: with
     //    reconcile_on_start off, a crash would leave it in the bucket and
     //    never in the catalog. Left in the spool it survives the crash.
-    //    A cancel (the flush deadline, or stop()) starts no upload, and cuts
-    //    those in flight: those packs stay staged too. A flush whose time
+    //    A cancel (the flush deadline, or stop()) stops the uploader's
+    //    listing between packs, starts no upload, and cuts those in
+    //    flight: those packs stay staged too. A flush whose time
     //    ran out before this point -- flush(0) -- does not list the spool
     //    through the uploader, since a listing re-hashes every staged pack
     //    and would hold the flush for as long as a backlog takes to hash:
@@ -557,6 +558,7 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
         if (staged) outcome.cut_short = true;
       } else {
         batch = uploader_->UploadPending(-1);
+        if (batch.listing_cancelled) outcome.cut_short = true;
       }
     }
     std::vector<PackRefData> to_index;
@@ -629,15 +631,21 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
         !catalog || upload_failures != 0 || pending_index_.size() > deferred;
     bool nothing_pending = !batch.refs.empty();
     if (batch.refs.empty() && !outcome.failed && !outcome.cut_short) {
+      // Cut between packs by a cancel, like the uploader's listing: a
+      // backlog staged since would otherwise be hashed to its end.
       std::vector<dmi_store::StagedPack> pending;
       std::string error;
+      bool cut = false;
       const bool listed =
-          spool_.ListPending(&pending, &error) == dmi_store::SpoolStatus::kOk;
+          spool_.ListPending(&pending, &error, &upload_cancel_, &cut) ==
+          dmi_store::SpoolStatus::kOk;
       if (!listed) {
         record_error("spool listing failed: " + error);
         outcome.failed = true;
+      } else if (cut) {
+        outcome.cut_short = true;
       }
-      nothing_pending = listed && pending.empty();
+      nothing_pending = listed && !cut && pending.empty();
     }
     outcome.drained = nothing_pending && !outcome.failed && !outcome.cut_short;
     std::lock_guard<std::mutex> lock(state_mutex_);
