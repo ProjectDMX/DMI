@@ -4,7 +4,7 @@
 //   {"op":"open","root":"...","max_bytes":N,"max_queue_records":N,
 //    "max_queue_bytes":N,"max_pack_bytes":N,"max_pack_records":N,
 //    "max_linger_ns":N,"overload":"block"|"drop_newest",
-//    "admission_timeout":-1}
+//    "admission_timeout":-1,"owner_lock":"take"|"held_by_caller" (optional)}
 //     -> {"ok":true}
 //   {"op":"submit","metadata":{...canonical field names...},"payload_b64":"..."}
 //     -> {"ok":true,"admission":"accepted"|...}
@@ -209,6 +209,14 @@ int main() {
           jc::FindString(line, "overload") == "block"
               ? dmi_sink::Overload::kBlock
               : dmi_sink::Overload::kDropNewest;
+      const std::string owner_lock = jc::FindString(line, "owner_lock");
+      if (!owner_lock.empty() &&
+          !dmi_store::ParseOwnerLock(owner_lock, &config.spool_owner_lock)) {
+        std::string out = "{\"ok\":false,\"what\":";
+        jc::EscapeJson("unknown owner_lock: " + owner_lock, &out);
+        std::cout << out << "}\n";
+        continue;
+      }
       const int64_t workers = Integer(line, "num_workers");
       config.num_workers = static_cast<int>(workers > 0 ? workers : 1);
       // Before the sink exists: a limit that cannot be represented must not

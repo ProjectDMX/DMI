@@ -86,12 +86,33 @@ def _load_native_sink_extension() -> Any:
 
 class NativePackSinkHandle:
     """Owns a native pack sink; mirrors CapturePackReferenceSink's surface
-    (``record_format`` + ``native_sink``) so call sites switch by factory."""
+    (``record_format`` + ``native_sink``) so call sites switch by factory.
 
-    def __init__(self, config: NativeSinkConfig) -> None:
+    ``spool_root`` overrides ``config.spool_root`` (the engine passes its
+    own rank directory under it), and ``owner_lock`` is the spool
+    directory's owner-lock mode: ``"take"`` owns the directory for the
+    sink's life, ``"held_by_caller"`` when the caller holds a
+    ``SpoolOwnerLock`` on it -- as the engine does around its sink and its
+    storage service, which would otherwise refuse each other.
+    ``charge_dead_siblings`` says the spool root is a rank directory of the
+    spool layout, and what the dead incarnations beside it still hold
+    counts against ``spool_max_bytes`` (the engine's claimed directory).
+    """
+
+    def __init__(
+        self,
+        config: NativeSinkConfig,
+        *,
+        spool_root: str | None = None,
+        owner_lock: str = "take",
+        charge_dead_siblings: bool = False,
+    ) -> None:
         module = _load_native_sink_extension()
         self._native_sink = module.NativePackSink(
-            spool_root=config.spool_root,
+            spool_root=config.spool_root if spool_root is None else spool_root,
+            owner_lock=owner_lock,
+            allow_shared_filesystem=config.spool_allow_shared_filesystem,
+            charge_dead_siblings=charge_dead_siblings,
             layout=LAYOUT_NAME,
             num_workers=config.num_workers,
             max_queue_records=config.max_queue_records,
@@ -120,12 +141,20 @@ class NativePackSinkHandle:
         return self._native_sink
 
 
-def create_native_pack_sink(config: NativeSinkConfig) -> NativePackSinkHandle:
+def create_native_pack_sink(
+    config: NativeSinkConfig,
+    *,
+    spool_root: str | None = None,
+    owner_lock: str = "take",
+    charge_dead_siblings: bool = False,
+) -> NativePackSinkHandle:
     """Select the native capture writer for one record runtime."""
 
     if not isinstance(config, NativeSinkConfig):
         raise TypeError("config must be a NativeSinkConfig")
-    return NativePackSinkHandle(config)
+    return NativePackSinkHandle(config, spool_root=spool_root,
+                                owner_lock=owner_lock,
+                                charge_dead_siblings=charge_dead_siblings)
 
 
 __all__ = [

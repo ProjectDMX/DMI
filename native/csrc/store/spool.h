@@ -11,6 +11,50 @@
 // the directory chain to the root. Idempotent: re-staging validates the
 // existing ready file (name, size, sha256) and returns it; a different pack
 // under the same pack_id is a conflict.
+//
+// One owner per directory (B6). Recover() deletes every .open file this
+// object is not writing, so it is only safe while no other PROCESS writes
+// there. A spool directory therefore has an owner lock -- flock(LOCK_EX) on
+// <root>/.owner.lock, whose content records the holder's host and pid, and
+// on <root> itself -- and a second process that tries to take it is
+// refused, told who holds it. The lock goes with its holder, even one
+// killed with SIGKILL.
+//   - owner_lock=kTake (the default) takes it in Open(), before anything
+//     reads the directory, and holds it for the Spool object's life.
+//   - owner_lock=kHeldByCaller takes none: the calling process holds a
+//     SpoolOwnerLock on the directory already. Two Spools in ONE process
+//     that both take refuse each other (flock binds to an open file
+//     description, not to the process), so a process running a sink and a
+//     storage service on one directory holds one SpoolOwnerLock and opens
+//     both Spools with kHeldByCaller. Open() refuses it unless one of THIS
+//     process's descriptors holds the lock (SpoolOwnedByThisProcess): kOwned,
+//     naming the holder, beside another process's lock, and kBadArgument
+//     when nothing holds it. Standalone callers -- the drivers, adoption --
+//     take.
+// A spool never walks into a subdirectory with a .owner.lock of its own --
+// another spool directory nested in it, live or dead -- to count, sweep,
+// list or upload what it holds: a dead one's packs are for its successor to
+// adopt, under its own keys. So a flat spool_root (the sink-only mode, an
+// explicit record_sink) passes over the rank directories a crashed
+// default-mode run left under it, and an adopter over a spool someone put
+// inside the dead directory it drains. A directory nested under, or
+// containing, a HELD spool directory is refused at the take, since the
+// outer spool's walk could meet the inner one before its lock file is
+// there; one nobody holds refuses nothing (every take leaves its file
+// behind). The check runs after the lock is taken, so of two processes
+// taking an outer and a nested directory at once, at least one is refused.
+// <root>/_refs/ is never scanned: the upload handoff's ref files live there
+// (plan section 2.4). The spool must be node-local: NFS, Lustre, BeeGFS, CIFS/SMB2, FUSE,
+// GPFS, 9p, AFS and OrangeFS are refused by statfs f_type unless
+// allow_shared_filesystem is set, since none guarantees a flock that
+// excludes a process on another node.
+//
+// The Python DurablePackSpool (spool.py) takes no lock, and its recover()
+// deletes every .open file under its root; the C++ spool is deliberately
+// stricter, and that is not ported to the reference. Nor is skipping
+// <root>/_refs/, or a nested spool directory: the reference counts, sweeps
+// and quarantines .open and .ready files there like any others, which the
+// C++ spool leaves alone -- C++-only divergences, deliberately not ported.
 
 #ifndef DMI_STORE_SPOOL_H_
 #define DMI_STORE_SPOOL_H_
@@ -27,9 +71,41 @@ namespace dmi_store {
 
 class Cancellation;  // cancel.h
 
+enum class OwnerLock {
+  kTake = 0,      // Open() takes <root>/.owner.lock for the Spool's life
+  kHeldByCaller,  // the caller holds a SpoolOwnerLock on <root>
+};
+
+// "take" / "held_by_caller".
+const char* OwnerLockName(OwnerLock mode);
+bool ParseOwnerLock(const std::string& text, OwnerLock* mode);
+
 struct SpoolConfig {
   std::string root;
   uint64_t max_bytes = 0;
+  OwnerLock owner_lock = OwnerLock::kTake;
+  // Admit a root on a shared filesystem (SharedFilesystemName), or on a
+  // FUSE filesystem that is local after all. Only safe when every process
+  // that could open the directory runs on this node.
+  bool allow_shared_filesystem = false;
+  // The root is a rank directory of the section 2.3 layout, and what its
+  // SIBLING rank directories hold (ready packs and temp files) counts
+  // against max_bytes as well, while an adoption by this process's storage
+  // service can drain it: a sibling nobody holds (a dead incarnation's,
+  // waiting to be adopted), and one this process holds through an adoption
+  // (SpoolOwner::adopting). Not charged: a sibling another live process
+  // holds, which is that process's own budget; one this process holds for
+  // its own writing -- an earlier engine's claim kept owned while its
+  // unsealed sink may still stage -- which no adoption here drains until
+  // the process exits; and one an adopter left blocked (SpoolOwner::
+  // blocked), or that this process could not take and empty at all. Every
+  // process start gets a fresh rank directory, so without this each
+  // crash-restart while uploads are blocked would add a whole max_bytes to
+  // the node's spool; before the layout every restart reused one directory
+  // and one budget. The charge is refreshed wherever the committed account
+  // is (Open, and before a stage is refused), so the capacity comes back as
+  // adoption drains them.
+  bool charge_dead_siblings = false;
 };
 
 struct StagedPack {
@@ -42,11 +118,22 @@ struct StagedPack {
   uint64_t object_bytes = 0;
 };
 
+// A recovery in steps (Spool::BeginRecovery): the ready packs it listed,
+// sorted, how many of them it has validated, and those that were valid.
+struct SpoolRecovery {
+  std::vector<std::string> listed;
+  size_t next = 0;
+  std::vector<StagedPack> valid;
+};
+
 struct SpoolSnapshot {
   uint64_t entries = 0;
   uint64_t bytes = 0;
   uint64_t peak_bytes = 0;
   uint64_t max_bytes = 0;
+  // charge_dead_siblings: what the sibling directories were charged, as of
+  // the last refresh; capacity is judged against bytes plus this.
+  uint64_t sibling_bytes = 0;
 };
 
 enum class SpoolStatus {
@@ -56,6 +143,7 @@ enum class SpoolStatus {
   kIntegrity,   // ready file fails validation
   kIo,          // filesystem error
   kBadArgument,
+  kOwned,       // another owner holds the directory's owner lock
 };
 
 inline const char* SpoolStatusName(SpoolStatus s) {
@@ -66,14 +154,196 @@ inline const char* SpoolStatusName(SpoolStatus s) {
     case SpoolStatus::kIntegrity: return "ready pack failed validation";
     case SpoolStatus::kIo: return "spool filesystem error";
     case SpoolStatus::kBadArgument: return "invalid argument";
+    case SpoolStatus::kOwned: return "spool directory is owned by another process";
   }
   return "unknown";
 }
 
+// The statfs f_type names of the shared filesystems a spool refuses: "NFS",
+// "Lustre", "BeeGFS", "CIFS", "SMB2", "FUSE", "GPFS", "9p", "AFS",
+// "OrangeFS", or nullptr for any other. The list needs maintenance as
+// deployments meet new ones.
+const char* SharedFilesystemName(int64_t f_type);
+
+// Refuses `dir` (which must exist) on a shared filesystem unless
+// `allow_shared_filesystem`.
+SpoolStatus CheckNodeLocal(const std::string& dir,
+                           bool allow_shared_filesystem, std::string* error);
+
+// Test seam: every node-local check in this binary reads `f_type` instead of
+// calling statfs(2). A negative value restores statfs.
+void SetFilesystemTypeForTesting(int64_t f_type);
+
+// Test seam: every /proc/self/fdinfo read in this binary sees no "lock:"
+// lines, as under gVisor or WSL1, whose procfs lists none.
+void SetFdinfoHidesLocksForTesting(bool hide);
+
+// Test seam: taking an existing directory's lock calls `hook` with the lock
+// file's path after opening the file and before locking it -- the window in
+// which a remover can unlink it. An empty function removes the hook.
+void SetLockOpenHookForTesting(std::function<void(const std::string&)> hook);
+
+// The record in a directory's owner lock file: its last holder, which
+// wrote it on taking the lock, and why it held the directory. Read with
+// the lock free, it is the last holder's, whom the kernel has let go of.
+struct SpoolOwner {
+  std::string host;
+  int64_t pid = 0;
+  // Taken by an adopter (SpoolOwnerLock::TryAdopt), to drain a dead
+  // directory, rather than by the process writing it.
+  bool adopting = false;
+  // Why an adopter left the directory for good (MarkBlocked), or empty.
+  std::string blocked;
+};
+
+// Whether <dir>'s owner lock is held right now (by any process, this one
+// included) -- its lock file's, or the directory's own. Fills *owner with
+// the lock file's record either way (empty without one). A holder that has
+// locked but not yet written its record, or whose lock file was replaced,
+// reads as an empty host and pid 0.
+bool ReadSpoolOwner(const std::string& dir, SpoolOwner* owner);
+
+// Whether `name` is the staging copy of a directory SpoolOwnerLock::Acquire
+// is creating, ".<name>.<8 hex>.creating": built beside its target with its
+// lock file held, then renamed into place. One nobody holds was left by a
+// claim killed before its rename; it holds nothing but its lock file, is
+// ignored by the nesting check, and an adopter clears it.
+bool IsSpoolClaimStagingName(const std::string& name);
+
+// Whether one of THIS process's descriptors holds <dir>'s owner lock (its
+// lock file's, or the directory's own), as the kernel reports it in
+// /proc/self/fdinfo (falling back to the recorded host and pid where /proc
+// cannot be read, or its fdinfo lists no flocks at all, as under gVisor or
+// WSL1). What kHeldByCaller requires.
+bool SpoolOwnedByThisProcess(const std::string& dir);
+
+// The owner lock of one spool directory: flock(LOCK_EX) on <dir>/.owner.lock
+// and on <dir> itself, released with the object (or Release()), and by the
+// kernel when the process dies. The directory's lock keeps a live owner's
+// directory owned should its lock file be removed from under it -- by an
+// age-based cleaner (systemd-tmpfiles, which also leaves a flocked
+// directory and everything below it alone) or by a person: the next take
+// meets the directory's lock, not only a new lock file nobody holds. flock binds to an open file description, which a child
+// shares after fork(): the descriptor is close-on-exec, and a child forked
+// WITHOUT exec (a fork-started worker) closes its copy of every lock
+// descriptor at once (pthread_atfork) -- held, or opened and not yet locked
+// or not yet closed, since a fork from another thread can land anywhere in
+// a take or a release -- so the lock never outlives its owner in a child.
+// The owner's own hold is untouched, and the child's objects read as not
+// held. A child the owner spawns through posix_spawn or vfork runs no
+// atfork handler, and loses the descriptor at exec.
+class SpoolOwnerLock {
+ public:
+  static constexpr const char* kFileName = ".owner.lock";
+
+  SpoolOwnerLock() = default;
+  ~SpoolOwnerLock();
+  SpoolOwnerLock(SpoolOwnerLock&& other) noexcept;
+  SpoolOwnerLock& operator=(SpoolOwnerLock&& other) noexcept;
+  SpoolOwnerLock(const SpoolOwnerLock&) = delete;
+  SpoolOwnerLock& operator=(const SpoolOwnerLock&) = delete;
+
+  // Takes the lock on `dir`, creating it when it does not exist -- beside
+  // its lock file, already held, and renamed into place, so no scan of the
+  // parent ever meets the directory before its owner holds it -- and records
+  // this host and pid in it. kOwned, naming the holder, when another holder
+  // has it; kBadArgument for a shared filesystem or a directory nested
+  // under, or containing, a held one (see above), after letting go of the
+  // lock and of whatever this call created.
+  static SpoolStatus Acquire(const std::string& dir,
+                             bool allow_shared_filesystem,
+                             SpoolOwnerLock* out, std::string* error);
+
+  // Adoption's try-lock: takes the lock of an EXISTING directory whose owner
+  // is gone, creating its lock file if it has none, and records the take as
+  // an adoption (SpoolOwner::adopting). kOwned while its owner lives; never
+  // creates the directory.
+  static SpoolStatus TryAdopt(const std::string& dir, SpoolOwnerLock* out,
+                              std::string* error);
+
+  // Records in the lock file, while it is held, that the directory is left
+  // for good and why (SpoolOwner::blocked): an adopter that can never drain
+  // it lets go of it after this. The next take rewrites the record. Returns
+  // whether it was written.
+  bool MarkBlocked(const std::string& reason);
+
+  bool held() const;
+  // The canonical path of the directory, while held.
+  const std::string& directory() const { return dir_; }
+
+  void Release();
+
+  // Releases the lock, first removing the directory if it holds nothing but
+  // its lock file and empty subdirectories. Anything else -- a pack, a
+  // quarantined file, a ref -- keeps the directory, which the next owner or
+  // adopter meets as it was left. Returns whether the directory was removed.
+  bool ReleaseAndRemoveIfEmpty(std::string* error);
+
+ private:
+  // Takes over the two descriptors, which the fork handler has tracked
+  // since their open().
+  void Hold(int fd, int dir_fd, std::string dir);
+
+  int fd_ = -1;      // on <dir>/.owner.lock
+  int dir_fd_ = -1;  // on <dir> itself
+  std::string dir_;
+  // The fork generation the lock was taken in (spool.cpp): in a forked
+  // child, whose copies of the descriptors the fork handler closed, the
+  // object reads as not held, and never closes a descriptor number the
+  // child may have reused since.
+  uint64_t generation_ = 0;
+};
+
+// Where a spool's packs go: the catalog -- its ClickHouse server, database
+// and table prefix -- and the store -- its S3 endpoint, bucket and store id.
+struct SpoolDestination {
+  std::string clickhouse_host;
+  uint64_t clickhouse_port = 0;
+  std::string database;
+  std::string table_prefix;
+  std::string s3_endpoint;
+  std::string s3_bucket;
+  std::string store_id;
+};
+
+// The spool layout of the plan's section 2.3. A capture process spools into
+//   <base>/<catalog_key>/r<producer_rank>-<incarnation>/
+// where catalog_key is the first 12 hex digits of the sha256 of
+//   "<database>/<table_prefix>/<store_id>\n"
+//   "clickhouse <clickhouse_host>:<clickhouse_port>\n"
+//   "s3 <s3_endpoint>/<s3_bucket>"
+// and incarnation is 8 hex digits fresh for every process start, so no two
+// processes -- two jobs on one node, or a restart of the same rank -- ever
+// share a directory. The directories under one catalog key are siblings:
+// packs bound for one catalog and store, which a successor on the node
+// adopts once their owner has died (CaptureStorageService,
+// adopt_sibling_spools). The servers are in the key, not only the names:
+// with the plan's sha256(database/table_prefix/store_id), two deployments
+// sharing a spool_root and the default names but not a server adopted each
+// other's dead directories into the wrong catalog and bucket. The servers
+// are hashed as spelled, so spell them alike on every process of a
+// deployment, or a dead directory waits for a process that does.
+std::string SpoolCatalogKey(const SpoolDestination& destination);
+bool IsSpoolCatalogKey(const std::string& name);
+std::string SpoolRankDirectoryName(uint64_t producer_rank,
+                                   const std::string& incarnation);
+// "r<rank>-<8 lowercase hex>", the rank in canonical decimal.
+bool ParseSpoolRankDirectoryName(const std::string& name,
+                                 uint64_t* producer_rank,
+                                 std::string* incarnation);
+std::string NewSpoolIncarnation();
+std::string SpoolRankDirectory(const std::string& base,
+                               const SpoolDestination& destination,
+                               uint64_t producer_rank,
+                               const std::string& incarnation);
+
 class Spool {
  public:
-  // Opens (creating) the root. Recovery of pre-existing files is explicit
-  // via Recover(), matching the Python constructor + recover() split.
+  // Opens (creating) the root, after the node-local check and, with kTake,
+  // after taking its owner lock (kOwned when another holder has it);
+  // kHeldByCaller is refused unless this process holds it. Recovery of
+  // pre-existing files is explicit via Recover(), matching the Python
+  // constructor + recover() split.
   static SpoolStatus Open(SpoolConfig config, Spool* out, std::string* error);
 
   Spool() = default;
@@ -88,8 +358,23 @@ class Spool {
 
   // Startup cleanup: delete abandoned "*.open" files, validate ready packs,
   // quarantine failures, and rebuild accounting. Other writers on this root
-  // must be stopped; use ListPending() while they are running.
+  // must be stopped; use ListPending() while they are running. The owner
+  // lock keeps other processes out; writers in this process sharing it
+  // (kHeldByCaller) are the caller's to order.
   SpoolStatus Recover(std::vector<StagedPack>* out, std::string* error);
+  // Recover() a pack at a time, for an adopter's recovery of a dead spool:
+  // Recover() hashes every byte of a dead backlog in one call, and whatever
+  // waits for the adopter -- a stop(), a flush() behind its cycle -- waits
+  // for all of it. BeginRecovery() is Recover()'s sweep of the .open files
+  // and its listing of the ready packs, and hashes none of them. Each
+  // ContinueRecovery() then validates the next pack listed, quarantining
+  // one that fails as Recover() does; once none is left it rebuilds the
+  // account as Recover() does and returns true, recovery->valid then the
+  // packs Recover() would have listed. The account is left as it was
+  // until then. Nothing else may validate or remove this spool's packs
+  // meanwhile.
+  SpoolStatus BeginRecovery(SpoolRecovery* recovery, std::string* error);
+  bool ContinueRecovery(SpoolRecovery* recovery);
 
   // Validate and list ready packs without deleting in-progress writes.
   SpoolStatus ListPending(std::vector<StagedPack>* out, std::string* error);
@@ -106,6 +391,9 @@ class Spool {
 
   SpoolSnapshot Snapshot() const;
 
+  // The canonical root, once opened.
+  const std::string& root() const { return root_; }
+
   // Test seam: called by Stage() after its capacity reservation is taken and
   // before the temp file is written, outside the lock. Lets a test hold one
   // stager at exactly the point where its reservation exists but nothing is
@@ -116,6 +404,18 @@ class Spool {
   SpoolStatus Scan(std::vector<StagedPack>* out, bool discard_open_files,
                   std::string* error, const Cancellation* cancel = nullptr,
                   bool* cut = nullptr);
+  // A scan's parts. The walk: every ready path, sorted, into *readies;
+  // the .open files this object is not writing deleted (discard_open_files)
+  // or their bytes added to *open_bytes. The validation of one listed ready
+  // path: true with *out filled when its name parses and its size and
+  // sha256 match, and otherwise it is quarantined. And the account rebuilt
+  // from a whole listing's valid packs. `mutex_` must be held for each.
+  void ListReadyLocked(bool discard_open_files,
+                       std::vector<std::string>* readies,
+                       uint64_t* open_bytes);
+  bool ValidateReadyLocked(const std::string& path, StagedPack* out);
+  void CommitListingLocked(const std::vector<StagedPack>& valid,
+                           uint64_t open_bytes);
   // Count/uncount one ready path in the committed account, at most once each
   // -- Python's _account_ready_locked / _unaccount_ready_locked. `mutex_`
   // must be held. Both return whether they actually changed the account.
@@ -135,9 +435,19 @@ class Spool {
   // stale-high. The retry/EEXIST-loser paths run it too, so a charge that
   // would exceed the cap is judged against the same durable truth.
   void ReconcileCommittedLocked();
+  // charge_dead_siblings: the bytes of ready and temp files in the sibling
+  // rank directories an adoption can drain (SpoolConfig).
+  uint64_t ChargedSiblingBytes() const;
+  // The kFull refusal of a stage of `n` bytes. `mutex_` must be held.
+  std::string FullMessage(uint64_t n) const;
 
   std::string root_;
   uint64_t max_bytes_ = 0;
+  bool charge_dead_siblings_ = false;
+  // What ChargedSiblingBytes() found last. Under `mutex_`.
+  uint64_t sibling_bytes_ = 0;
+  // Held for the object's life under OwnerLock::kTake; empty otherwise.
+  SpoolOwnerLock owner_lock_;
   mutable std::mutex mutex_;
   // Two accounts, kept apart on purpose:
   //   committed_bytes_/committed_entries_ -- ready files this object knows

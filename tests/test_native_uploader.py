@@ -381,12 +381,15 @@ def test_a_cancel_stops_the_listing_between_packs(fake_s3, tmp_path):
     """UploadPending lists the spool before it uploads anything, and a
     listing re-hashes every staged pack: over a backlog, seconds a GiB of
     it, all before a single worker looked at the cancel. The listing now
-    stops between packs once cancelled, and nothing is tried. 16 sparse
-    packs of 256 MiB, zeros named for their checksum, take it about 3 s."""
+    stops between packs once cancelled, and nothing is tried. 128 sparse
+    packs of 64 MiB, zeros named for their checksum, take it about 6 s
+    idle; one of them takes a small part of the bound below even on a
+    loaded runner, where 256 MiB packs took it over, the whole listing
+    slowing with them."""
     import hashlib
     import uuid
 
-    size = 256 << 20
+    size = 64 << 20
     digest = hashlib.sha256()
     zeros = bytes(1 << 20)
     for _ in range(size // len(zeros)):
@@ -394,7 +397,7 @@ def test_a_cancel_stops_the_listing_between_packs(fake_s3, tmp_path):
     root = tmp_path / "spool"
     root.mkdir()
     backlog = []
-    for _ in range(16):
+    for _ in range(128):
         ready = root / f"{uuid.uuid4()}.1.1.{digest.hexdigest()}.dmi-pack.ready"
         with open(ready, "wb") as sparse:
             sparse.truncate(size)
@@ -411,9 +414,9 @@ def test_a_cancel_stops_the_listing_between_packs(fake_s3, tmp_path):
     assert result["refs"] == [] and result["failures"] == [], result
     assert result["snapshot"]["cancelled_packs"] == 0, result
     # Between packs, not after the listing: the cut ends within one pack's
-    # hash of the cancel, about 0.5 s here, where the whole listing takes
-    # over 3 s. The bound leaves room for a loaded runner, whose hashing
-    # slows with it (about 1.1 s at 4x oversubscription).
+    # hash of the cancel, about 0.1 s here, where the whole listing takes
+    # about 6 s. The bound leaves room for a loaded runner, whose hashing
+    # slows with it (a pack about 0.6 s at 2.5x oversubscription).
     assert elapsed < 2.0, elapsed
     assert sorted(root.rglob("*.dmi-pack.ready")) == sorted(backlog)
     assert STATE.calls == []
@@ -523,6 +526,8 @@ def test_pack_over_the_byte_gate_fails_fast(fake_s3, tmp_path):
         assert result["snapshot"]["failed_packs"] == 1
         assert result["failures"][0]["attempts"] == 0
         assert "in-flight" in result["failures"][0]["error"]
+        # No retry by this uploader can admit it.
+        assert result["failures"][0]["retryable"] is False
     finally:
         sink.close()
         store.close()
@@ -619,8 +624,10 @@ def test_a_pack_conflict_reports_why_it_will_not_overwrite(fake_s3, tmp_path):
         assert staged["object_key"] in failure["error"], failure
         assert "do not overwrite" in failure["error"], failure
         # Counted like every other attempted failure: the HEAD that found
-        # the conflict was an attempt, and it is not retried.
+        # the conflict was an attempt, and it is not retried -- now or by a
+        # later batch.
         assert failure["attempts"] == 1, failure
+        assert failure["retryable"] is False, failure
 
         # The refusal is real: nothing was written over the existing object,
         # and the staged pack is still there to inspect.
@@ -876,6 +883,8 @@ def test_a_64_mib_pack_uploads_multipart_over_https_with_a_private_ca(
         assert untrusted["refs"][0]["pack_id"] == "", untrusted
         assert failure["pack_id"] == staged["pack_id"], failure
         assert "certificate" in failure["error"].lower(), failure
+        # A transport failure: a later try (with the CA, here) can succeed.
+        assert failure["retryable"] is True, failure
         assert STATE.calls == [] and STATE.objects == {}
         assert Path(staged["path"]).exists()
 

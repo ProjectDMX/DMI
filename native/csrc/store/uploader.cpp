@@ -103,7 +103,8 @@ SpoolUploader::SpoolUploader(Spool* spool, S3Client* client,
 
 bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
                               int* attempts_out, std::string* error,
-                              bool* cancelled_out) {
+                              bool* cancelled_out, bool* retryable_out) {
+  if (retryable_out) *retryable_out = true;
   const std::string& key = staged.object_key;
   std::mt19937_64 rng(
       static_cast<uint64_t>(std::hash<std::string>{}(staged.pack_id)));
@@ -190,6 +191,7 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
         // the retry-exhausted exit carries one.
         if (attempts_out) *attempts_out = attempts;
         if (error) *error = last_error;
+        if (retryable_out) *retryable_out = false;
         return false;  // NOT retryable
       }
     }
@@ -207,6 +209,7 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
       // Corrupt staged bytes: no retry can fix local corruption, but report
       // it as the failure rather than uploading garbage.
       last_error = "staged bytes do not match the staged checksum";
+      if (retryable_out) *retryable_out = false;
       break;
     }
     std::string etag;
@@ -313,7 +316,8 @@ UploadBatchResult SpoolUploader::UploadStaged(std::vector<StagedPack> pending) {
       // test_mixed_batch_reports_oversized_pack_at_its_position), and
       // docs/benchmarks.md records the accounting decision behind it.
       result.failures[i] = {pending[i].pack_id, pending[i].object_key, 0,
-                            "pack exceeds the in-flight byte limit"};
+                            "pack exceeds the in-flight byte limit",
+                            /*cancelled=*/false, /*retryable=*/false};
       ++result.snapshot.attempted_packs;
       ++result.snapshot.failed_packs;
     }
@@ -376,7 +380,7 @@ UploadBatchResult SpoolUploader::UploadStaged(std::vector<StagedPack> pending) {
                        pending[left.index].object_key, 0,
                        "upload cancelled before it started; the pack stays "
                        "staged",
-                       true};
+                       /*cancelled=*/true, /*retryable=*/true};
             ++result.snapshot.cancelled_packs;
             finished[left.index] = true;
           }
@@ -406,7 +410,9 @@ UploadBatchResult SpoolUploader::UploadStaged(std::vector<StagedPack> pending) {
       std::string error;
       int attempts = 0;
       bool cancelled = false;
-      const bool ok = UploadOne(*staged, &ref, &attempts, &error, &cancelled);
+      bool retryable = true;
+      const bool ok = UploadOne(*staged, &ref, &attempts, &error, &cancelled,
+                                &retryable);
       const int64_t elapsed = NowNs() - started;
       {
         std::lock_guard<std::mutex> lock(mutex);
@@ -428,7 +434,8 @@ UploadBatchResult SpoolUploader::UploadStaged(std::vector<StagedPack> pending) {
         } else {
           result.refs[slot.index] = PackRef{};
           result.failures[slot.index] = {staged->pack_id, staged->object_key,
-                                         attempts, error, cancelled};
+                                         attempts, error, cancelled,
+                                         retryable};
           if (cancelled) {
             ++result.snapshot.cancelled_packs;
           } else {

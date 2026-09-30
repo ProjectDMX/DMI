@@ -104,6 +104,16 @@ std::string FreshRoot(const char* tag) {
   return root;
 }
 
+// The config for a SECOND Spool object on a root the first one opened. The
+// first takes the directory's owner lock; in one process the second shares
+// it (owner_lock=held_by_caller), as the engine's sink and storage service
+// do -- two takes would refuse each other, since flock binds to an open file
+// description rather than to the process.
+dmi_store::SpoolConfig Beside(dmi_store::SpoolConfig config) {
+  config.owner_lock = dmi_store::OwnerLock::kHeldByCaller;
+  return config;
+}
+
 // (1) The serial uploader case: stage, remove through a second object,
 // stage again on the first object. Must succeed, and the accounting must
 // end at exactly one file.
@@ -114,7 +124,7 @@ void TestSerialRemoveThroughAnotherSpoolIsReconciled() {
   std::string error;
   CHECK(dmi_store::Spool::Open(config, &writer, &error) ==
         dmi_store::SpoolStatus::kOk);
-  CHECK(dmi_store::Spool::Open(config, &uploader, &error) ==
+  CHECK(dmi_store::Spool::Open(Beside(config), &uploader, &error) ==
         dmi_store::SpoolStatus::kOk);
 
   dmi_store::StagedPack first;
@@ -246,7 +256,7 @@ void TestALostLinkRaceReleasesItsReservation() {
   std::string error;
   CHECK(dmi_store::Spool::Open(config, &loser, &error) ==
         dmi_store::SpoolStatus::kOk);
-  CHECK(dmi_store::Spool::Open(config, &winner, &error) ==
+  CHECK(dmi_store::Spool::Open(Beside(config), &winner, &error) ==
         dmi_store::SpoolStatus::kOk);
 
   dmi_store::StagedPack winner_out;
@@ -295,7 +305,7 @@ void TestARetryOfAnotherObjectsReadyFileIsAccounted() {
   std::string error;
   CHECK(dmi_store::Spool::Open(config, &writer, &error) ==
         dmi_store::SpoolStatus::kOk);
-  CHECK(dmi_store::Spool::Open(config, &other, &error) ==
+  CHECK(dmi_store::Spool::Open(Beside(config), &other, &error) ==
         dmi_store::SpoolStatus::kOk);
 
   // `other` writes the ready file; `writer` has never seen it.
@@ -345,7 +355,7 @@ void TestARetryCannotOversubscribeAnInflightReservation() {
   std::string error;
   CHECK(dmi_store::Spool::Open(config, &spool, &error) ==
         dmi_store::SpoolStatus::kOk);
-  CHECK(dmi_store::Spool::Open(config, &other, &error) ==
+  CHECK(dmi_store::Spool::Open(Beside(config), &other, &error) ==
         dmi_store::SpoolStatus::kOk);
 
   dmi_store::SpoolStatus retry_status = dmi_store::SpoolStatus::kIo;
@@ -405,7 +415,7 @@ void TestAnEexistLoserAccountsForTheWinnersFile() {
   std::string error;
   CHECK(dmi_store::Spool::Open(config, &loser, &error) ==
         dmi_store::SpoolStatus::kOk);
-  CHECK(dmi_store::Spool::Open(config, &winner, &error) ==
+  CHECK(dmi_store::Spool::Open(Beside(config), &winner, &error) ==
         dmi_store::SpoolStatus::kOk);
 
   // The loser reserves, and while it is paused the winner links the ready
@@ -484,7 +494,7 @@ void TestASerialRetryIsAdmittedEvenWhenAlreadyOverCap() {
   // retry now goes through a Spool that has NOT ledgered this path, so it
   // reconciles, sees 1000 > 900, and takes the capacity decision.
   dmi_store::Spool reopened;
-  dmi_store::SpoolConfig lowered{root, 900};
+  dmi_store::SpoolConfig lowered = Beside({root, 900});
   CHECK(dmi_store::Spool::Open(lowered, &reopened, &error) ==
         dmi_store::SpoolStatus::kOk);
 
@@ -530,7 +540,7 @@ void TestRecoverThenRemoveReleasesTheAccount() {
 
   {
     dmi_store::Spool writer;
-    CHECK(dmi_store::Spool::Open(config, &writer, &error) ==
+    CHECK(dmi_store::Spool::Open(Beside(config), &writer, &error) ==
           dmi_store::SpoolStatus::kOk);
     dmi_store::StagedPack out;
     CHECK(StageBytes(writer, 1, 1000, &out, &error) ==
@@ -596,7 +606,7 @@ void TestRemoveOfAnAlreadyDeletedFileStillUncounts() {
   std::string error;
   CHECK(dmi_store::Spool::Open(config, &writer, &error) ==
         dmi_store::SpoolStatus::kOk);
-  CHECK(dmi_store::Spool::Open(config, &other, &error) ==
+  CHECK(dmi_store::Spool::Open(Beside(config), &other, &error) ==
         dmi_store::SpoolStatus::kOk);
 
   dmi_store::StagedPack staged;

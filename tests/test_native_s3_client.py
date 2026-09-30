@@ -141,9 +141,22 @@ class FakeS3Handler(BaseHTTPRequestHandler):
             return True
         return False
 
-    def _read_body(self) -> bytes:
+    def _read_body(self):
+        """The request's body, or None when it is not the one signed for:
+        shorter than its Content-Length (the client went away mid-body), or
+        not what x-amz-content-sha256 hashes. S3 stores neither
+        (IncompleteBody, XAmzContentSHA256Mismatch), and a body short of
+        its length passed the signature check here, which trusts that
+        header -- so a PUT cut off mid-body stored an empty object."""
         length = int(self.headers.get("Content-Length", 0))
-        return self.rfile.read(length) if length else b""
+        body = self.rfile.read(length) if length else b""
+        if len(body) < length:
+            return None
+        claimed = self.headers.get("x-amz-content-sha256", "")
+        if (len(claimed) == 64
+                and hashlib.sha256(body).hexdigest() != claimed.lower()):
+            return None
+        return body
 
     def _split(self):
         from urllib.parse import unquote
@@ -216,6 +229,15 @@ class FakeS3Handler(BaseHTTPRequestHandler):
             return
         key = segments[1]
         body = self._read_body()
+        if body is None:
+            # Nobody may be listening; the connection goes, and nothing is
+            # recorded or stored.
+            self.close_connection = True
+            try:
+                self._send(400, {}, b"incomplete or mismatched body")
+            except OSError:
+                pass
+            return
         self._record(body)
         if self._reject_unsigned(body):
             return
@@ -987,3 +1009,78 @@ def test_an_uncancelled_request_is_untouched_by_the_cancel_hook(fake_s3):
     assert put["ok"], put
     assert put.get("cancelled") is False, put
     assert STATE.objects["packs/on-time"]["body"] == b"data"
+
+
+def _signed_put_head(endpoint: str, key: str, body_hash: str,
+                     length: int) -> bytes:
+    """A SigV4-signed PUT's head as the native client sends one, for a body
+    of `length` bytes that x-amz-content-sha256 says hashes to `body_hash`."""
+    import datetime as datetime_module
+
+    host = urlsplit(endpoint).netloc
+    credentials = botocore.credentials.Credentials(ACCESS, SECRET, None)
+    request = botocore.awsrequest.AWSRequest(
+        method="PUT", url=f"http://{host}/{BUCKET}/{key}", data=b"",
+        headers={"x-amz-content-sha256": body_hash})
+    frozen = datetime_module.datetime.now(datetime_module.timezone.utc).replace(
+        microsecond=0, tzinfo=None)
+    with mock.patch.object(
+        botocore.auth, "get_current_datetime", return_value=frozen
+    ):
+        botocore.auth.SigV4Auth(credentials, "s3", REGION).add_auth(request)
+    head = f"PUT /{BUCKET}/{key} HTTP/1.1\r\nHost: {host}\r\n"
+    for name in ("x-amz-content-sha256", "X-Amz-Date", "Authorization"):
+        head += f"{name}: {request.headers[name]}\r\n"
+    head += f"Content-Length: {length}\r\n\r\n"
+    return head.encode()
+
+
+def _send_raw(endpoint: str, request: bytes) -> bytes:
+    """Send `request`, say no more (shutdown for writing), and return the
+    answer, if any."""
+    import socket
+
+    parts = urlsplit(endpoint)
+    with socket.create_connection((parts.hostname, parts.port),
+                                  timeout=10) as connection:
+        connection.sendall(request)
+        connection.shutdown(socket.SHUT_WR)
+        answer = b""
+        try:
+            while chunk := connection.recv(65536):
+                answer += chunk
+        except OSError:
+            pass
+    return answer
+
+
+def test_the_fake_stores_no_put_that_is_not_the_body_it_signed_for(fake_s3):
+    """The harness itself. Its signature check takes the payload hash from
+    x-amz-content-sha256, as S3 does, so a PUT whose client went away after
+    the head -- a cancel landing between libcurl's head and its body --
+    passed it with a short body and was stored, empty, over what a later
+    upload put at the key. S3 stores neither a body short of its
+    Content-Length nor one its x-amz-content-sha256 does not hash."""
+    body = bytes(range(256)) * 8
+    digest = hashlib.sha256(body).hexdigest()
+
+    # The control: the same head with its whole body is stored.
+    answer = _send_raw(fake_s3, _signed_put_head(
+        fake_s3, "packs/whole", digest, len(body)) + body)
+    assert answer.startswith(b"HTTP/1.1 200"), answer
+    assert STATE.objects["packs/whole"]["body"] == body
+
+    # The head, and half the body, then nothing more.
+    _send_raw(fake_s3, _signed_put_head(
+        fake_s3, "packs/short", digest, len(body)) + body[:1024])
+    # The head alone.
+    _send_raw(fake_s3, _signed_put_head(
+        fake_s3, "packs/headless", digest, len(body)))
+    # A whole body, but not the one the head hashes.
+    answer = _send_raw(fake_s3, _signed_put_head(
+        fake_s3, "packs/other", digest, len(body)) + bytes(len(body)))
+    assert answer.startswith(b"HTTP/1.1 400"), answer
+    with STATE.lock:
+        assert set(STATE.objects) == {"packs/whole"}, sorted(STATE.objects)
+        assert [call["path"] for call in STATE.calls] == [
+            f"/{BUCKET}/packs/whole"], STATE.calls

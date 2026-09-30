@@ -2,6 +2,10 @@
 //
 //   StorageService   spool -> object store -> catalog, on a background thread
 //   CaptureReader    search / select / hydrate against the catalog + store
+//   SpoolOwnerLock   the owner lock of one spool directory (store/spool.h),
+//                    which the engine holds around its sink and service
+//   spool_rank_directory, spool_catalog_key, spool_owner
+//                    the section 2.3 spool layout, and who owns a directory
 //
 // Pure C++ plus libcurl and libcrypto. It uses pybind11's headers but links
 // nothing from torch, and registers no ring types, so it loads beside
@@ -10,12 +14,14 @@
 #include <pybind11/stl.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "catalog/hydration.h"
 #include "catalog/reader.h"
 #include "catalog/storage_service.h"
+#include "store/spool.h"
 
 namespace py = pybind11;
 namespace dc = dmi_catalog;
@@ -75,10 +81,50 @@ dc::ClickHouseConnection clickhouse_connection(const py::dict& d) {
   return c;
 }
 
+dmi_store::OwnerLock owner_lock(const std::string& text) {
+  dmi_store::OwnerLock mode = dmi_store::OwnerLock::kTake;
+  if (!dmi_store::ParseOwnerLock(text, &mode)) {
+    throw py::value_error("spool_owner_lock must be 'take' or "
+                          "'held_by_caller', got '" + text + "'");
+  }
+  return mode;
+}
+
+// Where a spool's packs go (store/spool.h); every field is required.
+dmi_store::SpoolDestination spool_destination(const py::dict& d) {
+  for (const char* key : {"clickhouse_host", "clickhouse_port", "database",
+                          "table_prefix", "s3_endpoint", "s3_bucket",
+                          "store_id"}) {
+    if (!d.contains(key)) {
+      throw py::key_error(std::string("spool destination needs '") + key +
+                          "'");
+    }
+  }
+  dmi_store::SpoolDestination out;
+  out.clickhouse_host = d["clickhouse_host"].cast<std::string>();
+  out.clickhouse_port = d["clickhouse_port"].cast<uint64_t>();
+  out.database = d["database"].cast<std::string>();
+  out.table_prefix = d["table_prefix"].cast<std::string>();
+  out.s3_endpoint = d["s3_endpoint"].cast<std::string>();
+  out.s3_bucket = d["s3_bucket"].cast<std::string>();
+  out.store_id = d["store_id"].cast<std::string>();
+  return out;
+}
+
 dc::StorageServiceConfig service_config(const py::dict& d) {
   dc::StorageServiceConfig c;
   c.spool_root = get<std::string>(d, "spool_root", "");
   c.spool_max_bytes = get<uint64_t>(d, "spool_max_bytes", c.spool_max_bytes);
+  c.spool_owner_lock =
+      owner_lock(get<std::string>(d, "spool_owner_lock", "take"));
+  c.spool_allow_shared_filesystem = get<bool>(
+      d, "spool_allow_shared_filesystem", c.spool_allow_shared_filesystem);
+  c.adopt_sibling_spools =
+      get<bool>(d, "adopt_sibling_spools", c.adopt_sibling_spools);
+  c.adoption_recheck_interval_ns = get<uint64_t>(
+      d, "adoption_recheck_interval_ns", c.adoption_recheck_interval_ns);
+  c.adoption_slice_ns =
+      get<uint64_t>(d, "adoption_slice_ns", c.adoption_slice_ns);
   c.s3 = s3_config(d);
   c.uploader.store_id = get<std::string>(d, "store_id", c.uploader.store_id);
   c.uploader.max_workers = get<int>(d, "uploader_max_workers", c.uploader.max_workers);
@@ -129,6 +175,11 @@ py::dict snapshot_dict(const dc::StorageServiceSnapshot& s) {
   out["swept_on_start"] = s.swept_on_start;
   out["pending_index"] = s.pending_index;
   out["rejected_packs"] = s.rejected_packs;
+  out["adopted_spools"] = s.adopted_spools;
+  out["adopted_packs"] = s.adopted_packs;
+  out["adoption_owed"] = s.adoption_owed;
+  out["live_siblings"] = s.live_siblings;
+  out["blocked_siblings"] = s.blocked_siblings;
   out["failed"] = s.failed;
   out["lease_state"] = s.lease_state;
   // Seconds on the monotonic clock, comparable with time.monotonic() (both
@@ -275,6 +326,23 @@ class CaptureReader {
   dc::NativeCaptureReader reader_;
 };
 
+// A refused SpoolStatus as the Python exception that says what it is: a
+// directory another process owns, a refused configuration, or an I/O error.
+PyObject* g_spool_owned_error = nullptr;  // SpoolOwnedError, set at import
+
+[[noreturn]] void raise_spool_status(dmi_store::SpoolStatus status,
+                                     const std::string& error) {
+  if (status == dmi_store::SpoolStatus::kOwned) {
+    PyErr_SetString(g_spool_owned_error, error.c_str());
+    throw py::error_already_set();
+  }
+  if (status == dmi_store::SpoolStatus::kBadArgument) {
+    throw py::value_error(error);
+  }
+  PyErr_SetString(PyExc_OSError, error.c_str());
+  throw py::error_already_set();
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_dmi_native_store, m) {
@@ -295,6 +363,91 @@ PYBIND11_MODULE(_dmi_native_store, m) {
       .def("snapshot",
            [](const dc::CaptureStorageService& s) { return snapshot_dict(s.snapshot()); })
       .def("rethrow_if_failed", &dc::CaptureStorageService::rethrow_if_failed);
+
+  // Raised when another owner holds a spool directory; a RuntimeError, so
+  // callers catching the service's refusals keep catching it.
+  static py::exception<std::runtime_error> spool_owned_error(
+      m, "SpoolOwnedError", PyExc_RuntimeError);
+  g_spool_owned_error = spool_owned_error.ptr();
+
+  py::class_<dmi_store::SpoolOwnerLock>(m, "SpoolOwnerLock")
+      .def(py::init([](const std::string& directory,
+                                  bool allow_shared_filesystem) {
+             auto lock = std::make_unique<dmi_store::SpoolOwnerLock>();
+             std::string error;
+             const dmi_store::SpoolStatus status =
+                 dmi_store::SpoolOwnerLock::Acquire(
+                     directory, allow_shared_filesystem, lock.get(), &error);
+             if (status != dmi_store::SpoolStatus::kOk) {
+               raise_spool_status(status, error);
+             }
+             return lock;
+           }),
+           py::arg("directory"), py::arg("allow_shared_filesystem") = false)
+      .def_property_readonly("directory", &dmi_store::SpoolOwnerLock::directory)
+      .def_property_readonly("held", &dmi_store::SpoolOwnerLock::held)
+      .def("release", &dmi_store::SpoolOwnerLock::Release)
+      .def("release_and_remove_if_empty",
+           [](dmi_store::SpoolOwnerLock& self) {
+             std::string error;
+             return self.ReleaseAndRemoveIfEmpty(&error);
+           })
+      .def("__enter__",
+           [](dmi_store::SpoolOwnerLock& self) -> dmi_store::SpoolOwnerLock& {
+             return self;
+           }, py::return_value_policy::reference)
+      .def("__exit__", [](dmi_store::SpoolOwnerLock& self, const py::args&) {
+        self.Release();
+        return false;
+      });
+
+  m.def("spool_owner",
+        [](const std::string& directory) -> py::object {
+          dmi_store::SpoolOwner owner;
+          if (!dmi_store::ReadSpoolOwner(directory, &owner)) return py::none();
+          py::dict out;
+          out["host"] = owner.host;
+          out["pid"] = owner.pid;
+          return out;
+        },
+        py::arg("directory"),
+        "Who holds a spool directory's owner lock, or None when nothing "
+        "does.");
+  m.def("spool_catalog_key",
+        [](const py::dict& destination) {
+          return dmi_store::SpoolCatalogKey(spool_destination(destination));
+        },
+        py::arg("destination"),
+        "The catalog key of a destination dict (clickhouse_host, "
+        "clickhouse_port, database, table_prefix, s3_endpoint, s3_bucket, "
+        "store_id).");
+  m.def("spool_rank_directory",
+        [](const std::string& base, const py::dict& destination,
+           uint64_t producer_rank, std::optional<std::string> incarnation) {
+          const std::string fresh =
+              incarnation ? *incarnation : dmi_store::NewSpoolIncarnation();
+          uint64_t parsed_rank = 0;
+          std::string parsed;
+          if (!dmi_store::ParseSpoolRankDirectoryName(
+                  dmi_store::SpoolRankDirectoryName(producer_rank, fresh),
+                  &parsed_rank, &parsed)) {
+            throw py::value_error("incarnation must be 8 lowercase hex "
+                                  "digits");
+          }
+          return dmi_store::SpoolRankDirectory(
+              base, spool_destination(destination), producer_rank, fresh);
+        },
+        py::arg("base"), py::arg("destination"), py::arg("producer_rank"),
+        py::arg("incarnation") = py::none(),
+        "<base>/<catalog_key>/r<producer_rank>-<incarnation>, the section "
+        "2.3 spool layout; a fresh incarnation when none is given.");
+  m.def("_set_spool_filesystem_type_for_testing",
+        [](std::optional<int64_t> f_type) {
+          dmi_store::SetFilesystemTypeForTesting(f_type ? *f_type : -1);
+        },
+        py::arg("f_type"),
+        "Test seam: node-local checks in this module read f_type instead "
+        "of statfs(2); None restores statfs.");
 
   py::class_<CaptureReader>(m, "CaptureReader")
       .def(py::init<const py::dict&>(), py::arg("config"))

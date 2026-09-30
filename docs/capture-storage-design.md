@@ -1827,6 +1827,9 @@ bytes, and retained failure details all have explicit caps.
   writer will be native. See *Phase 6 -- Decision: the production writer is
   native*.
 - One process owns a spool directory; cross-process locking is not implemented.
+  (The native C++ spool does lock it: an owner lock on `<dir>/.owner.lock`,
+  B6, documented in `native/csrc/store/spool.h`. The Python reference
+  deliberately stays unlocked.)
 - Durable mode stages synchronously and uploads through a separate explicit
   uploader, so remote backpressure is isolated from local commit.
 - The pipeline remains opt-in and is not connected to Ring².

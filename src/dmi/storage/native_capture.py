@@ -21,11 +21,18 @@ Deployment shape: the catalog has ONE publisher lease per (``database``,
 ``table_prefix``), so run one capture process per catalog. A second engine
 on the same catalog waits ``start_lease_wait_s`` for the lease, then fails
 at ``create_record_runtime`` with the lease held, naming the holder.
+
+Each spool directory has one owner process (an flock on its
+``.owner.lock``). The engine claims a fresh directory of its own under
+``spool_root`` (:func:`claim_spool_directory`) and its service adopts the
+spools of dead processes beside it, so a crashed run's packs reach the
+catalog through the next process on the node for the same catalog.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -124,6 +131,21 @@ class NativeSinkConfig:
     A record larger than ``max_queue_bytes`` or ``max_pack_bytes`` can
     never be admitted; ``validate_capture_bounds`` refuses such a bound at
     attach, before any forward runs.
+
+    ``spool_root`` must be node-local, and each spool directory has one
+    owner process, held by an flock on its ``.owner.lock``. With
+    ``capture_storage_config`` the engine spools into a directory of its own
+    under it, ``<spool_root>/<catalog_key>/r<rank>-<incarnation>/`` (see
+    :func:`claim_spool_directory`), and its storage service adopts the
+    directories of dead processes beside it. ``spool_max_bytes`` then
+    bounds this directory together with what the dead incarnations beside
+    it still hold, so crash-restarts while uploads are blocked cannot each
+    add a whole budget. Without one, the sink owns ``spool_root`` itself.
+    A root on NFS, Lustre, BeeGFS, CIFS/SMB2, FUSE,
+    GPFS, 9p, AFS or OrangeFS is refused unless
+    ``spool_allow_shared_filesystem``: flock there does not keep out a
+    process on another node (a FUSE filesystem that is local, such as
+    fuse-overlayfs, needs the override too).
     """
 
     spool_root: str
@@ -136,10 +158,13 @@ class NativeSinkConfig:
     max_linger_ns: int = 1_000_000_000
     overload: str = "block"
     admission_timeout_s: Optional[float] = 2.0
+    spool_allow_shared_filesystem: bool = False
 
     def __post_init__(self) -> None:
         if not self.spool_root:
             raise ValueError("spool_root is required")
+        if type(self.spool_allow_shared_filesystem) is not bool:
+            raise TypeError("spool_allow_shared_filesystem must be bool")
         for name in (
             "spool_max_bytes",
             "num_workers",
@@ -288,7 +313,13 @@ class NativeCaptureStorageConfig:
     # budget cuts a multipart upload; against a slow catalog that still
     # answers, by one batch of statements and the release. When the sink
     # itself is stuck, the flush its release from the ring makes adds up to
-    # 30 s. close() logs what did not drain; flush_and_wait is what raises.
+    # 30 s. The budget also pays for the adoption step the background loop
+    # is in when the drain starts (adopt_sibling_spools, the engine's
+    # default): the drain's cycle waits for it -- one of a dead process's
+    # packs validated, which hashes it, or one round of their uploads --
+    # but never for a dead backlog's whole listing, and past the budget
+    # stopping the service cuts it. close() logs what did not drain;
+    # flush_and_wait is what raises.
     close_flush_timeout_s: float = 60.0
     # Bytes of packs the uploader holds in flight at once. A staged pack
     # larger than this is never uploaded, so the sink's max_pack_bytes must
@@ -532,6 +563,20 @@ class NativeCaptureStorageConfig:
             "uploader_max_in_flight_bytes": self.uploader_max_in_flight_bytes,
         }
 
+    def _spool_destination(self) -> dict[str, Any]:
+        """Where the packs go, as the spool's catalog key hashes it: the
+        catalog's server and names, and the store's endpoint, bucket and
+        id (native/csrc/store/spool.h, SpoolDestination)."""
+        return {
+            "clickhouse_host": self.clickhouse_host,
+            "clickhouse_port": self.clickhouse_port,
+            "database": self.database,
+            "table_prefix": self.table_prefix,
+            "s3_endpoint": self.s3_endpoint,
+            "s3_bucket": self.s3_bucket,
+            "store_id": self.store_id,
+        }
+
     def _native_reader_dict(self) -> dict[str, Any]:
         """The reader's native config: the reader account, when one is set."""
         native = self._native_dict()
@@ -597,8 +642,160 @@ def validate_capture_bounds(
             "uploader_max_in_flight_bytes")
 
 
+_LOG = logging.getLogger(__name__)
+
+# The spool directory's owner-lock modes (native/csrc/store/spool.h).
+SPOOL_OWNER_LOCKS = ("take", "held_by_caller")
+
+# The spool layout's directory names (native/csrc/store/spool.h).
+_CATALOG_KEY = re.compile(r"[0-9a-f]{12}")
+_RANK_DIRECTORY = re.compile(r"r(?:0|[1-9][0-9]{0,18})-[0-9a-f]{8}")
+
+
+def _packs_outside_the_layout(spool_root: str) -> tuple[int, Optional[str]]:
+    """Ready packs under ``spool_root`` that no rank directory of the layout
+    holds -- left by an engine from before the layout, or by a sink-only or
+    explicit-record_sink run, which write into ``spool_root`` itself -- and
+    the first one met. Only names are read, and the rank directories, which
+    adoption drains, are not walked."""
+    count, example = 0, None
+    for directory, subdirectories, files in os.walk(spool_root):
+        relative = os.path.relpath(directory, spool_root)
+        depth = 0 if relative == "." else relative.count(os.sep) + 1
+        if depth == 1 and _CATALOG_KEY.fullmatch(os.path.basename(directory)):
+            subdirectories[:] = [name for name in subdirectories
+                                 if not _RANK_DIRECTORY.fullmatch(name)]
+        for name in files:
+            if name.endswith(".dmi-pack.ready"):
+                count += 1
+                if example is None:
+                    example = os.path.join(directory, name)
+    return count, example
+
+
+def _spool_producer_rank() -> int:
+    """The rank a spool directory is named for: torchrun's global ``RANK``,
+    0 for a single process or anything that is not a rank. It only labels
+    the directory; the incarnation is what keeps two processes apart."""
+    text = os.environ.get("RANK", "")
+    return int(text) if text.isdigit() else 0
+
+
+# Every SpoolClaim not yet released. Dropping a claim must not let go of its
+# directory: an engine dropped without close() drops its claim while the
+# ring and the sink it activated may still be capturing into the directory,
+# and another process's adoption would then sweep it from under them. So a
+# claim lives until release(), or until the process exits and the kernel
+# drops its lock.
+_HELD_SPOOL_CLAIMS: set["SpoolClaim"] = set()
+
+
+class SpoolClaim:
+    """This process's own spool directory, owned through its lock.
+
+    From :func:`claim_spool_directory`. Hold it for as long as anything in
+    the process writes or reads the directory -- the engine holds it from
+    before its storage service starts until the sink and the service are
+    done -- then :meth:`release` it. Only ``release()`` lets go: a claim
+    that is merely dropped stays held until the process exits.
+    """
+
+    def __init__(self, lock: Any) -> None:
+        self._lock = lock
+        self.directory: str = lock.directory
+        _HELD_SPOOL_CLAIMS.add(self)
+
+    @property
+    def held(self) -> bool:
+        return bool(self._lock.held)
+
+    def release(self) -> bool:
+        """Let go of the directory, removing it if nothing but its lock
+        file is left. Whatever did not drain stays, and the next process on
+        the node for this catalog adopts it. Returns whether it was
+        removed. Call it only once nothing in the process can still write
+        the directory."""
+        _HELD_SPOOL_CLAIMS.discard(self)
+        return bool(self._lock.release_and_remove_if_empty())
+
+
+def claim_spool_directory(
+    sink_config: NativeSinkConfig,
+    storage_config: NativeCaptureStorageConfig,
+) -> SpoolClaim:
+    """Create and lock this process's spool directory.
+
+    ``<spool_root>/<catalog_key>/r<rank>-<incarnation>/``: the catalog key is
+    the first 12 hex digits of a sha256 of where the packs go -- the
+    ClickHouse host and port, ``database``, ``table_prefix``, the S3 endpoint
+    and bucket, and ``store_id`` -- so every directory under it holds packs
+    for this catalog and store, and two deployments that share the default
+    names but not a server never adopt each other's directories; the
+    incarnation is fresh for every call, so no two processes -- two jobs on
+    one node, or a restart -- share a directory; the rank is torchrun's
+    ``RANK`` (0 when unset). The directory is created with its owner lock
+    already held. Raises ``SpoolOwnedError`` (a ``RuntimeError``) if another
+    process holds it, and ``ValueError`` for a shared filesystem or a
+    directory nested in a spool that another owner holds (a sink-only or
+    explicit-``record_sink`` run on ``spool_root``).
+
+    Ready packs under ``spool_root`` outside the layout -- an engine from
+    before it spooled into ``<spool_root>/v1/...``, and a sink-only or
+    explicit-``record_sink`` run still does -- are adopted by nothing, so a
+    claim logs a warning naming how many there are, one of them, and a
+    directory of the layout to move them into for adoption.
+    """
+    module = _load_native_store_extension()
+    directory = module.spool_rank_directory(
+        sink_config.spool_root, storage_config._spool_destination(),
+        _spool_producer_rank())
+    claim = SpoolClaim(module.SpoolOwnerLock(
+        directory,
+        allow_shared_filesystem=sink_config.spool_allow_shared_filesystem))
+    count, example = _packs_outside_the_layout(sink_config.spool_root)
+    if count:
+        orphanage = os.path.join(sink_config.spool_root,
+                                 os.path.basename(os.path.dirname(directory)),
+                                 "r0-00000000")
+        _LOG.warning(
+            "spool_root %s holds %d ready pack(s) outside the per-process "
+            "layout (for example %s), which no engine adopts: left by an "
+            "engine from before the layout, or by a sink-only or "
+            "explicit-record_sink run. If they are bound for this catalog "
+            "and store, move them, keeping their paths below spool_root "
+            "(v1/...), into a directory of the layout nobody owns, such as "
+            "%s, and the next start on this node adopts them",
+            sink_config.spool_root, count, example, orphanage)
+    return claim
+
+
+def spool_owner_lock_beside(spool_root: str) -> str:
+    """The owner-lock mode for a second Spool on a directory: ``held_by_caller``
+    when this process already holds its lock (a sink the caller built took
+    it), else ``take``, which another process's lock refuses by name."""
+    owner = _load_native_store_extension().spool_owner(spool_root)
+    if (owner is not None and owner["pid"] == os.getpid()
+            and owner["host"] == socket.gethostname()):
+        return "held_by_caller"
+    return "take"
+
+
 class NativeCaptureStorage:
-    """The in-process storage service: spool -> object store -> catalog."""
+    """The in-process storage service: spool -> object store -> catalog.
+
+    The spool directory has one owner process, held by an flock on
+    ``<spool_root>/.owner.lock``. ``spool_owner_lock="take"`` makes this
+    service its owner for the service's life, and refuses a directory
+    another process owns, naming it. A process that also runs the sink on
+    the directory -- the engine -- holds one ``SpoolOwnerLock`` and passes
+    ``"held_by_caller"`` here and to the sink: two takes in one process
+    refuse each other.
+
+    ``adopt_sibling_spools`` needs ``spool_root`` to be a rank directory of
+    the spool layout (``spool_rank_directory``); once started, the service's
+    background loop drains the sibling directories whose owners have died
+    into this catalog, a slice per cycle.
+    """
 
     def __init__(
         self,
@@ -607,9 +804,22 @@ class NativeCaptureStorage:
         spool_root: str,
         spool_max_bytes: int,
         sweep_spool: bool,
+        spool_owner_lock: str = "take",
+        adopt_sibling_spools: bool = False,
+        spool_allow_shared_filesystem: bool = False,
     ) -> None:
         if not isinstance(config, NativeCaptureStorageConfig):
             raise TypeError("config must be a NativeCaptureStorageConfig")
+        if spool_owner_lock not in SPOOL_OWNER_LOCKS:
+            raise ValueError(
+                f"spool_owner_lock must be one of {SPOOL_OWNER_LOCKS}, got "
+                f"{spool_owner_lock!r}")
+        for name, value in (
+                ("adopt_sibling_spools", adopt_sibling_spools),
+                ("spool_allow_shared_filesystem",
+                 spool_allow_shared_filesystem)):
+            if type(value) is not bool:
+                raise TypeError(f"{name} must be bool")
         module = _load_native_store_extension()
         native = config._native_dict()
         native.update(
@@ -622,6 +832,9 @@ class NativeCaptureStorage:
             reconcile_prefix=config.reconcile_prefix,
             reconcile_interval_ns=int(config.reconcile_interval_s * 1e9),
             sweep_spool_on_start=sweep_spool,
+            spool_owner_lock=spool_owner_lock,
+            adopt_sibling_spools=adopt_sibling_spools,
+            spool_allow_shared_filesystem=spool_allow_shared_filesystem,
             **config._lease_native(),
         )
         self._config = config
@@ -651,6 +864,16 @@ class NativeCaptureStorage:
         6 s late when the deadline cuts a multipart upload, whose abort
         nothing cuts (see
         ``NativeCaptureStorageConfig.close_flush_timeout_s``).
+        The dead processes' spools the service adopts
+        (``adopt_sibling_spools``) are not part of it -- they are the
+        background loop's, and ``snapshot()`` reports them
+        (``adopted_spools``, ``adoption_owed``) -- though an adopted pack
+        uploaded and not yet indexed is waited for like this process's own.
+        Nor does a flush adopt, but it does wait, within ``timeout_s``, for
+        the adoption step the loop is in when it is called: one of a dead
+        spool's packs validated, which hashes it, or one round of their
+        uploads (at most four packs, one per upload worker) -- not a dead
+        backlog's whole listing, which goes a pack a step.
         """
         if not self._service.flush(float(timeout_s)):
             snapshot = self._service.snapshot()
@@ -862,6 +1085,7 @@ class NativeCaptureReader:
 __all__ = [
     "PACK_FRAMING_RESERVE_BYTES",
     "SINK_OVERLOAD_POLICIES",
+    "SPOOL_OWNER_LOCKS",
     "NativeSinkConfig",
     "NativeCapture",
     "NativeCapturePage",
@@ -869,5 +1093,8 @@ __all__ = [
     "NativeCaptureSelection",
     "NativeCaptureStorage",
     "NativeCaptureStorageConfig",
+    "SpoolClaim",
+    "claim_spool_directory",
+    "spool_owner_lock_beside",
     "validate_capture_bounds",
 ]

@@ -185,6 +185,71 @@ refuses the persistent backend with `ConfigurationError` rather than generating
 with nothing stored. The catalog
 takes one publisher per `(database, table_prefix)`, so a second engine on the
 same catalog is refused at `create_record_runtime`.
+The engine spools into a directory of its own under
+`capture_sink_config.spool_root`,
+`<spool_root>/<catalog_key>/r<rank>-<incarnation>/` (the key is the first 12
+hex digits of a sha256 of where the packs go -- the ClickHouse host and port,
+`database`, `table_prefix`, the S3 endpoint and bucket, and `store_id`, as
+spelled in the config -- the rank torchrun's
+`RANK`, 0 when unset, and the incarnation fresh on every
+`create_record_runtime`), and owns it: an flock on its `.owner.lock` and on the
+directory itself, taken before the service starts and let go after the sink and
+the service are done, when a drained directory is removed. The directory's own
+lock keeps it owned should its `.owner.lock` be removed from under it, and
+systemd-tmpfiles skips a flocked directory when it ages `/tmp`; other cleaners
+may not, so keep `spool_root` out of what they age. If the sink did not seal --
+the release backstop's flush, when the stopping ring lets go of it, did not go
+through -- it may still be staging, so the directory stays owned by the
+process until it exits (a warning names it) and the next process on the node
+adopts it; so does the directory of an engine dropped without `close()`.
+A second process on a directory is
+refused, naming the holder's pid and host. Once started, the service's
+background loop adopts the directories under the same catalog key whose owners
+have died: their stale `.open` files are swept, their ready packs uploaded and
+indexed, a round at a time and a slice of each cycle, and the directory
+removed, so a crashed process's packs reach the catalog through the next one on
+the node, whatever run it belongs to. Neither `create_record_runtime` nor
+`flush_and_wait` waits for that: a flush covers this process's records (an
+adopted pack uploaded and not yet indexed is waited for like its own), waits
+for no more of an adoption in progress than the step it is in (one round of
+its uploads, or one of its packs validated -- a dead directory's packs are
+hashed one per step, so a large backlog's listing does not hold a flush up),
+and `close()` cuts an adoption as it cuts the service's own uploads, leaving
+what it did not upload in the dead directory for the next process. The
+storage part of `capture_status()` reports the adoption (`adopted_spools`,
+`adopted_packs`, `adoption_owed`, `live_siblings`). A dead directory the
+service can never adopt -- one holding a pack it can never upload, such as one
+larger than its `uploader_max_in_flight_bytes` or one whose key already holds a
+different object, or one it cannot lock -- is left in place once the rest of
+its packs are up, listed in `blocked_siblings`, reported once in `last_error`
+and in its `.owner.lock` (a `blocked: <why>` line), and neither retried nor
+owed. `spool_max_bytes` bounds the directory together with what the dead
+directories the service can adopt still hold, so restarts while uploads are
+blocked cannot each add a whole budget; the room comes back as they are
+adopted. A live process's directory is its own budget, and neither a blocked
+directory nor one this process keeps owned itself (an earlier engine's whose
+sink did not seal) is charged: no adoption here drains them. The
+spool root must be
+node-local: NFS, Lustre, BeeGFS, CIFS/SMB2, FUSE, GPFS, 9p, AFS and OrangeFS
+are refused (by statfs `f_type`) unless `NativeSinkConfig.spool_allow_shared_filesystem`, which a FUSE
+filesystem that is itself local, such as fuse-overlayfs, needs too. Without
+`capture_storage_config` the sink owns `spool_root` itself. With an explicit
+`record_sink`, the service drains `spool_root` as that sink writes it,
+unswept and adopting nothing. Both of those modes pass over the rank
+directories under `spool_root` -- what a crashed or undrained default-mode run
+left there is the next default-mode start's to adopt -- so switching to them
+(the rollback to an explicit `record_sink` included) works after such a run.
+They are refused, naming the holder, while a default-mode process on the node
+holds a rank directory under that `spool_root`, and a default-mode start is
+refused while one of them holds `spool_root`. Upgrading from an engine without this layout: it
+spooled into `<spool_root>/v1/...` and its next start uploaded what a crashed
+run left there, but nothing adopts packs outside the layout now -- nor those a
+sink-only or explicit-`record_sink` run leaves in `spool_root`. Each
+`create_record_runtime` logs a warning while any are there, with their count,
+one of them, and a directory of the layout nobody owns
+(`<spool_root>/<catalog_key>/r0-00000000/`); moved into it with their paths
+below `spool_root` kept (`v1/...`), packs bound for this catalog and store are
+adopted by the next start on the node.
 To reach a secured catalog, set `clickhouse_scheme="https"` (and the server's
 TLS HTTP port, usually 8443) on `NativeCaptureStorageConfig`. The client always
 verifies the server's certificate and name, against libcurl's built-in CA

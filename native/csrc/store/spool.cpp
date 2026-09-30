@@ -5,12 +5,29 @@
 #include <openssl/sha.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cerrno>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <random>
+#include <thread>
 
+#include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#else
+// statfs(2) with f_fstypename: macOS and the BSDs.
+#include <sys/mount.h>
+#include <sys/param.h>
+#endif
 #include <unistd.h>
 
 namespace dmi_store {
@@ -20,6 +37,96 @@ namespace {
 
 constexpr const char* kReadySuffix = ".dmi-pack.ready";
 constexpr const char* kOpenSuffix = ".open";
+constexpr const char* kOwnerLockFile = ".owner.lock";
+// SpoolOwnerLock::Acquire builds a new directory as
+// <parent>/.<name>.<8 hex>.creating and renames it into place.
+constexpr const char* kClaimStagingSuffix = ".creating";
+// <root>/_refs/: the upload handoff's ref files (plan section 2.4). Not a
+// legal object-key component (those start with an alphanumeric), so no pack
+// is ever staged under it.
+constexpr const char* kRefsDirectory = "_refs";
+
+// statfs(2) f_type values of network filesystems, whose flock does not
+// keep out a process on another node -- or is not a place a node-local
+// spool can be (linux/magic.h has NFS, SMB2, CIFS, FUSE, 9p and both AFS
+// values; the others are their own). BeeGFS keeps flock client-local
+// unless tuneUseGlobalFileLocks is set, and GPFS (IBM Storage Scale) keeps
+// it node-local. FUSE covers network filesystems (sshfs, s3fs, gcsfuse,
+// GlusterFS) and local ones alike, and f_type cannot tell them apart, so a
+// local one needs the override. AFS is OpenAFS's and kAFS's.
+constexpr uint32_t kNfsSuperMagic = 0x6969;
+constexpr uint32_t kLustreSuperMagic = 0x0BD00BD0;
+constexpr uint32_t kBeeGfsSuperMagic = 0x19830326;
+constexpr uint32_t kCifsSuperMagic = 0xFF534D42;
+constexpr uint32_t kSmb2SuperMagic = 0xFE534D42;
+constexpr uint32_t kFuseSuperMagic = 0x65735546;
+constexpr uint32_t kGpfsSuperMagic = 0x47504653;
+constexpr uint32_t kV9fsMagic = 0x01021997;
+constexpr uint32_t kAfsSuperMagic = 0x5346414F;
+constexpr uint32_t kAfsFsMagic = 0x6B414653;
+constexpr uint32_t kOrangeFsSuperMagic = 0x20030528;
+
+std::atomic<int64_t> g_filesystem_type_for_testing{-1};
+
+#if !defined(__linux__)
+// Where statfs names the filesystem rather than giving Linux's magic: the
+// same refusal, by f_fstypename (FreeBSD spells a FUSE mount
+// "fusefs.<name>").
+const char* SharedFilesystemTypeName(const char* name) {
+  static const char* const kShared[][2] = {
+      {"nfs", "NFS"},         {"smbfs", "SMB"},       {"afpfs", "AFP"},
+      {"webdav", "WebDAV"},   {"lustre", "Lustre"},   {"macfuse", "FUSE"},
+      {"osxfuse", "FUSE"},    {"fusefs", "FUSE"},     {"afs", "AFS"}};
+  for (const auto& entry : kShared) {
+    const size_t n = std::strlen(entry[0]);
+    if (std::strncmp(name, entry[0], n) == 0 &&
+        (name[n] == '\0' || name[n] == '.')) {
+      return entry[1];
+    }
+  }
+  return nullptr;
+}
+#endif
+std::function<void(const std::string&)>& LockOpenHookForTesting() {
+  static auto* hook = new std::function<void(const std::string&)>;
+  return *hook;
+}
+
+// Whether a recursive walk of a spool root is at <root>/_refs, which no scan
+// enters.
+bool AtRefsDirectory(const fs::recursive_directory_iterator& it) {
+  std::error_code ec;
+  return it.depth() == 0 && it->path().filename() == kRefsDirectory &&
+         it->is_directory(ec);
+}
+
+// Whether a recursive walk of a spool is at a subdirectory with a lock
+// file of its own: another spool directory nested in this one -- a rank
+// directory of the layout under a flat spool_root, a claim's staging copy,
+// a root someone put inside a dead rank directory -- live or dead. No walk
+// of this spool enters it, for counting, sweeping, listing or uploading: a
+// live one's owner is writing it, and a dead one's packs are its
+// successor's to adopt, under its own keys, not this spool's.
+bool AtNestedSpool(const fs::recursive_directory_iterator& it) {
+  std::error_code ec;
+  return it->is_directory(ec) && !it->is_symlink(ec) &&
+         fs::exists(it->path() / kOwnerLockFile, ec);
+}
+
+// Every walk of a spool's own files skips these two.
+bool AtSkippedDirectory(const fs::recursive_directory_iterator& it) {
+  return AtRefsDirectory(it) || AtNestedSpool(it);
+}
+
+std::string Hostname() {
+  char host[256] = {0};
+  if (::gethostname(host, sizeof(host) - 1) != 0 || host[0] == '\0') {
+    return "unknown-host";
+  }
+  return host;
+}
+
+std::string Errno(int error) { return std::strerror(error); }
 
 bool HasSuffix(const std::string& name, const char* suffix) {
   const size_t n = std::strlen(suffix);
@@ -238,14 +345,951 @@ std::string ReadyName(const std::string& pack_id, uint64_t created,
          std::to_string(records) + "." + checksum + ".dmi-pack.ready";
 }
 
+void FsyncParent(const std::string& path) {
+  FsyncDir(fs::path(path).parent_path().string(), nullptr);
+}
+
+// The record's roles, on the line after "<host> <pid>".
+constexpr const char* kAdoptingRole = "adopting";
+constexpr const char* kBlockedRole = "blocked: ";
+constexpr size_t kOwnerRecordBytes = 2048;
+
+// "<host> <pid>\n", then a role line when there is one ("adopting", or
+// "blocked: <why>"): whoever holds the lock records itself, so a refused
+// process can say who holds the directory, and a sink beside it whether
+// an adoption can drain it.
+void WriteOwnerRecord(int fd, const std::string& role = "") {
+  std::string record = Hostname() + " " + std::to_string(::getpid()) + "\n";
+  if (!role.empty()) {
+    std::string line = role.substr(0, kOwnerRecordBytes - record.size() - 2);
+    std::replace(line.begin(), line.end(), '\n', ' ');
+    record += line + "\n";
+  }
+  if (::ftruncate(fd, 0) == 0) {
+    (void)!::pwrite(fd, record.data(), record.size(), 0);
+  }
+}
+
+void ReadOwnerRecord(int fd, SpoolOwner* owner) {
+  char buffer[kOwnerRecordBytes];
+  const ssize_t n = ::pread(fd, buffer, sizeof(buffer), 0);
+  *owner = SpoolOwner{};
+  if (n <= 0) return;
+  std::string record(buffer, static_cast<size_t>(n));
+  const auto trim = [](std::string* text) {
+    while (!text->empty() && std::isspace(static_cast<unsigned char>(
+                                 text->back()))) {
+      text->pop_back();
+    }
+  };
+  const size_t newline = record.find('\n');
+  if (newline != std::string::npos) {
+    std::string role = record.substr(newline + 1);
+    record.resize(newline);
+    trim(&role);
+    const size_t blocked = std::strlen(kBlockedRole);
+    if (role == kAdoptingRole) {
+      owner->adopting = true;
+    } else if (role.compare(0, blocked, kBlockedRole) == 0) {
+      owner->blocked = role.substr(blocked);
+      if (owner->blocked.empty()) owner->blocked = "blocked";
+    }
+  }
+  trim(&record);
+  const size_t space = record.rfind(' ');
+  if (space == std::string::npos) {
+    owner->host = record;
+    return;
+  }
+  owner->host = record.substr(0, space);
+  const std::string pid = record.substr(space + 1);
+  if (!pid.empty() && pid.size() <= 18 &&
+      std::all_of(pid.begin(), pid.end(),
+                  [](char c) { return c >= '0' && c <= '9'; })) {
+    owner->pid = std::strtoll(pid.c_str(), nullptr, 10);
+  }
+}
+
+std::string OwnedMessage(const std::string& dir, const SpoolOwner& owner) {
+  const std::string file = dir + "/" + kOwnerLockFile;
+  if (owner.pid <= 0) {
+    return "spool directory " + dir + " is owned by another process, which "
+           "holds " + file + " and has not recorded itself yet; a spool "
+           "directory has one owner process";
+  }
+  return "spool directory " + dir + " is owned by pid " +
+         std::to_string(owner.pid) + " on host " + owner.host +
+         " (it holds " + file + "); a spool directory has one owner process";
+}
+
+// Whether `fd` is still the file at `path`: a remover unlinks the lock file
+// before it removes a drained directory, and a lock taken on the unlinked
+// file guards nothing.
+bool IsFileAt(int fd, const std::string& path) {
+  struct stat by_fd{}, by_path{};
+  return ::fstat(fd, &by_fd) == 0 && ::stat(path.c_str(), &by_path) == 0 &&
+         by_fd.st_dev == by_path.st_dev && by_fd.st_ino == by_path.st_ino;
+}
+
+// A path that may not exist yet, absolute, with its existing prefix's
+// symlinks resolved.
+std::string CanonicalPath(const std::string& path, std::string* error) {
+  std::error_code ec;
+  const fs::path absolute = fs::absolute(path, ec);
+  if (ec) {
+    if (error) *error = "cannot resolve " + path + ": " + ec.message();
+    return "";
+  }
+  const fs::path canonical = fs::weakly_canonical(absolute, ec);
+  if (ec) {
+    if (error) *error = "cannot resolve " + path + ": " + ec.message();
+    return "";
+  }
+  std::string out = canonical.string();
+  while (out.size() > 1 && out.back() == '/') out.pop_back();
+  return out;
+}
+
+// A spool directory must not be nested under, or contain, another one that
+// is owned: Scan walks recursively, and although every walk passes over a
+// subdirectory with a lock file of its own (AtNestedSpool), the outer
+// spool's walk can reach one before its owner's lock file is there -- a
+// take of an existing directory creates it -- and sweep the .open files
+// its owner then writes. Run AFTER `dir`'s own lock is taken, so that of
+// two takes racing on an outer directory and one inside it, at least one
+// sees the other: each publishes its lock before it looks. Only a HELD
+// lock refuses, in either direction. One nobody holds is a spool that was:
+// every take leaves its file behind, a spool_root a sink-only run once
+// owned holds one, and a crashed default-mode run leaves its rank
+// directory's under spool_root. Such a directory's packs are left alone by
+// every walk of the other (AtNestedSpool) -- a dead one inside is for its
+// successor to adopt -- so it refuses nothing: the rank directories under
+// a flat spool_root and that spool_root's own modes (sink-only, explicit
+// record_sink) take turns, and never run at once.
+SpoolStatus CheckNotNested(const std::string& dir, std::string* error) {
+  const auto holder = [](const SpoolOwner& owner) {
+    return owner.pid > 0 ? "pid " + std::to_string(owner.pid) + " on host " +
+                               owner.host
+                         : std::string("another owner");
+  };
+  fs::path ancestor(dir);
+  while (ancestor.has_parent_path() && ancestor.parent_path() != ancestor) {
+    ancestor = ancestor.parent_path();
+    std::error_code ec;
+    SpoolOwner owner;
+    if (fs::exists(ancestor / kOwnerLockFile, ec) &&
+        ReadSpoolOwner(ancestor.string(), &owner)) {
+      if (error) {
+        *error = "spool directory " + dir + " is nested under the spool "
+                 "directory " + ancestor.string() + ", which " +
+                 holder(owner) + " holds (" + kOwnerLockFile + "), and whose "
+                 "recovery would sweep this one; use a directory outside "
+                 "it, or wait for that owner to end";
+      }
+      return SpoolStatus::kBadArgument;
+    }
+  }
+  std::error_code ec;
+  for (auto it = fs::recursive_directory_iterator(
+           dir, fs::directory_options::skip_permission_denied, ec);
+       !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+    if (it->path().filename() != kOwnerLockFile) continue;
+    const fs::path owned = it->path().parent_path();
+    if (owned == fs::path(dir)) continue;
+    SpoolOwner owner;
+    if (!ReadSpoolOwner(owned.string(), &owner)) continue;  // dead: left be
+    if (error) {
+      *error = "spool directory " + dir + " contains the spool directory " +
+               owned.string() + ", which " + holder(owner) + " holds (" +
+               kOwnerLockFile + "), and which this one's recovery could "
+               "sweep while its owner writes it; use a directory that does "
+               "not contain it, or wait for that owner to end";
+    }
+    return SpoolStatus::kBadArgument;
+  }
+  return SpoolStatus::kOk;
+}
+
 }  // namespace
+
+const char* OwnerLockName(OwnerLock mode) {
+  return mode == OwnerLock::kHeldByCaller ? "held_by_caller" : "take";
+}
+
+bool ParseOwnerLock(const std::string& text, OwnerLock* mode) {
+  if (text == "take") {
+    *mode = OwnerLock::kTake;
+    return true;
+  }
+  if (text == "held_by_caller") {
+    *mode = OwnerLock::kHeldByCaller;
+    return true;
+  }
+  return false;
+}
+
+const char* SharedFilesystemName(int64_t f_type) {
+  switch (static_cast<uint32_t>(f_type)) {
+    case kNfsSuperMagic: return "NFS";
+    case kLustreSuperMagic: return "Lustre";
+    case kBeeGfsSuperMagic: return "BeeGFS";
+    case kCifsSuperMagic: return "CIFS";
+    case kSmb2SuperMagic: return "SMB2";
+    case kFuseSuperMagic: return "FUSE";
+    case kGpfsSuperMagic: return "GPFS";
+    case kV9fsMagic: return "9p";
+    case kAfsSuperMagic: return "AFS";
+    case kAfsFsMagic: return "AFS";
+    case kOrangeFsSuperMagic: return "OrangeFS";
+    default: return nullptr;
+  }
+}
+
+void SetFilesystemTypeForTesting(int64_t f_type) {
+  g_filesystem_type_for_testing.store(f_type);
+}
+
+void SetLockOpenHookForTesting(std::function<void(const std::string&)> hook) {
+  LockOpenHookForTesting() = std::move(hook);
+}
+
+SpoolStatus CheckNodeLocal(const std::string& dir,
+                           bool allow_shared_filesystem, std::string* error) {
+  const int64_t f_type = g_filesystem_type_for_testing.load();
+  const char* shared = nullptr;
+  std::string seen;  // what statfs said, for the refusal
+  const auto magic = [](int64_t value) {
+    char text[48];
+    std::snprintf(text, sizeof(text), "statfs f_type 0x%llx",
+                  static_cast<unsigned long long>(value));
+    return std::string(text);
+  };
+  if (f_type >= 0) {
+    shared = SharedFilesystemName(f_type);
+    seen = magic(f_type);
+  } else {
+    struct statfs info{};
+    if (::statfs(dir.c_str(), &info) != 0) {
+      if (error) *error = "cannot statfs " + dir + ": " + Errno(errno);
+      return SpoolStatus::kIo;
+    }
+#if defined(__linux__)
+    const int64_t type =
+        static_cast<int64_t>(static_cast<uint32_t>(info.f_type));
+    shared = SharedFilesystemName(type);
+    seen = magic(type);
+#else
+    shared = SharedFilesystemTypeName(info.f_fstypename);
+    seen = std::string("statfs f_fstypename ") + info.f_fstypename;
+#endif
+  }
+  if (shared == nullptr || allow_shared_filesystem) return SpoolStatus::kOk;
+  if (error) {
+    *error = "spool directory " + dir + " is on " + shared + " (" + seen +
+             "): a spool must be node-local, "
+             "since its owner lock (flock) does not keep out a process on "
+             "another node there. Use a local disk, or set "
+             "allow_shared_filesystem if no process on another node can "
+             "reach this directory" +
+             (std::string(shared) == "FUSE"
+                  ? " (a FUSE filesystem that is itself local, such as "
+                    "fuse-overlayfs or ntfs-3g, is one)"
+                  : std::string());
+  }
+  return SpoolStatus::kBadArgument;
+}
+
+namespace {
+// A probe of one flock: if it can be taken nobody holds it, and it is let
+// go at once. (A take racing the probe retries, see LockInPlace.) An
+// unlock on the probe's own description, so a child forked meanwhile
+// keeps nothing either.
+bool FlockHeld(int fd) {
+  if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
+    ::flock(fd, LOCK_UN);
+    return false;
+  }
+  return errno == EWOULDBLOCK;
+}
+}  // namespace
+
+bool ReadSpoolOwner(const std::string& dir, SpoolOwner* owner) {
+  const std::string file = dir + "/" + kOwnerLockFile;
+  const int fd = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+  bool held = fd >= 0 && FlockHeld(fd);
+  if (!held) {
+    // The directory's own lock, which its owner keeps however its lock
+    // file is replaced (SpoolOwnerLock).
+    const int dir_fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd >= 0) {
+      held = FlockHeld(dir_fd);
+      ::close(dir_fd);
+    }
+  }
+  if (owner != nullptr) {
+    if (fd >= 0) {
+      ReadOwnerRecord(fd, owner);
+    } else {
+      *owner = SpoolOwner{};
+    }
+  }
+  if (fd >= 0) ::close(fd);
+  return held;
+}
+
+bool IsSpoolClaimStagingName(const std::string& name) {
+  // "." + <name> + "." + 8 hex + ".creating", <name> not empty.
+  const size_t suffix = std::strlen(kClaimStagingSuffix);
+  if (name.size() < 1 + 1 + 1 + 8 + suffix || name[0] != '.' ||
+      !HasSuffix(name, kClaimStagingSuffix)) {
+    return false;
+  }
+  const size_t dot = name.size() - suffix - 9;
+  if (name[dot] != '.') return false;
+  return std::all_of(name.begin() + dot + 1, name.end() - suffix, [](char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+  });
+}
+
+namespace {
+std::atomic<bool> g_fdinfo_hides_locks_for_testing{false};
+
+// Whether /proc/self/fdinfo/<fd> lists a write flock on the descriptor's
+// open file description ("lock: 1: FLOCK  ADVISORY  WRITE ...").
+bool FdinfoShowsWriteFlock(const std::string& fd) {
+  if (g_fdinfo_hides_locks_for_testing.load()) return false;
+  std::FILE* in = std::fopen(("/proc/self/fdinfo/" + fd).c_str(), "re");
+  if (in == nullptr) return false;
+  bool shown = false;
+  char line[512];
+  while (!shown && std::fgets(line, sizeof(line), in) != nullptr) {
+    shown = std::strncmp(line, "lock:", 5) == 0 &&
+            std::strstr(line, " FLOCK ") != nullptr &&
+            std::strstr(line, " WRITE ") != nullptr;
+  }
+  std::fclose(in);
+  return shown;
+}
+// Whether this kernel lists flocks in /proc/self/fdinfo at all. Linux does
+// (since 3.8); gVisor's procfs prints only pos, flags and mnt_id, and
+// WSL1's lists no locks either. Probed once, on a flock taken on a
+// temporary file; no temporary file, no telling, and the record decides.
+bool FdinfoListsFlocks() {
+  if (g_fdinfo_hides_locks_for_testing.load()) return false;
+  static const bool lists = [] {
+    std::FILE* temp = std::tmpfile();
+    if (temp == nullptr) return false;
+    const int fd = ::fileno(temp);
+    const bool shown = ::flock(fd, LOCK_EX | LOCK_NB) == 0 &&
+                       FdinfoShowsWriteFlock(std::to_string(fd));
+    std::fclose(temp);
+    return shown;
+  }();
+  return lists;
+}
+}  // namespace
+
+void SetFdinfoHidesLocksForTesting(bool hide) {
+  g_fdinfo_hides_locks_for_testing.store(hide);
+}
+
+bool SpoolOwnedByThisProcess(const std::string& dir) {
+  const std::string file = dir + "/" + kOwnerLockFile;
+  // The lock file, and the directory itself, which its owner locks too: a
+  // lock file replaced behind the owner's back is no longer the one it
+  // holds, but the directory is.
+  struct stat targets[2]{};
+  size_t n_targets = 0;
+  if (::stat(file.c_str(), &targets[n_targets]) == 0) ++n_targets;
+  if (::stat(dir.c_str(), &targets[n_targets]) == 0 &&
+      S_ISDIR(targets[n_targets].st_mode)) {
+    ++n_targets;
+  }
+  if (n_targets == 0) return false;
+  // /proc/self/fdinfo/<fd> lists the flocks each open file description
+  // holds ("lock: 1: FLOCK  ADVISORY  WRITE ..."), so the kernel says
+  // whether one of this process's descriptors on the file holds the lock --
+  // a SpoolOwnerLock's, or one a Spool took with kTake. The record in the
+  // file is only a fallback, where /proc cannot be read or lists no flocks
+  // (FdinfoListsFlocks): it is written after the lock is taken, and a pid
+  // says nothing across pid namespaces.
+  DIR* fds = FdinfoListsFlocks() ? ::opendir("/proc/self/fd") : nullptr;
+  if (fds == nullptr) {
+    SpoolOwner owner;
+    return ReadSpoolOwner(dir, &owner) && owner.pid == ::getpid() &&
+           owner.host == Hostname();
+  }
+  const int listing = ::dirfd(fds);
+  bool held = false;
+  while (!held) {
+    const dirent* entry = ::readdir(fds);
+    if (entry == nullptr) break;
+    char* end = nullptr;
+    const long fd = std::strtol(entry->d_name, &end, 10);
+    if (end == entry->d_name || *end != '\0' || fd == listing) continue;
+    struct stat by_fd{};
+    if (::fstat(static_cast<int>(fd), &by_fd) != 0) continue;
+    bool on_target = false;
+    for (size_t i = 0; i < n_targets; ++i) {
+      on_target = on_target || (by_fd.st_dev == targets[i].st_dev &&
+                                by_fd.st_ino == targets[i].st_ino);
+    }
+    if (!on_target) continue;
+    held = FdinfoShowsWriteFlock(entry->d_name);
+  }
+  ::closedir(fds);
+  return held;
+}
+
+namespace {
+
+// Every descriptor this binary has open on a spool owner lock file, or on
+// the directory it locks with it: held, or between its open() and its
+// flock, or on its way to close(). The fork
+// handlers close the child's copies of all of them. Tracking starts at the
+// open() and ends at the close(), each under the mutex that BeforeFork
+// takes, so no fork -- from any thread, at any point of a take or a
+// release -- hands a child a copy the handler does not know of: a copy
+// made before the flock shares the description the flock then locks.
+// Leaked on purpose, so no static destructor runs while one is open. Each
+// binary that compiles spool.cpp (the store and sink extensions, the
+// drivers) keeps its own set and its own handlers, for its own descriptors.
+std::mutex& LockDescriptorsMutex() {
+  static std::mutex* mutex = new std::mutex;
+  return *mutex;
+}
+std::unordered_set<int>& LockDescriptors() {
+  static auto* descriptors = new std::unordered_set<int>;
+  return *descriptors;
+}
+// Bumped in each forked child, where every SpoolOwnerLock taken before the
+// fork then reads as released (SpoolOwnerLock::held).
+std::atomic<uint64_t> g_fork_generation{0};
+
+void BeforeForkLockDescriptors() { LockDescriptorsMutex().lock(); }
+void AfterForkLockDescriptorsInParent() { LockDescriptorsMutex().unlock(); }
+void AfterForkLockDescriptorsInChild() {
+  // Close, never LOCK_UN: an unlock on the shared description would drop
+  // the parent's hold too, and closing one of its descriptors does not.
+  for (const int fd : LockDescriptors()) ::close(fd);
+  LockDescriptors().clear();
+  g_fork_generation.fetch_add(1, std::memory_order_relaxed);
+  LockDescriptorsMutex().unlock();
+}
+
+int OpenLockDescriptor(const char* path, int flags, mode_t mode) {
+  static std::once_flag handlers;
+  std::call_once(handlers, [] {
+    ::pthread_atfork(&BeforeForkLockDescriptors,
+                     &AfterForkLockDescriptorsInParent,
+                     &AfterForkLockDescriptorsInChild);
+  });
+  std::lock_guard<std::mutex> guard(LockDescriptorsMutex());
+  const int fd = ::open(path, flags, mode);
+  const int failure = errno;
+  if (fd >= 0) LockDescriptors().insert(fd);
+  errno = failure;
+  return fd;
+}
+
+void CloseLockDescriptor(int fd) {
+  if (fd < 0) return;
+  std::lock_guard<std::mutex> guard(LockDescriptorsMutex());
+  LockDescriptors().erase(fd);
+  ::close(fd);  // closing the last descriptor unlocks
+}
+
+// The two locks of a held spool directory: its lock file's, which records
+// the holder, and the directory's own. The directory cannot be unlinked
+// while it holds anything, so a lock file removed behind a live owner's
+// back -- by an age-based cleaner such as systemd-tmpfiles, which also
+// skips a directory that is flocked, or by a person -- leaves the
+// directory owned: the next take meets its lock and is refused, where by
+// the new lock file alone it took the live directory for a dead one.
+struct HeldLock {
+  int file_fd = -1;
+  int dir_fd = -1;
+};
+
+void CloseHeldLock(HeldLock* lock) {
+  CloseLockDescriptor(lock->dir_fd);
+  CloseLockDescriptor(lock->file_fd);
+  *lock = HeldLock{};
+}
+
+// Takes `dir`'s own lock beside its lock file's, which `lock` holds. kOwned
+// while another holder has it: an owner whose lock file was replaced (or
+// is being probed, which a retry outlasts).
+SpoolStatus LockDirectory(const std::string& dir, HeldLock* lock,
+                          std::string* error) {
+  lock->dir_fd = OpenLockDescriptor(dir.c_str(),
+                                    O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+  if (lock->dir_fd < 0) {
+    if (error) *error = "cannot open spool directory " + dir + ": " +
+                        Errno(errno);
+    return SpoolStatus::kIo;
+  }
+  if (::flock(lock->dir_fd, LOCK_EX | LOCK_NB) == 0) return SpoolStatus::kOk;
+  const int failure = errno;
+  CloseLockDescriptor(lock->dir_fd);
+  lock->dir_fd = -1;
+  if (failure != EWOULDBLOCK) {
+    if (error) *error = "cannot lock spool directory " + dir + ": " +
+                        Errno(failure);
+    return SpoolStatus::kIo;
+  }
+  if (error) {
+    *error = "spool directory " + dir + " is owned by another process, "
+             "which holds the directory's own lock: its " + kOwnerLockFile +
+             " was replaced since, so that file does not name it; a spool "
+             "directory has one owner process";
+  }
+  return SpoolStatus::kOwned;
+}
+
+// Locks an existing directory -- its lock file, creating the file if it
+// has none, and the directory itself. Retries a lock lost to a remover's
+// unlink, and a refusal as brief as another process's ReadSpoolOwner
+// probe.
+SpoolStatus LockInPlace(const std::string& dir, const char* role,
+                        HeldLock* out, std::string* error) {
+  const std::string file = dir + "/" + kOwnerLockFile;
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    HeldLock lock;
+    lock.file_fd =
+        OpenLockDescriptor(file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    const int fd = lock.file_fd;
+    if (fd < 0) {
+      if (error) *error = "cannot open " + file + ": " + Errno(errno);
+      return SpoolStatus::kIo;
+    }
+    if (LockOpenHookForTesting()) LockOpenHookForTesting()(file);
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+      const int failure = errno;
+      SpoolOwner owner;
+      ReadOwnerRecord(fd, &owner);
+      CloseHeldLock(&lock);
+      if (failure != EWOULDBLOCK) {
+        if (error) *error = "cannot lock " + file + ": " + Errno(failure);
+        return SpoolStatus::kIo;
+      }
+      if (attempt < 2) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        continue;
+      }
+      if (error) *error = OwnedMessage(dir, owner);
+      return SpoolStatus::kOwned;
+    }
+    if (!IsFileAt(fd, file)) {
+      CloseHeldLock(&lock);
+      if (!fs::is_directory(dir)) {
+        if (error) *error = "spool directory " + dir + " was removed while "
+                            "it was being locked";
+        return SpoolStatus::kIo;
+      }
+      continue;
+    }
+    const SpoolStatus directory = LockDirectory(dir, &lock, error);
+    if (directory != SpoolStatus::kOk) {
+      CloseHeldLock(&lock);
+      if (directory == SpoolStatus::kOwned && attempt < 2) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        continue;
+      }
+      return directory;
+    }
+    WriteOwnerRecord(fd, role);
+    *out = lock;
+    return SpoolStatus::kOk;
+  }
+  if (error) *error = "cannot lock " + file + ": it keeps being replaced";
+  return SpoolStatus::kIo;
+}
+
+// Creates `dir` with its locks already held: built under a hidden name
+// beside it, then renamed into place, so a scan of the parent never meets
+// the directory unowned (an adopter would otherwise take a brand-new
+// sibling for a dead one). Falls back to LockInPlace if `dir` appears
+// meanwhile.
+SpoolStatus CreateLocked(const std::string& dir, HeldLock* out,
+                         std::string* error) {
+  const fs::path target(dir);
+  const std::string parent = target.parent_path().string();
+  const std::string name = target.filename().string();
+  std::random_device random;
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    char suffix[16];
+    std::snprintf(suffix, sizeof(suffix), "%08x",
+                  static_cast<unsigned>(random()));
+    // IsSpoolClaimStagingName's pattern.
+    const std::string staging =
+        parent + "/." + name + "." + suffix + kClaimStagingSuffix;
+    if (::mkdir(staging.c_str(), 0755) != 0) {
+      if (errno == EEXIST) continue;
+      if (error) *error = "cannot create " + staging + ": " + Errno(errno);
+      return SpoolStatus::kIo;
+    }
+    const std::string file = staging + "/" + kOwnerLockFile;
+    HeldLock lock;
+    lock.file_fd = OpenLockDescriptor(
+        file.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    const int fd = lock.file_fd;
+    if (fd < 0 || ::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+      const int failure = errno;
+      CloseHeldLock(&lock);
+      ::unlink(file.c_str());
+      ::rmdir(staging.c_str());
+      if (error) *error = "cannot lock " + file + ": " + Errno(failure);
+      return SpoolStatus::kIo;
+    }
+    // Nobody else knows the staging copy yet, so its own lock is free.
+    if (LockDirectory(staging, &lock, error) != SpoolStatus::kOk) {
+      CloseHeldLock(&lock);
+      ::unlink(file.c_str());
+      ::rmdir(staging.c_str());
+      return SpoolStatus::kIo;
+    }
+    WriteOwnerRecord(fd);
+    ::fsync(fd);
+    FsyncDir(staging, nullptr);
+    // A rename that refuses an existing target: plain rename() silently
+    // replaces an empty directory.
+#if defined(RENAME_NOREPLACE)
+    const int renamed = ::renameat2(AT_FDCWD, staging.c_str(), AT_FDCWD,
+                                    dir.c_str(), RENAME_NOREPLACE);
+#elif defined(__APPLE__) && defined(RENAME_EXCL)
+    const int renamed =
+        ::renamex_np(staging.c_str(), dir.c_str(), RENAME_EXCL);
+#else
+    // Neither: refuse a target that exists before renaming. The window
+    // left is between the check and the rename, and only another claim of
+    // the same fresh incarnation could fall into it.
+    int renamed = -1;
+    if (::access(dir.c_str(), F_OK) == 0) {
+      errno = EEXIST;
+    } else {
+      renamed = ::rename(staging.c_str(), dir.c_str());
+    }
+#endif
+    if (renamed != 0) {
+      const int failure = errno;
+      CloseHeldLock(&lock);
+      ::unlink(file.c_str());
+      ::rmdir(staging.c_str());
+      if (failure == EEXIST || failure == ENOTEMPTY) {
+        return LockInPlace(dir, "", out, error);
+      }
+      if (error) {
+        *error = "cannot create spool directory " + dir + ": " +
+                 Errno(failure);
+      }
+      return SpoolStatus::kIo;
+    }
+    FsyncDir(parent, nullptr);
+    *out = lock;  // the directory's lock went with the rename
+    return SpoolStatus::kOk;
+  }
+  if (error) *error = "cannot create spool directory " + dir;
+  return SpoolStatus::kIo;
+}
+
+}  // namespace
+
+void SpoolOwnerLock::Hold(int fd, int dir_fd, std::string dir) {
+  fd_ = fd;
+  dir_fd_ = dir_fd;
+  dir_ = std::move(dir);
+  generation_ = g_fork_generation.load(std::memory_order_relaxed);
+}
+
+bool SpoolOwnerLock::held() const {
+  return fd_ >= 0 &&
+         generation_ == g_fork_generation.load(std::memory_order_relaxed);
+}
+
+SpoolOwnerLock::~SpoolOwnerLock() { Release(); }
+
+SpoolOwnerLock::SpoolOwnerLock(SpoolOwnerLock&& other) noexcept {
+  if (other.held()) {
+    fd_ = other.fd_;
+    dir_fd_ = other.dir_fd_;
+    dir_ = std::move(other.dir_);
+    generation_ = other.generation_;
+  }
+  other.fd_ = -1;
+  other.dir_fd_ = -1;
+  other.dir_.clear();
+}
+
+SpoolOwnerLock& SpoolOwnerLock::operator=(SpoolOwnerLock&& other) noexcept {
+  if (this != &other) {
+    Release();
+    if (other.held()) {
+      fd_ = other.fd_;
+      dir_fd_ = other.dir_fd_;
+      dir_ = std::move(other.dir_);
+      generation_ = other.generation_;
+    }
+    other.fd_ = -1;
+    other.dir_fd_ = -1;
+    other.dir_.clear();
+  }
+  return *this;
+}
+
+void SpoolOwnerLock::Release() {
+  // Each untracked and closed in one step (CloseLockDescriptor). In a
+  // forked child the fork handler closed them already, and their numbers
+  // may be other files' by now: nothing to close.
+  if (held()) {
+    CloseLockDescriptor(dir_fd_);
+    CloseLockDescriptor(fd_);
+  }
+  fd_ = -1;
+  dir_fd_ = -1;
+  dir_.clear();
+}
+
+SpoolStatus SpoolOwnerLock::Acquire(const std::string& dir,
+                                    bool allow_shared_filesystem,
+                                    SpoolOwnerLock* out, std::string* error) {
+  out->Release();
+  if (dir.empty()) {
+    if (error) *error = "spool directory must not be empty";
+    return SpoolStatus::kBadArgument;
+  }
+  const std::string canonical = CanonicalPath(dir, error);
+  if (canonical.empty()) return SpoolStatus::kIo;
+  std::error_code ec;
+  const bool exists = fs::is_directory(canonical, ec);
+  if (!exists && fs::exists(canonical, ec)) {
+    if (error) *error = "spool directory " + canonical + " is not a directory";
+    return SpoolStatus::kBadArgument;
+  }
+  const std::string parent = fs::path(canonical).parent_path().string();
+  if (!exists) {
+    fs::create_directories(parent, ec);
+    if (ec) {
+      if (error) *error = "cannot create " + parent + ": " + ec.message();
+      return SpoolStatus::kIo;
+    }
+  }
+  SpoolStatus status =
+      CheckNodeLocal(exists ? canonical : parent, allow_shared_filesystem,
+                     error);
+  if (status != SpoolStatus::kOk) return status;
+  const std::string lock_file = canonical + "/" + kOwnerLockFile;
+  const bool had_lock_file = exists && fs::exists(lock_file, ec);
+  HeldLock lock;
+  status = exists ? LockInPlace(canonical, "", &lock, error)
+                  : CreateLocked(canonical, &lock, error);
+  if (status != SpoolStatus::kOk) return status;
+  out->Hold(lock.file_fd, lock.dir_fd, canonical);
+  // Only now, with this lock published: see CheckNotNested.
+  status = CheckNotNested(canonical, error);
+  if (status != SpoolStatus::kOk) {
+    // Leave nothing of this take behind: the directory it created (while
+    // it is still empty), or the lock file it added to one that existed.
+    if (!exists) {
+      std::string ignored;
+      out->ReleaseAndRemoveIfEmpty(&ignored);
+    } else {
+      if (!had_lock_file) ::unlink(lock_file.c_str());
+      out->Release();
+    }
+    return status;
+  }
+  return SpoolStatus::kOk;
+}
+
+SpoolStatus SpoolOwnerLock::TryAdopt(const std::string& dir,
+                                     SpoolOwnerLock* out,
+                                     std::string* error) {
+  out->Release();
+  char resolved[4096];
+  if (::realpath(dir.c_str(), resolved) == nullptr ||
+      !fs::is_directory(resolved)) {
+    if (error) *error = "no spool directory to adopt at " + dir;
+    return SpoolStatus::kBadArgument;
+  }
+  HeldLock lock;
+  const SpoolStatus status =
+      LockInPlace(resolved, kAdoptingRole, &lock, error);
+  if (status != SpoolStatus::kOk) return status;
+  out->Hold(lock.file_fd, lock.dir_fd, resolved);
+  return SpoolStatus::kOk;
+}
+
+bool SpoolOwnerLock::MarkBlocked(const std::string& reason) {
+  if (!held()) return false;
+  WriteOwnerRecord(fd_, kBlockedRole + (reason.empty() ? "blocked" : reason));
+  ::fsync(fd_);
+  return true;
+}
+
+bool SpoolOwnerLock::ReleaseAndRemoveIfEmpty(std::string* error) {
+  if (!held()) return false;
+  const std::string dir = dir_;
+  const fs::path lock_file = fs::path(dir) / kOwnerLockFile;
+  std::vector<fs::path> subdirectories;
+  std::error_code ec;
+  for (auto it = fs::recursive_directory_iterator(dir, ec);
+       !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+    std::error_code type_ec;
+    if (it->is_directory(type_ec) && !it->is_symlink(type_ec)) {
+      subdirectories.push_back(it->path());
+    } else if (it->path() != lock_file) {
+      Release();  // something is left: the directory stays as it is
+      return false;
+    }
+  }
+  if (ec) {
+    if (error) *error = "cannot list " + dir + ": " + ec.message();
+    Release();
+    return false;
+  }
+  // Deepest first, so each is empty when its turn comes.
+  std::sort(subdirectories.begin(), subdirectories.end(),
+            [](const fs::path& a, const fs::path& b) {
+              return a.string().size() > b.string().size();
+            });
+  for (const fs::path& subdirectory : subdirectories) {
+    ::rmdir(subdirectory.c_str());
+  }
+  // Unlinked while held: a process that opens the file from here on creates
+  // a new one (and the rmdir below then fails, leaving it the directory); one
+  // that opened the old file first finds, once it locks it, that the file
+  // is no longer at the path (IsFileAt), and lets it go.
+  ::unlink(lock_file.c_str());
+  const bool removed = ::rmdir(dir.c_str()) == 0;
+  if (!removed && error) {
+    *error = "cannot remove " + dir + ": " + Errno(errno);
+  }
+  if (removed) FsyncParent(dir);
+  Release();
+  return removed;
+}
+
+std::string SpoolCatalogKey(const SpoolDestination& destination) {
+  const std::string text =
+      destination.database + "/" + destination.table_prefix + "/" +
+      destination.store_id + "\nclickhouse " + destination.clickhouse_host +
+      ":" + std::to_string(destination.clickhouse_port) + "\ns3 " +
+      destination.s3_endpoint + "/" + destination.s3_bucket;
+  unsigned char digest[SHA256_DIGEST_LENGTH];
+  SHA256(reinterpret_cast<const unsigned char*>(text.data()), text.size(),
+         digest);
+  static const char* kHex = "0123456789abcdef";
+  std::string out;
+  for (int i = 0; i < 6; ++i) {
+    out.push_back(kHex[digest[i] >> 4]);
+    out.push_back(kHex[digest[i] & 0xF]);
+  }
+  return out;
+}
+
+namespace {
+bool IsLowerHex(const std::string& text, size_t size) {
+  return text.size() == size &&
+         std::all_of(text.begin(), text.end(), [](char c) {
+           return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+         });
+}
+}  // namespace
+
+bool IsSpoolCatalogKey(const std::string& name) { return IsLowerHex(name, 12); }
+
+std::string SpoolRankDirectoryName(uint64_t producer_rank,
+                                   const std::string& incarnation) {
+  return "r" + std::to_string(producer_rank) + "-" + incarnation;
+}
+
+bool ParseSpoolRankDirectoryName(const std::string& name,
+                                 uint64_t* producer_rank,
+                                 std::string* incarnation) {
+  if (name.size() < 4 || name[0] != 'r') return false;
+  const size_t dash = name.find('-');
+  if (dash == std::string::npos || dash < 2) return false;
+  const std::string digits = name.substr(1, dash - 1);
+  if (digits.size() > 19 || (digits.size() > 1 && digits[0] == '0') ||
+      !std::all_of(digits.begin(), digits.end(),
+                   [](char c) { return c >= '0' && c <= '9'; })) {
+    return false;
+  }
+  const std::string tail = name.substr(dash + 1);
+  if (!IsLowerHex(tail, 8)) return false;
+  *producer_rank = std::strtoull(digits.c_str(), nullptr, 10);
+  *incarnation = tail;
+  return true;
+}
+
+std::string NewSpoolIncarnation() {
+  std::random_device random;
+  char out[16];
+  std::snprintf(out, sizeof(out), "%08x", static_cast<unsigned>(random()));
+  return out;
+}
+
+std::string SpoolRankDirectory(const std::string& base,
+                               const SpoolDestination& destination,
+                               uint64_t producer_rank,
+                               const std::string& incarnation) {
+  std::string root = base;
+  while (root.size() > 1 && root.back() == '/') root.pop_back();
+  return root + "/" + SpoolCatalogKey(destination) + "/" +
+         SpoolRankDirectoryName(producer_rank, incarnation);
+}
 
 SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
   if (config.max_bytes == 0) {
     if (error) *error = "max_bytes must be positive";
     return SpoolStatus::kBadArgument;
   }
+  if (config.root.empty()) {
+    if (error) *error = "spool root must not be empty";
+    return SpoolStatus::kBadArgument;
+  }
+  // A re-opened object gives up the directory it owned first.
+  out->owner_lock_.Release();
   std::error_code ec;
+  if (config.owner_lock == OwnerLock::kTake) {
+    // Before anything reads the directory: the accounting walk below, and
+    // above all Recover(), belong to its one owner. Creates the root.
+    const SpoolStatus locked = SpoolOwnerLock::Acquire(
+        config.root, config.allow_shared_filesystem, &out->owner_lock_,
+        error);
+    if (locked != SpoolStatus::kOk) return locked;
+  } else {
+    // The caller took the lock, so the directory and its lock file exist.
+    char held[4096];
+    SpoolOwner owner;
+    if (::realpath(config.root.c_str(), held) == nullptr ||
+        !ReadSpoolOwner(held, &owner)) {
+      if (error) {
+        *error = "spool owner_lock=held_by_caller, but nothing holds " +
+                 config.root + "/" + kOwnerLockFile +
+                 ": take a SpoolOwnerLock on the directory first, or open "
+                 "it with owner_lock=take";
+      }
+      return SpoolStatus::kBadArgument;
+    }
+    // Held, but by THIS process? "Someone holds it" passes exactly when
+    // another live process owns the directory, and this Spool's Recover
+    // would then delete that owner's in-flight .open files.
+    if (!SpoolOwnedByThisProcess(held)) {
+      if (error) {
+        *error = "spool owner_lock=held_by_caller, but this process does "
+                 "not hold the owner lock of " + std::string(held) + ": " +
+                 OwnedMessage(held, owner) + ". held_by_caller is for a "
+                 "second Spool in the process that holds the directory's "
+                 "SpoolOwnerLock";
+      }
+      return SpoolStatus::kOwned;
+    }
+    const SpoolStatus local =
+        CheckNodeLocal(held, config.allow_shared_filesystem, error);
+    if (local != SpoolStatus::kOk) return local;
+  }
   fs::create_directories(config.root, ec);
   if (ec) {
     if (error) *error = "cannot create spool root: " + ec.message();
@@ -260,6 +1304,8 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
   }
   out->root_ = resolved;
   out->max_bytes_ = config.max_bytes;
+  out->charge_dead_siblings_ = config.charge_dead_siblings;
+  out->sibling_bytes_ = 0;
   out->committed_bytes_ = 0;
   out->committed_entries_ = 0;
   out->reserved_bytes_ = 0;
@@ -272,9 +1318,13 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
   // files plus stale .open files both count until Recover() runs, and only
   // the ready PATHS are remembered (_accounted_ready = ready_bytes), so a
   // later retry of one of them is recognised as already counted.
-  for (const auto& entry :
-       fs::recursive_directory_iterator(out->root_, ec)) {
-    if (ec) break;
+  for (auto it = fs::recursive_directory_iterator(out->root_, ec);
+       it != fs::recursive_directory_iterator(); ++it) {
+    if (AtSkippedDirectory(it)) {
+      it.disable_recursion_pending();
+      continue;
+    }
+    const fs::directory_entry& entry = *it;
     if (!entry.is_regular_file()) continue;
     const std::string name = entry.path().filename().string();
     const bool is_ready = HasSuffix(name, kReadySuffix);
@@ -287,7 +1337,73 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
     }
   }
   out->peak_bytes_ = out->committed_bytes_;
+  if (out->charge_dead_siblings_) {
+    out->sibling_bytes_ = out->ChargedSiblingBytes();
+  }
   return SpoolStatus::kOk;
+}
+
+namespace {
+// Whether this process could take `dir`'s lock and empty it: write its lock
+// file (or create one), and unlink in it.
+bool CouldAdopt(const std::string& dir) {
+  const std::string file = dir + "/" + kOwnerLockFile;
+  if (::access(dir.c_str(), W_OK | X_OK) != 0) return false;
+  return ::access(file.c_str(), F_OK) != 0 ||
+         ::access(file.c_str(), R_OK | W_OK) == 0;
+}
+}  // namespace
+
+uint64_t Spool::ChargedSiblingBytes() const {
+  const fs::path own(root_);
+  uint64_t bytes = 0;
+  std::error_code ec;
+  for (fs::directory_iterator it(own.parent_path(), ec), end;
+       !ec && it != end; it.increment(ec)) {
+    uint64_t rank = 0;
+    std::string incarnation;
+    std::error_code type_ec;
+    if (it->path() == own || it->is_symlink(type_ec) ||
+        !it->is_directory(type_ec) ||
+        !ParseSpoolRankDirectoryName(it->path().filename().string(), &rank,
+                                     &incarnation)) {
+      continue;
+    }
+    const std::string sibling = it->path().string();
+    // Only what adoption can drain: a dead directory, or one this process's
+    // adoption holds.
+    SpoolOwner owner;
+    if (ReadSpoolOwner(sibling, &owner)) {
+      // Another live process's directory is its own budget. One this
+      // process holds for its own writing -- an earlier engine's claim,
+      // kept owned while its unsealed sink may still stage -- no adoption
+      // here drains (its service reads it as live), until the process
+      // exits and the next one on the node adopts it.
+      if (!owner.adopting || !SpoolOwnedByThisProcess(sibling)) continue;
+    } else if (!owner.blocked.empty() || !CouldAdopt(sibling)) {
+      // Dead, but left for good by an adopter that could never drain it
+      // (its lock file says why), or not one this process could take and
+      // empty at all -- another user's, say.
+      continue;
+    }
+    std::error_code walk_ec;
+    for (fs::recursive_directory_iterator walk(sibling, walk_ec), last;
+         !walk_ec && walk != last; walk.increment(walk_ec)) {
+      if (AtSkippedDirectory(walk)) {
+        walk.disable_recursion_pending();
+        continue;
+      }
+      std::error_code entry_ec;
+      if (!walk->is_regular_file(entry_ec)) continue;
+      const std::string name = walk->path().filename().string();
+      if (!HasSuffix(name, kReadySuffix) && !HasSuffix(name, kOpenSuffix)) {
+        continue;
+      }
+      const uint64_t size = walk->file_size(entry_ec);
+      if (!entry_ec) bytes += size;
+    }
+  }
+  return bytes;
 }
 
 bool Spool::AccountReadyLocked(const std::string& path,
@@ -330,9 +1446,13 @@ void Spool::ReconcileCommittedLocked() {
   uint64_t ready_count = 0;
   std::unordered_map<std::string, uint64_t> seen_ready;
   std::error_code walk_ec;
-  for (const auto& entry :
-       fs::recursive_directory_iterator(root_, walk_ec)) {
-    if (walk_ec) break;
+  for (auto it = fs::recursive_directory_iterator(root_, walk_ec);
+       it != fs::recursive_directory_iterator(); ++it) {
+    if (AtSkippedDirectory(it)) {
+      it.disable_recursion_pending();
+      continue;
+    }
+    const fs::directory_entry& entry = *it;
     if (!entry.is_regular_file()) continue;
     const std::string name = entry.path().filename().string();
     if (HasSuffix(name, kReadySuffix)) {
@@ -352,9 +1472,26 @@ void Spool::ReconcileCommittedLocked() {
   // The path ledger is rebuilt with the aggregate it describes, so the two
   // never disagree about which files the committed account holds.
   accounted_ready_ = std::move(seen_ready);
+  // And the dead siblings' charge with it, so what adoption has drained
+  // since is capacity again.
+  if (charge_dead_siblings_) sibling_bytes_ = ChargedSiblingBytes();
   // The scan can raise the committed total (files another object wrote), and
   // peak_bytes_ must never read below what the account holds right now.
   peak_bytes_ = std::max(peak_bytes_, committed_bytes_ + reserved_bytes_);
+}
+
+std::string Spool::FullMessage(uint64_t n) const {
+  std::string message =
+      "spool byte limit exceeded: " +
+      std::to_string(committed_bytes_ + reserved_bytes_ + sibling_bytes_ + n) +
+      " > " + std::to_string(max_bytes_);
+  if (sibling_bytes_ > 0) {
+    message += " (" + std::to_string(sibling_bytes_) +
+               " bytes of it in dead spool directories beside this one, "
+               "which this process's storage service adopts: the room "
+               "comes back as it drains them)";
+  }
+  return message;
 }
 
 void Spool::SetStageHookForTesting(std::function<void()> hook) {
@@ -435,14 +1572,12 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
           return SpoolStatus::kConflict;
         }
       }
-      if (committed_bytes_ + reserved_bytes_ + n > max_bytes_) {
+      if (committed_bytes_ + reserved_bytes_ + sibling_bytes_ + n >
+          max_bytes_) {
         ReconcileCommittedLocked();
-        if (committed_bytes_ + reserved_bytes_ + n > max_bytes_) {
-          if (error) {
-            *error = "spool byte limit exceeded: " +
-                     std::to_string(committed_bytes_ + reserved_bytes_ + n) +
-                     " > " + std::to_string(max_bytes_);
-          }
+        if (committed_bytes_ + reserved_bytes_ + sibling_bytes_ + n >
+            max_bytes_) {
+          if (error) *error = FullMessage(n);
           return SpoolStatus::kFull;
         }
       }
@@ -505,12 +1640,9 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
     // ready file -- a state Python cannot reach at all, since it holds its
     // lock across the whole of stage()), while a serial retry under a lowered
     // cap is admitted the way the reference admits it.
-    if (reserved_bytes_ > 0 && committed_bytes_ + reserved_bytes_ > max_bytes_) {
-      if (error) {
-        *error = "spool byte limit exceeded: " +
-                 std::to_string(committed_bytes_ + reserved_bytes_) + " > " +
-                 std::to_string(max_bytes_);
-      }
+    if (reserved_bytes_ > 0 &&
+        committed_bytes_ + reserved_bytes_ + sibling_bytes_ > max_bytes_) {
+      if (error) *error = FullMessage(0);
       return SpoolStatus::kFull;
     }
     if (AccountReadyLocked(ready, n)) ++generation_;
@@ -625,6 +1757,29 @@ SpoolStatus Spool::Recover(std::vector<StagedPack>* out, std::string* error) {
   return Scan(out, true, error);
 }
 
+SpoolStatus Spool::BeginRecovery(SpoolRecovery* recovery, std::string* error) {
+  *recovery = SpoolRecovery{};
+  std::lock_guard<std::mutex> lock(mutex_);
+  uint64_t open_bytes = 0;  // stays 0: every .open file is swept
+  ListReadyLocked(true, &recovery->listed, &open_bytes);
+  (void)error;
+  return SpoolStatus::kOk;
+}
+
+bool Spool::ContinueRecovery(SpoolRecovery* recovery) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (recovery->next < recovery->listed.size()) {
+    StagedPack staged;
+    if (ValidateReadyLocked(recovery->listed[recovery->next], &staged)) {
+      recovery->valid.push_back(std::move(staged));
+    }
+    ++recovery->next;
+  }
+  if (recovery->next < recovery->listed.size()) return false;
+  CommitListingLocked(recovery->valid, 0);
+  return true;
+}
+
 SpoolStatus Spool::ListPending(std::vector<StagedPack>* out, std::string* error) {
   return Scan(out, false, error);
 }
@@ -640,13 +1795,36 @@ SpoolStatus Spool::Scan(std::vector<StagedPack>* out, bool discard_open_files,
   out->clear();
   if (cut) *cut = false;
   std::lock_guard<std::mutex> lock(mutex_);
-  std::error_code ec;
   std::vector<std::string> readies;
-  uint64_t bytes = 0;
-  std::unordered_map<std::string, uint64_t> seen_ready;
-  for (const auto& entry :
-       fs::recursive_directory_iterator(root_, ec)) {
-    if (ec) break;
+  uint64_t open_bytes = 0;
+  ListReadyLocked(discard_open_files, &readies, &open_bytes);
+  for (const std::string& path : readies) {
+    if (cancel != nullptr && cancel->cancelled()) {
+      // Before the next pack's hash. The account below is rebuilt from a
+      // whole listing only; quarantines already made stand.
+      out->clear();
+      if (cut) *cut = true;
+      return SpoolStatus::kOk;
+    }
+    StagedPack staged;
+    if (ValidateReadyLocked(path, &staged)) out->push_back(std::move(staged));
+  }
+  CommitListingLocked(*out, open_bytes);
+  (void)error;
+  return SpoolStatus::kOk;
+}
+
+void Spool::ListReadyLocked(bool discard_open_files,
+                            std::vector<std::string>* readies,
+                            uint64_t* open_bytes) {
+  std::error_code ec;
+  for (auto it = fs::recursive_directory_iterator(root_, ec);
+       it != fs::recursive_directory_iterator(); ++it) {
+    if (AtSkippedDirectory(it)) {
+      it.disable_recursion_pending();
+      continue;
+    }
+    const fs::directory_entry& entry = *it;
     if (!entry.is_regular_file()) continue;
     const std::string path = entry.path().string();
     const std::string name = entry.path().filename().string();
@@ -658,65 +1836,65 @@ SpoolStatus Spool::Scan(std::vector<StagedPack>* out, bool discard_open_files,
         FsyncDir(entry.path().parent_path().string(), nullptr);
       } else {
         const uint64_t size = entry.file_size(ec);
-        if (!ec) bytes += size;
+        if (!ec) *open_bytes += size;
         ec.clear();  // Another writer may have just committed its temp.
       }
       continue;
     }
     if (HasSuffix(name, kReadySuffix)) {
-      readies.push_back(path);
+      readies->push_back(path);
     }
   }
-  std::sort(readies.begin(), readies.end());
-  for (const std::string& path : readies) {
-    if (cancel != nullptr && cancel->cancelled()) {
-      // Before the next pack's hash. The account below is rebuilt from a
-      // whole listing only; quarantines already made stand.
-      out->clear();
-      if (cut) *cut = true;
-      return SpoolStatus::kOk;
-    }
-    const std::string name = fs::path(path).filename().string();
-    std::string id, sum;
-    uint64_t created = 0, records = 0;
-    const uint64_t size = fs::file_size(path, ec);
-    if (!ParseReadyName(name, &id, &created, &records, &sum) || ec ||
-        Sha256HexFile(path, nullptr) != sum) {
-      // Quarantine: keep the bytes, drop the .ready suffix.
-      const std::string target = path.substr(0, path.size() - 6) +
-                                 ".quarantined";
-      ::rename(path.c_str(), target.c_str());
-      FsyncDir(fs::path(path).parent_path().string(), nullptr);
-      ++generation_;
-      continue;
-    }
-    const std::string rel = fs::relative(path, root_, ec).string();
-    const size_t slash = rel.rfind('/');
-    const std::string parent = (slash == std::string::npos) ? "" : rel.substr(0, slash);
-    StagedPack staged;
-    staged.pack_id = id;
-    staged.created_at_ns = created;
-    staged.record_count = records;
-    staged.checksum = sum;
-    staged.object_key = (parent.empty() ? "" : parent + "/") + id + ".dmi-pack";
-    staged.path = path;
-    staged.object_bytes = size;
-    out->push_back(std::move(staged));
-    bytes += size;
-    seen_ready.emplace(path, size);
+  std::sort(readies->begin(), readies->end());
+}
+
+bool Spool::ValidateReadyLocked(const std::string& path, StagedPack* out) {
+  std::error_code ec;
+  const std::string name = fs::path(path).filename().string();
+  std::string id, sum;
+  uint64_t created = 0, records = 0;
+  const uint64_t size = fs::file_size(path, ec);
+  if (!ParseReadyName(name, &id, &created, &records, &sum) || ec ||
+      Sha256HexFile(path, nullptr) != sum) {
+    // Quarantine: keep the bytes, drop the .ready suffix.
+    const std::string target = path.substr(0, path.size() - 6) +
+                               ".quarantined";
+    ::rename(path.c_str(), target.c_str());
+    FsyncDir(fs::path(path).parent_path().string(), nullptr);
+    ++generation_;
+    return false;
   }
+  const std::string rel = fs::relative(path, root_, ec).string();
+  const size_t slash = rel.rfind('/');
+  const std::string parent = (slash == std::string::npos) ? "" : rel.substr(0, slash);
+  out->pack_id = id;
+  out->created_at_ns = created;
+  out->record_count = records;
+  out->checksum = sum;
+  out->object_key = (parent.empty() ? "" : parent + "/") + id + ".dmi-pack";
+  out->path = path;
+  out->object_bytes = size;
+  return true;
+}
+
+void Spool::CommitListingLocked(const std::vector<StagedPack>& valid,
+                                uint64_t open_bytes) {
   // Recovery rebuilds the committed account only; a stage in flight on
   // another thread keeps its reservation. The path ledger is rebuilt with
   // it (_commit_recovery_locked does the same), so the surviving entries are
   // exactly the ones a later retry will recognise as already counted, and
   // the quarantined ones are simply absent.
+  uint64_t bytes = open_bytes;
+  std::unordered_map<std::string, uint64_t> seen_ready;
+  for (const StagedPack& staged : valid) {
+    bytes += staged.object_bytes;
+    seen_ready.emplace(staged.path, staged.object_bytes);
+  }
   committed_bytes_ = bytes;
-  committed_entries_ = out->size();
+  committed_entries_ = valid.size();
   accounted_ready_ = std::move(seen_ready);
   peak_bytes_ = std::max(peak_bytes_, committed_bytes_ + reserved_bytes_);
   ++generation_;
-  (void)error;
-  return SpoolStatus::kOk;
 }
 
 SpoolStatus Spool::Remove(const StagedPack& staged, std::string* error) {
@@ -792,6 +1970,7 @@ SpoolSnapshot Spool::Snapshot() const {
   snapshot.bytes = committed_bytes_ + reserved_bytes_;
   snapshot.peak_bytes = peak_bytes_;
   snapshot.max_bytes = max_bytes_;
+  snapshot.sibling_bytes = sibling_bytes_;
   return snapshot;
 }
 

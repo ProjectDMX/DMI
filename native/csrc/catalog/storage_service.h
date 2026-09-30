@@ -23,6 +23,14 @@
 //     already committed, and indexes the rest. It runs at start(), and
 //     periodically when reconcile_interval_ns is non-zero.
 //
+// One owner per spool directory. The service's spool is opened under the
+// directory's owner lock (store/spool.h), so a second process on it is
+// refused at construction, naming the holder. With adopt_sibling_spools
+// the service's directory is one rank directory of the plan's section 2.3
+// layout, and once started its loop adopts the siblings whose owner has
+// died: a crashed process's spool is recovered by the next process on the
+// node for the same catalog, whatever run it belongs to.
+//
 // Deployment shape: the service holds the catalog's single publisher lease, so
 // run ONE service per (database, table_prefix). A second one waits up to
 // start_lease_wait_ns for the lease at start(), then fails naming the holder.
@@ -85,10 +93,13 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <exception>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -109,6 +120,74 @@ struct StorageServiceConfig {
   // sink writes.
   std::string spool_root;
   uint64_t spool_max_bytes = 1ull << 40;
+  // The spool directory's owner lock (store/spool.h). kTake owns it for the
+  // service's life, and refuses a directory another process owns. A process
+  // that also runs the sink on it -- the engine -- holds one SpoolOwnerLock
+  // and opens both with kHeldByCaller: two takes in one process refuse each
+  // other.
+  dmi_store::OwnerLock spool_owner_lock = dmi_store::OwnerLock::kTake;
+  bool spool_allow_shared_filesystem = false;
+  // Adopt the spools of dead processes bound for this catalog. spool_root
+  // must then be a rank directory of the plan's section 2.3 layout,
+  //   <base>/<catalog_key>/r<producer_rank>-<incarnation>/
+  // under THIS catalog's key (SpoolCatalogKey of clickhouse.host and
+  // .port, writer.database and .table_prefix, s3.endpoint and .bucket, and
+  // uploader.store_id), or construction throws.
+  // The loop's cycles adopt, starting with the first, which start() kicks
+  // off once it holds the lease and has swept its own directory; start()
+  // itself uploads nothing of a dead backlog, and neither does flush(). A
+  // cycle probes the owner lock of every sibling rank directory, then works
+  // through those whose owner is gone: it takes one's lock and sweeps its
+  // .open files, validates its .ready packs once, a pack a step -- which
+  // hashes every byte of it -- and uploads and indexes them a round at a
+  // time -- a chunk of the service's own upload path, at most
+  // uploader.max_workers and indexer.max_packs packs, each indexed before
+  // the next is uploaded -- under the cycle's upload rules, the lease and
+  // nothing owed to the catalog checked before every round, until
+  // adoption_slice_ns has passed, a stop is requested, or a flush() is
+  // running -- a flush waits for the step the adoption is in (one round,
+  // one pack's validation, or one sibling's lock and sweep), not for the
+  // rest of a slice or of a listing. Its uploads and index reads go through
+  // the service's own clients and Cancellations, and its listing stops
+  // between packs on the uploads' cancel, so stop() cuts an adoption as it
+  // cuts the service's own work: what it did not upload stays in the dead
+  // spool, which is let go of and never removed while a pack of it is
+  // left, for the next process on the node. The sibling's lock, its
+  // listing and its remaining packs are kept between cycles, so a large
+  // backlog is hashed once, not on every cycle, and neither a flush() nor
+  // the service's own uploads wait behind all of it. A drained sibling is
+  // removed once nothing but its lock file is left. An upload that failed
+  // stays in the dead spool and is retried by
+  // a later cycle, after the backoff -- unless no retry by this service can
+  // ever succeed (dmi_store::UploadFailure::retryable: a pack over
+  // uploader.max_in_flight_bytes, a different object at its key, bytes that
+  // no longer match), or the sibling cannot be locked or opened at all.
+  // Such a sibling is blocked: once the rest of its packs are up it is left
+  // in place, with its lock let go, for a process that can adopt it (or a
+  // person); it is reported once (last_error, snapshot blocked_siblings),
+  // and in its lock file's record (dmi_store::SpoolOwner::blocked), which
+  // keeps the sinks on the node from charging it against their budgets;
+  // never retried or re-hashed by this service, and not owed. So is one
+  // drained of packs that still holds other files. flush() covers this
+  // process's records: a sibling still to adopt does not keep it from
+  // reporting drained, though adopted packs uploaded and not yet indexed
+  // are owed like the service's own. Live siblings -- another rank or job on this
+  // node, a predecessor still closing -- are left alone, and are not owed.
+  bool adopt_sibling_spools = false;
+  // While a pass found a live sibling, the loop passes over the siblings
+  // again this often, so one whose owner dies later -- a predecessor that
+  // was still inside close() when this service started, a rank that
+  // crashes while this one runs -- is adopted then, not at the next
+  // restart on the node. A live sibling costs one non-blocking lock probe
+  // per pass. 0 never looks again after the first pass.
+  uint64_t adoption_recheck_interval_ns = 30'000'000'000ull;
+  // How long one cycle may spend adopting before it lets go of the cycle --
+  // to the service's own uploads, stop() -- and carries on in the next.
+  // Checked between rounds and between the packs a listing validates, so a
+  // cycle can outrun it by one round, or one pack's hash. A flush() does
+  // not wait for it: a cycle that has made one step of adoption lets go of
+  // the cycle at the next one while a flush is running.
+  uint64_t adoption_slice_ns = 1'000'000'000ull;
 
   dmi_store::S3Config s3;
   dmi_store::UploaderConfig uploader;  // uploader.store_id names the store
@@ -168,8 +247,9 @@ struct StorageServiceConfig {
   // past its row: until it resumes and next checks, or -- after a system
   // suspend, which the steady clock the deadline runs on does not count --
   // until a renewal or publish is refused. Two on different (database,
-  // table_prefix) pairs each hold a lease and upload freely. The spool
-  // itself is not locked; one process per spool is the caller's job.
+  // table_prefix) pairs each hold a lease and upload freely. The spool's
+  // owner lock (spool_owner_lock) is what keeps a second process off the
+  // directory itself: it is refused at construction, before any of this.
   bool sweep_spool_on_start = true;
   bool reconcile_on_start = true;
 };
@@ -195,6 +275,17 @@ struct StorageServiceSnapshot {
   uint64_t swept_on_start = 0;  // ready packs Recover() found at start
   uint64_t pending_index = 0;   // uploaded packs awaiting a retried index
   uint64_t rejected_packs = 0;  // set aside: cannot be indexed (see flush)
+  // adopt_sibling_spools: dead siblings drained, the ready packs of theirs
+  // that were uploaded, and whether one is still to adopt (or a look at
+  // the siblings is due).
+  uint64_t adopted_spools = 0;
+  uint64_t adopted_packs = 0;
+  bool adoption_owed = false;
+  // Siblings whose owner was alive at the last adoption pass.
+  uint64_t live_siblings = 0;
+  // Dead siblings this service will not adopt, left in place (see
+  // adopt_sibling_spools), by directory.
+  std::vector<std::string> blocked_siblings;
   // A foreign lease outlived 2 x TTL: the service stopped for good.
   bool failed = false;
   // "none" before start, "held", "quarantined" (an unknown outcome set the
@@ -227,7 +318,9 @@ class CaptureStorageService {
   // start_lease_wait_ns for another holder's to expire, or for a claim that
   // timed out to go through -- past it, once, to wait out the quarantine
   // such a claim left), sweep the spool, reconcile once, then start the
-  // background cycle. The lease renews from the moment it is taken.
+  // background cycle -- whose first cycle, at once, starts adopting dead
+  // siblings (adopt_sibling_spools). The lease renews from the moment it is
+  // taken.
   // Throws if the lease is still held by another publisher when the wait
   // ends, or its claim still times out. A lease lost while the reconcile
   // runs does not fail start(): the loop takes a fresh one, as it would
@@ -258,6 +351,11 @@ class CaptureStorageService {
   // request of at most 5 s that nothing cuts -- past one request timeout
   // when that is under about 6 s. At zero it still runs one cycle, which
   // indexes one batch of what earlier cycles owe and uploads nothing.
+  // Its cycles adopt nothing, and a dead sibling still to adopt does not
+  // keep it from returning true (adopt_sibling_spools); a loop cycle that
+  // is adopting when it is called lets go of the cycle after the step it
+  // is in -- one round of a dead spool's uploads, one of its packs
+  // validated, or one sibling's lock and sweep.
   // Throws, once, if packs were set aside since the last flush: they are in
   // the object store but can never reach the catalog.
   bool flush(double timeout_s);
@@ -274,7 +372,8 @@ class CaptureStorageService {
   // multipart upload it cut (one attempt, 5 s at most), and the lease
   // release, each catalog request bounded by the client's request timeout
   // (under the lease, by the lease deadline); the lease renews until the
-  // loop is done.
+  // loop is done. An adoption in flight is cut the same way, its dead
+  // sibling let go of with what it still holds (adopt_sibling_spools).
   void stop();
 
   StorageServiceSnapshot snapshot() const;
@@ -290,6 +389,16 @@ class CaptureStorageService {
     // A cancel left packs in the spool: neither drained nor a failure, so
     // it moves the backoff neither way.
     bool cut_short = false;
+  };
+
+  // One chunk of the upload path, the service's own spool's or a dead
+  // sibling's (upload_chunk): the batch, positional as UploadStaged returns
+  // it, what went up and is to be indexed, and how many were not.
+  struct ChunkOutcome {
+    dmi_store::UploadBatchResult batch;
+    std::vector<PackRefData> to_index;
+    size_t failed = 0;     // still staged; counted in upload_failures
+    size_t cancelled = 0;  // still staged: a cancel cut them short
   };
 
   // Holds lease_mutex_ for a stretch of catalog work, and bounds every
@@ -308,16 +417,77 @@ class CaptureStorageService {
   // start() waits out like any holder's.
   class LeaseScope;
 
+  // The dead sibling being adopted (storage_service.cpp).
+  struct Adoption;
+
   void loop();
   // start()'s spool sweep and reconcile, with the lease held and the lease
   // thread renewing it. Requires cycle_mutex_.
   void sweep_and_reconcile_at_start();
+  // One cycle's share of adoption (see adopt_sibling_spools): looks at the
+  // siblings when that is due, then adopts a step at a time -- a sibling
+  // taken and swept, one of its packs validated, a round, a finish -- until
+  // the slice ends, a flush() is waiting (after one step at least), a stop
+  // is requested or the uploads' Cancellation is cancelled -- which also
+  // cuts a round in flight, and *cut_short then says so. Adds what its index
+  // passes left owed through a cancel to *deferred (index_bounded). False
+  // when an upload failed, so the cycle backs off. Requires cycle_mutex_.
+  // Only a lost lease propagates.
+  bool adopt_step(uint64_t deadline_ns, size_t* deferred, bool* cut_short);
+  // Probes every sibling rank directory's owner lock and queues the dead
+  // ones. False when the directory cannot be listed. Requires cycle_mutex_.
+  bool scan_siblings();
+  // Takes a queued sibling's lock, sweeps its .open files and lists its
+  // ready packs into adopting_, hashing none of them (adopt_step validates
+  // them, a pack a step); leaves adopting_ empty for a live or vanished
+  // one, and for one it cannot lock or open, which it blocks.
+  void begin_adoption(const std::string& directory);
+  // Uploads and indexes one round of adopting_'s packs, one chunk of the
+  // service's upload path; *cut when a cancel left some in the dead spool,
+  // back at the front of adopting_. False when an upload failed.
+  bool upload_adopted_round(uint64_t deadline_ns, size_t* deferred,
+                            bool* cut);
+  // adopting_ holds no pack any more: removes the directory, or leaves a
+  // blocked one.
+  void finish_adoption();
+  // Leaves a dead sibling in place for good, reporting why -- and, given
+  // its held lock, marking why in it (SpoolOwnerLock::MarkBlocked) before
+  // letting go of it.
+  void block_sibling(const std::string& directory, const std::string& reason,
+                     dmi_store::SpoolOwnerLock* lock = nullptr);
+  bool adoption_owed() const;  // requires cycle_mutex_
+  // Lets go of the sibling being adopted, and of those queued, leaving what
+  // is left of them for the next process on the node: at stop(), and once
+  // the service has latched. Requires cycle_mutex_.
+  void let_go_of_adoption();
+  bool stop_requested();
+  // Removes the staging copies (dmi_store::IsSpoolClaimStagingName) that
+  // claims killed before their rename left under the catalog key.
+  void clear_dead_claim_staging(
+      const std::vector<std::filesystem::path>& staging);
+  // Uploads one chunk -- packs a listing returned, in its order -- through
+  // `uploader`, the service's own or an adoption's over a dead spool, and
+  // books the outcome. The caller indexes to_index (index_or_owe) before it
+  // uploads another chunk, so at most one chunk is ever out of a spool and
+  // not yet in the catalog. Requires cycle_mutex_.
+  ChunkOutcome upload_chunk(dmi_store::SpoolUploader* uploader,
+                            std::vector<dmi_store::StagedPack> chunk);
+  // Indexes refs that are gone from their spool, keeping whatever does not
+  // index in pending_index_ -- the only record of it in-process. With no
+  // catalog, keeps them all. Returns how many of those a cancel or the
+  // deadline left owed (index_bounded). Only a lost lease propagates.
+  // Requires cycle_mutex_.
+  size_t index_or_owe(std::vector<PackRefData> refs, bool catalog,
+                      uint64_t deadline_ns);
   // Stops the lease thread and waits for it.
   void stop_lease_thread();
   // One cycle. A non-zero deadline_ns (steady ns) cancels its uploads at
   // that moment -- flush()'s -- and allow_reconcile false skips the
-  // periodic and the owed reconcile. Requires cycle_mutex_.
-  CycleOutcome run_cycle(uint64_t deadline_ns, bool allow_reconcile);
+  // periodic and the owed reconcile. `adopt`: the loop's cycles adopt dead
+  // siblings (adopt_sibling_spools), flush()'s do not. Requires
+  // cycle_mutex_.
+  CycleOutcome run_cycle(uint64_t deadline_ns, bool allow_reconcile,
+                         bool adopt);
   // Indexes refs in bounded batches, appending every ref that did not index
   // to *unindexed. Only a lost lease propagates; other failures are
   // recorded. A non-zero deadline_ns (steady ns) starts no batch past it
@@ -407,6 +577,19 @@ class CaptureStorageService {
   // The reconcile at start() lost the lease before it finished; the loop
   // runs one once it holds a lease again. Guarded by cycle_mutex_.
   bool reconcile_owed_ = false;
+  // Adoption's state, guarded by cycle_mutex_: whether a look at the
+  // siblings is due (from start() on), the dead ones the last look found,
+  // the one being adopted, whether the last look found a live one and when
+  // it ran (the loop looks again every adoption_recheck_interval_ns).
+  bool adoption_scan_owed_ = false;
+  std::deque<std::string> adoption_queue_;
+  std::unique_ptr<Adoption> adopting_;
+  std::set<std::string> blocked_siblings_;
+  bool live_siblings_ = false;
+  uint64_t last_adoption_scan_ns_ = 0;
+  // flush() calls in progress. A cycle adopting lets go of the cycle at
+  // its next step while one is, so a flush never waits out a slice.
+  std::atomic<int> flushes_in_progress_{0};
   int failure_streak_ = 0;  // consecutive failed cycles, for the backoff
   // steady ns at which the last cycle -- the loop's or a flush's -- ended;
   // 0 before the first. The loop waits its interval from it. Guarded by

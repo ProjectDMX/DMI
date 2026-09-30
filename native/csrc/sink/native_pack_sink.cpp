@@ -258,12 +258,16 @@ bool NativePackSink::flush_and_wait(Duration timeout) {
 }
 
 void NativePackSink::on_engine_release() noexcept {
+  sealed_on_release_.store(false, std::memory_order_release);
   if (release_flush_timeout_ == Duration::zero()) return;
   try {
     std::string error;
     const bool flushed = sink_->Flush(
         std::chrono::duration<double>(release_flush_timeout_).count(), &error);
-    if (flushed) return;
+    if (flushed) {
+      sealed_on_release_.store(true, std::memory_order_release);
+      return;
+    }
     // Once released, rethrow_if_failed refuses the sink as not attached,
     // and a timeout latches nothing: this line is what says what became of
     // the open pack (a failure also counts in the snapshot's failures).

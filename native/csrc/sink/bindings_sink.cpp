@@ -182,8 +182,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        uint64_t max_linger_ns, uint64_t spool_max_bytes,
                        const std::string& overload,
                        std::optional<double> admission_timeout_s,
-                       double release_flush_timeout_s) {
+                       double release_flush_timeout_s,
+                       const std::string& owner_lock,
+                       bool allow_shared_filesystem,
+                       bool charge_dead_siblings) {
              dmi_sink::SinkConfig config;
+             if (!dmi_store::ParseOwnerLock(owner_lock,
+                                            &config.spool_owner_lock)) {
+               throw py::value_error(
+                   "owner_lock must be 'take' or 'held_by_caller', got '" +
+                   owner_lock + "'");
+             }
+             config.spool_allow_shared_filesystem = allow_shared_filesystem;
+             config.spool_charge_dead_siblings = charge_dead_siblings;
              config.overload = ParseOverload(overload);
              config.admission_timeout_s =
                  ParseAdmissionTimeout(admission_timeout_s);
@@ -224,7 +235,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("release_flush_timeout_s") =
                std::chrono::duration<double>(
                    dmi_sink::NativePackSink::kDefaultReleaseFlushTimeout)
-                   .count())
+                   .count(),
+           // The spool directory's owner lock (store/spool.h): "take" owns
+           // it for the sink's life; "held_by_caller" when the caller holds
+           // a SpoolOwnerLock on it, as the engine does around its sink and
+           // storage service.
+           py::arg("owner_lock") = "take",
+           py::arg("allow_shared_filesystem") = false,
+           // spool_root is a rank directory of the spool layout, and the
+           // dead incarnations' packs beside it count against
+           // spool_max_bytes, as the engine's claimed directory does.
+           py::arg("charge_dead_siblings") = false)
       .def("attach",
            [](std::shared_ptr<dmi_sink::NativePackSink> self) {
              // Simulates engine ownership for tests (the real engine takes
@@ -278,6 +299,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           [](const dmi_sink::NativePackSink& self) {
             return std::string(OverloadName(self.sink().config().overload));
           })
+      // Released by its engine, and the release backstop's flush went
+      // through: nothing the sink holds can still reach the spool.
+      .def_property_readonly("sealed_on_release",
+                             &dmi_sink::NativePackSink::sealed_on_release)
       .def_property_readonly(
           "release_flush_timeout_s",
           [](const dmi_sink::NativePackSink& self) {

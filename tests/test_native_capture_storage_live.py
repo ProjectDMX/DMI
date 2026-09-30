@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import shutil
 import socket
 import subprocess
 import threading
@@ -113,12 +114,49 @@ def _storage_config(endpoint, prefix, **overrides):
     return NativeCaptureStorageConfig(**fields)
 
 
+# Every spool directory a test points a service at is owned by the harness
+# for the rest of the test: one SpoolOwnerLock held here, and each service
+# opens the directory with owner_lock="held_by_caller". That is the engine's
+# arrangement -- it holds the lock around its sink and its service -- and a
+# test often builds a second service on a directory the first still has
+# open; each taking the lock would refuse the others.
+#
+# The drivers are processes of their own, so they cannot open a directory
+# this process owns: held_by_caller is refused unless the opening process
+# holds the lock. They take it, as the plan has standalone callers do. The
+# sink driver stages into a scratch directory it owns, and _stage moves its
+# sealed packs into the spool, where a sink in this process would have
+# staged them; the store driver uploads from a spool before any service of
+# the test has opened it.
+_HARNESS_LOCKS: dict = {}
+
+
+@pytest.fixture(autouse=True)
+def _harness_spool_locks():
+    yield
+    for lock in _HARNESS_LOCKS.values():
+        lock.release()
+    _HARNESS_LOCKS.clear()
+
+
+def _held(spool_root) -> str:
+    """Hold spool_root's owner lock for the test; the mode to open it in."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    key = str(spool_root)
+    if key not in _HARNESS_LOCKS:
+        _HARNESS_LOCKS[key] = _load_native_store_extension().SpoolOwnerLock(
+            key)
+    return "held_by_caller"
+
+
 def _service(config, spool_root: Path, *, sweep_spool=True):
     from dmi.storage.native_capture import NativeCaptureStorage
 
     return NativeCaptureStorage(config, spool_root=str(spool_root),
                                 spool_max_bytes=1 << 40,
-                                sweep_spool=sweep_spool)
+                                sweep_spool=sweep_spool,
+                                spool_owner_lock=_held(spool_root))
 
 
 def _record(index: int):
@@ -141,12 +179,18 @@ def _record(index: int):
 
 
 def _stage(spool_root: Path, indexes, *, records_per_pack: int = 2):
-    """Stage records through the native sink core; return the tensors."""
+    """Stage records through the native sink core; return the tensors.
+
+    The driver takes a scratch directory of its own beside spool_root, and
+    once its sink is closed the sealed packs move into spool_root under the
+    same relative paths -- one rename each, so a service scanning the spool
+    meets a whole ready file or none."""
+    scratch = spool_root.parent / f".stage-{uuid.uuid4().hex[:8]}"
     sink = _Driver(SINK_DRIVER)
     tensors = {}
     try:
         assert sink.call(
-            op="open", root=str(spool_root), max_bytes=1 << 40,
+            op="open", root=str(scratch), max_bytes=1 << 40,
             max_queue_records=256, max_queue_bytes=1 << 24,
             max_pack_bytes=8 << 20, max_pack_records=records_per_pack,
             max_linger_ns=1_000_000_000, overload="drop_newest",
@@ -164,6 +208,11 @@ def _stage(spool_root: Path, indexes, *, records_per_pack: int = 2):
         assert snapshot["persisted_records"] == len(tensors), snapshot
     finally:
         sink.close()
+    for ready in sorted(scratch.rglob("*.dmi-pack.ready")):
+        target = spool_root / ready.relative_to(scratch)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        ready.replace(target)
+    shutil.rmtree(scratch)
     return tensors
 
 
@@ -307,6 +356,9 @@ class _Switch:
         self.refused: list[float] = []
         self._lock = threading.Lock()
         self._sockets: set[socket.socket] = set()
+        # close() has run: a request held back by a delay is not forwarded
+        # once it has.
+        self._closed = False
         threading.Thread(target=self._accept, daemon=True).start()
 
     @classmethod
@@ -372,6 +424,7 @@ class _Switch:
         what delay_requests() says; anything else goes straight through."""
         request = b""
         continued = False
+        whole = False  # the head and all Content-Length bytes of body
         try:
             client.settimeout(2.0)
             while True:
@@ -379,6 +432,7 @@ class _Switch:
                 if found:
                     length = re.search(rb"(?i)content-length:\s*(\d+)", head)
                     if length is None or len(body) >= int(length.group(1)):
+                        whole = True
                         break
                     # libcurl holds a body over 1 KiB back until the server
                     # says 100 Continue, or for a second; answer for it, so
@@ -393,6 +447,12 @@ class _Switch:
                 request += chunk
             client.settimeout(None)
         except OSError:
+            client.close()
+            return
+        if not whole:
+            # The client went away mid-request -- a cancel that landed
+            # after the head, say. Forwarded, the fake S3 stored the short
+            # body under the key, over what a later upload put there.
             client.close()
             return
         if continued:
@@ -418,6 +478,10 @@ class _Switch:
                 and b"_publisher_lease" in request)
         if late:
             time.sleep(late_by)
+        if self._closed:
+            # Held back past close(): the test is done with this server.
+            client.close()
+            return
         try:
             upstream = socket.create_connection(self._target)
             upstream.sendall(request)
@@ -487,7 +551,9 @@ class _Switch:
         listener does not wake a thread blocked in accept(), which still
         takes one more queued connection: the stall settings go first, so
         that connection is refused rather than held open for its client's
-        whole timeout (a stop()'s lease release after a stall() did)."""
+        whole timeout (a stop()'s lease release after a stall() did).
+        A request a delay still holds back is dropped, not forwarded."""
+        self._closed = True
         self._stalled = False
         self._stall_if = None
         self._slow_once = None
@@ -495,6 +561,83 @@ class _Switch:
         self._late_by = 0.0
         self.cut()
         self._listener.close()
+
+
+class _Recorder:
+    """A TCP server that keeps every byte it is sent, by connection."""
+
+    def __init__(self):
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self.port = self._listener.getsockname()[1]
+        self.received: list[bytes] = []
+        self._lock = threading.Lock()
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                connection, _ = self._listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._keep, args=(connection,),
+                             daemon=True).start()
+
+    def _keep(self, connection):
+        data = b""
+        try:
+            while chunk := connection.recv(65536):
+                data += chunk
+        except OSError:
+            pass
+        connection.close()
+        with self._lock:
+            self.received.append(data)
+
+    def close(self):
+        self._listener.close()
+
+
+def test_the_switch_forwards_no_request_its_client_did_not_finish(tmp_path):
+    """The harness itself. A client that went away after a request's head
+    -- a flush deadline's cancel landing between libcurl's head and body,
+    which the switch had answered 100 Continue for -- was forwarded all
+    the same, its body short: the fake S3, whose signature check trusts
+    x-amz-content-sha256, then stored an empty object over what a later
+    upload put at the key. Nor does a request a delay still holds back
+    when close() runs reach the server after it."""
+    recorder = _Recorder()
+    switch = _Switch("127.0.0.1", recorder.port)
+    switch.delay_requests(lambda request: 0.3)
+    head = (b"PUT /b/k HTTP/1.1\r\nHost: x\r\nContent-Length: 2048\r\n"
+            b"Expect: 100-continue\r\n\r\n")
+    try:
+        with socket.create_connection(("127.0.0.1", switch.port),
+                                      timeout=10) as client:
+            client.sendall(head)
+            assert client.recv(64).startswith(b"HTTP/1.1 100 Continue")
+        # The control: a whole request, held back and then forwarded.
+        with socket.create_connection(("127.0.0.1", switch.port),
+                                      timeout=10) as client:
+            client.sendall(head + bytes(2048))
+            client.shutdown(socket.SHUT_WR)
+            time.sleep(1.0)
+        with recorder._lock:
+            forwarded = list(recorder.received)
+        assert len(forwarded) == 1, forwarded
+        assert forwarded[0].endswith(bytes(2048)), forwarded
+
+        # Held back when close() runs, then dropped.
+        with socket.create_connection(("127.0.0.1", switch.port),
+                                      timeout=10) as client:
+            client.sendall(head + bytes(2048))
+            time.sleep(0.1)
+            switch.close()
+            time.sleep(1.0)
+        with recorder._lock:
+            assert recorder.received == forwarded, recorder.received
+    finally:
+        switch.close()
+        recorder.close()
 
 
 def test_an_index_failure_keeps_the_pack_owed_until_it_lands(fake_s3, tmp_path):
@@ -642,7 +785,9 @@ def test_a_failed_head_is_an_error_not_a_foreign_object(fake_s3, tmp_path):
                               "etag": '"0"'}
     with _catalog() as (_client, catalog):
         native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
-        native.update(spool_root=str(tmp_path / "spool"), holder="head-test",
+        native.update(spool_root=str(tmp_path / "spool"),
+                      spool_owner_lock=_held(tmp_path / "spool"),
+                      holder="head-test",
                       reconcile_prefix="fault/", s3_max_attempts=1)
         service = _load_native_store_extension().StorageService(native)
         service.start()  # reconciles once
@@ -692,7 +837,8 @@ def test_the_loop_backs_off_while_the_object_store_is_down(tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(dead, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="backoff-test",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="backoff-test",
             poll_interval_ns=20_000_000, max_backoff_ns=10_000_000_000,
             reconcile_on_start=False, s3_max_attempts=1,
             uploader_max_attempts=1)
@@ -725,7 +871,8 @@ def test_a_pack_too_big_to_index_is_set_aside_and_the_rest_still_index(
         config = _storage_config(fake_s3, catalog.table_prefix)
         native = config._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="poison-test",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="poison-test",
             poll_interval_ns=50_000_000, reconcile_on_start=False,
             # One descriptor fits, forty do not.
             indexer_max_estimated_bytes=4000)
@@ -760,7 +907,8 @@ def test_a_batch_over_the_budget_splits_until_every_pack_indexes(
         config = _storage_config(fake_s3, catalog.table_prefix)
         native = config._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="split-test",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="split-test",
             poll_interval_ns=50_000_000, reconcile_on_start=False,
             # A two-record pack renders ~720 bytes: two fit, ten do not.
             indexer_max_estimated_bytes=2000)
@@ -795,7 +943,8 @@ def test_flush_returns_on_time_when_the_catalog_stops_answering(
         native = _storage_config(
             fake_s3, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
-        native.update(spool_root=str(spool_root), holder="stall-test",
+        native.update(spool_root=str(spool_root),
+                      spool_owner_lock=_held(spool_root), holder="stall-test",
                       poll_interval_ns=20_000_000, reconcile_on_start=False,
                       clickhouse_request_timeout_s=5.0)
         service = _load_native_store_extension().StorageService(native)
@@ -842,7 +991,8 @@ def test_a_flush_against_a_black_hole_catalog_overruns_by_one_request(
             fake_s3, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="black-hole-test",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="black-hole-test",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             # Every cycle is due a reconcile.
@@ -887,7 +1037,8 @@ def test_the_stop_after_a_flush_runs_no_further_cycle(fake_s3, tmp_path):
             fake_s3, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stop-after-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stop-after-flush",
             # Wakes while the flush below holds the cycle lock.
             poll_interval_ns=3_000_000_000, reconcile_on_start=False,
             # No renewal falls due while the test runs (a third of the TTL).
@@ -951,7 +1102,8 @@ def test_a_flush_out_of_time_does_not_hash_the_spool(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="flush-out-of-time",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="flush-out-of-time",
             # The loop sleeps through the test, and nothing uploads.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             sweep_spool_on_start=False,
@@ -1010,7 +1162,8 @@ def test_stop_cuts_a_listing_that_hashes_a_backlog(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="listing-stop",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="listing-stop",
             poll_interval_ns=20_000_000, reconcile_on_start=False,
             sweep_spool_on_start=False,
             uploader_max_in_flight_bytes=1 << 30)
@@ -1046,7 +1199,8 @@ def test_a_flush_cuts_the_listing_its_deadline_passes_in(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="listing-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="listing-flush",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             sweep_spool_on_start=False,
@@ -1084,7 +1238,8 @@ def test_a_flush_returns_on_time_while_an_upload_stalls(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stalled-upload-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stalled-upload-flush",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             s3_read_timeout_s=30)
@@ -1137,12 +1292,18 @@ def test_a_flush_that_cuts_a_multipart_upload_waits_for_its_abort(
     outlasts the request timeout. Here the store holds the part and the
     abort both, so the flush pays the whole bound, and no more. The pack is
     a sparse file of zeros named for its checksum, over the client's
-    64 MiB multipart threshold; it stays staged."""
+    64 MiB multipart threshold; it stays staged. The budget has to see the
+    part stalled before it ends: the listing and the upload each hash the
+    pack first, and a HEAD and the CreateMultipartUpload go before the
+    part, which on a loaded runner outlasted a 1 s budget -- the deadline
+    then cut the upload before its part was sent, and nothing was left to
+    abort."""
     import hashlib
 
     from dmi.storage.native_capture import _load_native_store_extension
 
     size = 65 << 20
+    budget = 4.0
     digest = hashlib.sha256()
     zeros = bytes(1 << 20)
     for _ in range(size // len(zeros)):
@@ -1157,7 +1318,8 @@ def test_a_flush_that_cuts_a_multipart_upload_waits_for_its_abort(
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="multipart-abort-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="multipart-abort-flush",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             clickhouse_request_timeout_s=2.0,
@@ -1167,7 +1329,7 @@ def test_a_flush_that_cuts_a_multipart_upload_waits_for_its_abort(
         try:
             s3.stall_requests(_multipart_part_or_abort)
             started = time.monotonic()
-            drained = service.flush(1.0)
+            drained = service.flush(budget)
             elapsed = time.monotonic() - started
             snapshot = service.snapshot()
         finally:
@@ -1177,7 +1339,7 @@ def test_a_flush_that_cuts_a_multipart_upload_waits_for_its_abort(
     assert drained is False
     assert len(s3.stalled) == 2, s3.stalled  # the part, then the abort
     # The deadline, up to a second for the cut, and the 5 s abort.
-    assert elapsed < 1.0 + 1.0 + 5.0 + 1.0, (elapsed, snapshot)
+    assert elapsed < budget + 1.0 + 5.0 + 1.0, (elapsed, snapshot)
     assert snapshot["cancelled_uploads"] == 1, snapshot
     assert snapshot["upload_failures"] == 0, snapshot
     assert _ready(spool_root) == [ready]
@@ -1187,7 +1349,10 @@ def test_stop_returns_promptly_while_an_upload_stalls(fake_s3, tmp_path):
     """stop() joined a loop whose cycle was inside a PUT the store never
     answers, so it waited out the S3 read timeout on every attempt, with the
     lease held. It cancels the upload now: the pack stays in the spool, the
-    lease is released, and the next process uploads the pack."""
+    lease is released, and the next process uploads the pack. The uploader
+    is allowed eight attempts: one whose own retries and backoff stop() did
+    not cut, on a client stop() did, would sleep out about 26 s of backoff
+    (four attempts' 1.75 s fit under the bound)."""
     from dmi.storage.native_capture import _load_native_store_extension
 
     spool_root = tmp_path / "spool"
@@ -1195,9 +1360,10 @@ def test_stop_returns_promptly_while_an_upload_stalls(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stalled-upload-stop",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stalled-upload-stop",
             poll_interval_ns=20_000_000, reconcile_on_start=False,
-            s3_read_timeout_s=60)
+            s3_read_timeout_s=60, uploader_max_attempts=8)
         service = _load_native_store_extension().StorageService(native)
         service.start()
         stopper = None
@@ -1259,7 +1425,8 @@ def test_a_flush_returns_on_time_while_the_index_reads_stall(
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stalled-read-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stalled-read-flush",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             s3_read_timeout_s=3,
@@ -1318,7 +1485,8 @@ def test_stop_returns_promptly_while_the_index_reads_stall(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stalled-read-stop",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stalled-read-stop",
             poll_interval_ns=20_000_000, reconcile_on_start=False,
             s3_read_timeout_s=3)
         service = _load_native_store_extension().StorageService(native)
@@ -1397,7 +1565,8 @@ def test_stop_sends_no_catalog_request_for_packs_it_cannot_index(
             s3.url, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stop-no-replay-guard",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stop-no-replay-guard",
             poll_interval_ns=20_000_000, reconcile_on_start=False,
             uploader_max_workers=1, s3_read_timeout_s=30)
         # Staged first, so the loop's first cycle lists all four.
@@ -1463,7 +1632,8 @@ def test_an_object_store_read_outage_sets_no_pack_aside(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="read-outage",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="read-outage",
             poll_interval_ns=20_000_000, max_backoff_ns=200_000_000,
             reconcile_on_start=False, s3_read_timeout_s=1,
             s3_max_attempts=1, max_index_attempts=2)
@@ -1520,7 +1690,8 @@ def test_a_flush_against_a_slow_catalog_indexes_one_batch_past_its_deadline(
             fake_s3, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="slow-catalog-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="slow-catalog-flush",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             indexer_max_packs=1,
@@ -1584,7 +1755,8 @@ def test_a_close_whose_budget_ends_mid_upload_leaves_nothing_owed(
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="close-mid-upload",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="close-mid-upload",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             uploader_max_workers=1, indexer_max_packs=4)
@@ -1637,7 +1809,8 @@ def test_the_one_batch_past_a_flushs_deadline_is_a_full_one(fake_s3,
             fake_s3, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="full-batch-flush",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="full-batch-flush",
             # The loop sleeps through the test, so the flush runs the cycle.
             poll_interval_ns=60_000_000_000, reconcile_on_start=False,
             indexer_max_packs=2, clickhouse_request_timeout_s=60.0)
@@ -1676,7 +1849,8 @@ def test_only_the_loop_reconciles_never_a_flush(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="flush-no-reconcile",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="flush-no-reconcile",
             poll_interval_ns=2_000_000_000, reconcile_on_start=False,
             reconcile_interval_ns=1_000_000)
         service = _load_native_store_extension().StorageService(native)
@@ -1706,7 +1880,8 @@ def test_a_service_started_again_after_stop_uploads_again(fake_s3, tmp_path):
     spool_root = tmp_path / "spool"
     with _catalog() as (_client, catalog):
         native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
-        native.update(spool_root=str(spool_root), holder="restarted",
+        native.update(spool_root=str(spool_root),
+                      spool_owner_lock=_held(spool_root), holder="restarted",
                       reconcile_on_start=False)
         service = _load_native_store_extension().StorageService(native)
         service.start()
@@ -1738,7 +1913,8 @@ def test_stop_cuts_a_reconcile_whose_listing_stalls(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
         native.update(
-            spool_root=str(spool_root), holder="stalled-reconcile-stop",
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="stalled-reconcile-stop",
             poll_interval_ns=20_000_000, reconcile_on_start=False,
             reconcile_interval_ns=1_000_000, s3_read_timeout_s=30)
         service = _load_native_store_extension().StorageService(native)
@@ -1795,7 +1971,8 @@ def test_dropping_a_running_service_does_not_hold_the_gil(fake_s3, tmp_path):
         native = _storage_config(
             fake_s3, catalog.table_prefix,
             clickhouse_port=switch.port)._native_dict()
-        native.update(spool_root=str(spool_root), holder="gil-test",
+        native.update(spool_root=str(spool_root),
+                      spool_owner_lock=_held(spool_root), holder="gil-test",
                       poll_interval_ns=20_000_000, reconcile_on_start=False,
                       clickhouse_request_timeout_s=2.0)
         service = _load_native_store_extension().StorageService(native)
@@ -1838,7 +2015,8 @@ def test_the_lease_holds_through_an_object_store_outage(tmp_path):
         def _native(spool, holder):
             native = _storage_config(dead, catalog.table_prefix)._native_dict()
             native.update(
-                spool_root=str(spool), holder=holder,
+                spool_root=str(spool), spool_owner_lock=_held(spool),
+                holder=holder,
                 poll_interval_ns=20_000_000, max_backoff_ns=10_000_000_000,
                 lease_ttl_ns=3_000_000_000, publish_timeout_ns=1_000_000_000,
                 clock_skew_ns=0, reconcile_on_start=False,

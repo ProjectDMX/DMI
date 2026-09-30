@@ -237,6 +237,51 @@ def test_a_zero_release_timeout_leaves_the_open_pack_to_the_pipeline(
     del lease
 
 
+def test_sealed_on_release_says_whether_the_sink_can_still_stage(
+        native_sink_module, tmp_path):
+    """The engine lets go of its spool directory's owner lock only once
+    nothing can stage into the directory any more. sealed_on_release says
+    so: true once a release's flush has persisted everything admitted --
+    a released sink admits nothing -- and false while the sink is
+    attached, after a release whose flush timed out (a stage is still on
+    its way, and lands later), and with the backstop off."""
+    sink = _binding_sink(native_sink_module, tmp_path / "sealed")
+    assert sink.sealed_on_release is False
+    lease = sink.attach()
+    sink.submit_envelope(LAYOUT, *_envelope(0))
+    _wait_until_admitted(sink, 1)
+    assert sink.sealed_on_release is False  # attached: it may take more
+    del lease
+    assert sink.sealed_on_release is True
+    assert len(_ready(tmp_path / "sealed")) == 1
+    lease = sink.attach()
+    assert sink.sealed_on_release is False  # attached again
+    del lease
+    assert sink.sealed_on_release is True  # nothing left to flush
+
+    wedged = _binding_sink(native_sink_module, tmp_path / "wedged",
+                           release_flush_timeout_s=0.5)
+    release_stages = wedged._hold_stages_for_testing(10.0)
+    lease = wedged.attach()
+    wedged.submit_envelope(LAYOUT, *_envelope(1))
+    _wait_until_admitted(wedged, 1)
+    del lease
+    assert wedged.sealed_on_release is False
+    assert _ready(tmp_path / "wedged") == []
+    release_stages()  # the stage the release gave up on still lands
+    deadline = time.monotonic() + 10.0
+    while not _ready(tmp_path / "wedged"):
+        assert time.monotonic() < deadline, wedged.snapshot()
+        time.sleep(0.01)
+    assert wedged.sealed_on_release is False
+
+    off = _binding_sink(native_sink_module, tmp_path / "off",
+                        release_flush_timeout_s=0.0)
+    lease = off.attach()
+    del lease
+    assert off.sealed_on_release is False
+
+
 @pytest.mark.parametrize("timeout_s", [-1.0, float("nan"), float("inf")])
 def test_the_release_timeout_must_be_finite_and_not_negative(
         native_sink_module, tmp_path, timeout_s):

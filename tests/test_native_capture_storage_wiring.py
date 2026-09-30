@@ -2,10 +2,12 @@
 
 The service itself is C++ and runs against a real object store and catalog
 in test_native_capture_storage_live.py. This suite pins what the engine
-promises around it, with the native modules faked: the service starts
-before the sink opens the spool it sweeps, ``flush_and_wait`` waits for the
-catalog as well as the spool, ``close`` drains and releases the lease, and a
-failed attach does not leave the lease held.
+promises around it, with the native modules faked: the engine takes its own
+rank directory's owner lock before anything opens it, the service starts
+before the sink opens the spool it sweeps, both open that directory
+held_by_caller, ``flush_and_wait`` waits for the catalog as well as the
+spool, ``close`` drains and releases the lease and only then the spool
+lock, and a failed attach leaves neither the lease nor the lock held.
 """
 
 from __future__ import annotations
@@ -441,12 +443,38 @@ class _FakeService:
         pass
 
 
-def _capture_engine(monkeypatch, tmp_path, *, fail_ring=False):
+RANK_DIRECTORY = "{base}/0123456789ab/r{rank}-0a1b2c3d"
+
+
+class _FakeSpoolLock:
+    """Stands in for _dmi_native_store.SpoolOwnerLock."""
+
+    def __init__(self, events, directory, allow_shared_filesystem=False):
+        self.events = events
+        self.directory = directory
+        self.allow_shared_filesystem = allow_shared_filesystem
+        self.held = True
+        events.append(("lock", "acquire", directory))
+
+    def release_and_remove_if_empty(self):
+        self.held = False
+        self.events.append(("lock", "release"))
+        return True
+
+    def release(self):
+        self.release_and_remove_if_empty()
+
+
+def _capture_engine(monkeypatch, tmp_path, *, fail_ring=False,
+                    fail_start=False, spool_owner=None, storage=True):
     """An engine under storage_backend="persistent" with both native modules
-    faked. Returns (engine, events, services)."""
+    faked. Returns (engine, events, services); ``events`` also records the
+    spool locks and the sinks' keyword arguments (``sinks``)."""
     from dmi.storage.capture.native_sink import NativeSinkConfig
 
     events, services = [], []
+    events_sinks: list = []
+    locks: list = []
     engine = MonitoringEngine(enable_ring_transport=False)
     engine._ring_transport = SimpleNamespace(null_offload=False,
                                              force_eager=False)
@@ -455,7 +483,7 @@ def _capture_engine(monkeypatch, tmp_path, *, fail_ring=False):
     engine._storage_backend = "persistent"
     engine._capture_sink_config = NativeSinkConfig(
         spool_root=str(tmp_path / "spool"), spool_max_bytes=1 << 30)
-    engine._capture_storage_config = _storage_config()
+    engine._capture_storage_config = _storage_config() if storage else None
 
     class _Lease:
         def release(self):
@@ -468,15 +496,33 @@ def _capture_engine(monkeypatch, tmp_path, *, fail_ring=False):
     class _NativePackSink(_RecordSink):
         def __init__(self, **kwargs):
             events.append(("sink", "open", kwargs["spool_root"]))
+            events_sinks.append(kwargs)
 
     def _service(config):
         service = _FakeService(events, config)
+        if fail_start:
+            def _refuse():
+                events.append(("service", "start"))
+                raise RuntimeError("publisher lease held elsewhere")
+            service.start = _refuse
         services.append(service)
         return service
+
+    def _lock(directory, allow_shared_filesystem=False):
+        lock = _FakeSpoolLock(events, directory, allow_shared_filesystem)
+        locks.append(lock)
+        return lock
+
+    def _rank_directory(base, destination, rank):
+        events.append(("layout", destination, rank))
+        return RANK_DIRECTORY.format(base=base, rank=rank)
 
     def _load_named_extension(name):
         if name == "_dmi_native_store":
             return SimpleNamespace(StorageService=_service,
+                                   SpoolOwnerLock=_lock,
+                                   spool_rank_directory=_rank_directory,
+                                   spool_owner=lambda directory: spool_owner,
                                    SEARCH_ITEM_COLUMNS=())
         return SimpleNamespace(NativePackSink=_NativePackSink)
 
@@ -527,6 +573,8 @@ def _capture_engine(monkeypatch, tmp_path, *, fail_ring=False):
     import dmi.transport
 
     monkeypatch.setattr(dmi.transport, "native", native, raising=False)
+    engine._test_sinks = events_sinks
+    engine._test_locks = locks
     return engine, events, services
 
 
@@ -546,21 +594,85 @@ def _record_format():
 
 
 def test_the_service_starts_before_the_sink_opens_the_spool(monkeypatch, tmp_path):
+    """The engine's own directory is locked first; the service starts (and
+    sweeps it) before the sink opens it; both open it under that lock."""
+    monkeypatch.delenv("RANK", raising=False)
     engine, events, services = _capture_engine(monkeypatch, tmp_path)
 
     engine.create_record_runtime(_record_format())
 
-    spool_root = str(tmp_path / "spool")
-    assert events[:3] == [
+    directory = RANK_DIRECTORY.format(base=tmp_path / "spool", rank=0)
+    storage = _storage_config()
+    assert events[:5] == [
+        ("layout", storage._spool_destination(), 0),
+        ("lock", "acquire", directory),
         ("service", "construct"),
         ("service", "start"),
-        ("sink", "open", spool_root),
+        ("sink", "open", directory),
     ]
     config = services[0].config
-    assert config["spool_root"] == spool_root
+    assert config["spool_root"] == directory
     assert config["spool_max_bytes"] == 1 << 30
     assert config["sweep_spool_on_start"] is True
+    assert config["spool_owner_lock"] == "held_by_caller"
+    assert config["adopt_sibling_spools"] is True
+    assert config["spool_allow_shared_filesystem"] is False
     assert config["holder"]  # a generated lease holder, never empty
+    (sink,) = engine._test_sinks
+    assert sink["owner_lock"] == "held_by_caller"
+    # Dead incarnations' packs beside it count against its budget.
+    assert sink["charge_dead_siblings"] is True
+    assert engine._test_locks[0].held
+
+
+def test_the_spool_directory_is_named_for_the_rank(monkeypatch, tmp_path):
+    monkeypatch.setenv("RANK", "3")
+    engine, events, services = _capture_engine(monkeypatch, tmp_path)
+
+    engine.create_record_runtime(_record_format())
+
+    assert services[0].config["spool_root"] == RANK_DIRECTORY.format(
+        base=tmp_path / "spool", rank=3)
+
+
+@pytest.mark.parametrize("rank", ["", "-1", "x", "1.5"])
+def test_a_rank_that_is_not_a_rank_names_rank_zero(monkeypatch, tmp_path, rank):
+    monkeypatch.setenv("RANK", rank)
+    engine, _events, services = _capture_engine(monkeypatch, tmp_path)
+
+    engine.create_record_runtime(_record_format())
+
+    assert services[0].config["spool_root"].endswith("/r0-0a1b2c3d")
+
+
+def test_the_shared_filesystem_override_reaches_the_lock_and_both_spools(
+        monkeypatch, tmp_path):
+    from dmi.storage.capture.native_sink import NativeSinkConfig
+
+    engine, _events, services = _capture_engine(monkeypatch, tmp_path)
+    engine._capture_sink_config = NativeSinkConfig(
+        spool_root=str(tmp_path / "spool"),
+        spool_allow_shared_filesystem=True)
+
+    engine.create_record_runtime(_record_format())
+
+    assert engine._test_locks[0].allow_shared_filesystem is True
+    assert services[0].config["spool_allow_shared_filesystem"] is True
+    assert engine._test_sinks[0]["allow_shared_filesystem"] is True
+
+
+def test_a_service_that_fails_to_start_releases_the_spool_lock(
+        monkeypatch, tmp_path):
+    engine, events, _services = _capture_engine(monkeypatch, tmp_path,
+                                                fail_start=True)
+
+    with pytest.raises(RuntimeError, match="lease held elsewhere"):
+        engine.create_record_runtime(_record_format())
+
+    assert events[-1] == ("lock", "release")
+    assert not engine._test_locks[0].held
+    assert engine._capture_storage is None
+    assert not any(event[0] == "sink" for event in events)
 
 
 def test_an_explicit_sink_leaves_the_spool_unswept(monkeypatch, tmp_path):
@@ -570,7 +682,65 @@ def test_an_explicit_sink_leaves_the_spool_unswept(monkeypatch, tmp_path):
     engine.create_record_runtime(
         _record_format(), record_sink=dmi.transport.native.RecordSink())
 
-    assert services[0].config["sweep_spool_on_start"] is False
+    config = services[0].config
+    assert config["sweep_spool_on_start"] is False
+    # An explicit sink writes where it was built to: the configured root,
+    # which the engine neither lays out nor adopts siblings around. Nothing
+    # holds it here, so the service takes its lock.
+    assert config["spool_root"] == str(tmp_path / "spool")
+    assert config["adopt_sibling_spools"] is False
+    assert config["spool_owner_lock"] == "take"
+    assert not any(event[0] == "lock" for event in events)
+
+
+def test_an_explicit_sink_holding_the_spool_shares_it_with_the_service(
+        monkeypatch, tmp_path):
+    """A NativePackSink the caller built takes the spool's owner lock; the
+    engine's service in the same process must open beside it, not take it
+    again (that would be refused, naming this very process)."""
+    import os
+    import socket
+
+    engine, _events, services = _capture_engine(
+        monkeypatch, tmp_path,
+        spool_owner={"host": socket.gethostname(), "pid": os.getpid()})
+    import dmi.transport
+
+    engine.create_record_runtime(
+        _record_format(), record_sink=dmi.transport.native.RecordSink())
+
+    assert services[0].config["spool_owner_lock"] == "held_by_caller"
+
+
+def test_an_explicit_sink_on_a_spool_another_process_owns_is_taken(
+        monkeypatch, tmp_path):
+    """Owned by another process: the service takes it, and so is refused
+    by the native spool naming that holder."""
+    engine, _events, services = _capture_engine(
+        monkeypatch, tmp_path, spool_owner={"host": "elsewhere", "pid": 1})
+    import dmi.transport
+
+    engine.create_record_runtime(
+        _record_format(), record_sink=dmi.transport.native.RecordSink())
+
+    assert services[0].config["spool_owner_lock"] == "take"
+
+
+def test_a_sink_without_a_service_owns_its_spool_itself(monkeypatch, tmp_path):
+    """No capture_storage_config: packs stay in the spool for something else
+    to drain, and the sink is the directory's one owner -- no layout, no
+    engine lock."""
+    engine, events, services = _capture_engine(monkeypatch, tmp_path,
+                                               storage=False)
+
+    engine.create_record_runtime(_record_format())
+
+    assert services == []
+    (sink,) = engine._test_sinks
+    assert sink["spool_root"] == str(tmp_path / "spool")
+    assert sink["owner_lock"] == "take"
+    assert sink["charge_dead_siblings"] is False  # no layout, no siblings
+    assert not any(event[0] in ("lock", "layout") for event in events)
 
 
 def test_a_failed_attach_stops_the_service_it_started(monkeypatch, tmp_path):
@@ -580,8 +750,9 @@ def test_a_failed_attach_stops_the_service_it_started(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="ring init failed"):
         engine.create_record_runtime(_record_format())
 
-    assert ("service", "stop") in events
+    assert events[-2:] == [("service", "stop"), ("lock", "release")]
     assert engine._capture_storage is None
+    assert not engine._test_locks[0].held
 
 
 def test_flush_waits_for_the_catalog_after_the_sink(monkeypatch, tmp_path):
@@ -615,31 +786,127 @@ def test_close_flushes_the_sink_before_the_ring_stops(monkeypatch, tmp_path):
 
     engine.close()
 
+    # The spool lock last: after the sink and the service are both done.
     assert [event[:2] for event in events] == [
         ("sink", "flush"), ("ring", "stop"),
-        ("service", "flush"), ("service", "stop")]
+        ("service", "flush"), ("service", "stop"), ("lock", "release")]
     # One budget for the whole drain: the service gets what the sink left.
     assert 59.0 <= events[0][2] <= 60.0
     assert 0.0 <= events[2][2] <= 60.0
     assert engine._capture_storage is None
 
 
-def test_close_still_stops_when_the_sink_flush_fails(monkeypatch, tmp_path):
-    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
-    engine.create_record_runtime(_record_format())
-
+def _fail_the_sink_flush(engine, events):
     def _failing_flush(timeout_s):
         events.append(("sink", "flush", timeout_s))
         raise TimeoutError("timed out waiting for durable record completion")
 
     engine._ring_transport.flush_records_and_wait = _failing_flush
+
+
+def test_close_still_stops_when_the_sink_flush_fails(monkeypatch, tmp_path,
+                                                     caplog):
+    """The service still stops. The spool lock does not go: a sink that did
+    not seal may still be staging -- it outlives close() through the user's
+    RecordRuntime, and its stagers and destructor write into the directory
+    -- so another process's adoption (or this one's next engine) must not
+    take the directory from under it. The kernel lets go at exit."""
+    from dmi.storage import native_capture
+
+    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
+    engine.create_record_runtime(_record_format())
+    _fail_the_sink_flush(engine, events)
+    (lock,) = engine._test_locks
+    events.clear()
+
+    with caplog.at_level("WARNING", logger="dmi.engine"):
+        engine.close()
+
+    assert [event[:2] for event in events] == [
+        ("sink", "flush"), ("ring", "stop"),
+        ("service", "flush"), ("service", "stop")]
+    assert lock.held
+    assert engine._spool_claim is None
+    # Kept alive for the process, so no garbage collection lets go of it.
+    assert any(claim._lock is lock
+               for claim in native_capture._HELD_SPOOL_CLAIMS)
+    assert lock.directory in caplog.text
+    assert "stays owned" in caplog.text
+
+
+def test_close_keeps_the_lock_when_the_release_backstop_did_not_seal(
+        monkeypatch, tmp_path, caplog):
+    """The sink's flush went through, but the ring stopping drains what it
+    still queued into the sink, and the release backstop that stages it
+    timed out (sealed_on_release false): a stage is still on its way into
+    the directory, so the lock stays, as for a sink that never sealed."""
+    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
+    engine.create_record_runtime(_record_format())
+    engine._record_sink.sealed_on_release = False
+    (lock,) = engine._test_locks
+    events.clear()
+
+    with caplog.at_level("WARNING", logger="dmi.engine"):
+        engine.close()
+
+    assert [event[:2] for event in events] == [
+        ("sink", "flush"), ("ring", "stop"),
+        ("service", "flush"), ("service", "stop")]
+    assert lock.held
+    assert "stays owned" in caplog.text
+
+
+def test_close_releases_the_lock_once_the_release_backstop_sealed_the_sink(
+        monkeypatch, tmp_path):
+    """The sink's flush ran out of close()'s budget, but its release from
+    the stopping ring flushed it (sealed_on_release true), and a released
+    sink admits nothing more: nothing can stage into the directory, so the
+    lock goes, as for a sink whose flush went through."""
+    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
+    engine.create_record_runtime(_record_format())
+    _fail_the_sink_flush(engine, events)
+    engine._record_sink.sealed_on_release = True
+    (lock,) = engine._test_locks
     events.clear()
 
     engine.close()
 
     assert [event[:2] for event in events] == [
         ("sink", "flush"), ("ring", "stop"),
-        ("service", "flush"), ("service", "stop")]
+        ("service", "flush"), ("service", "stop"), ("lock", "release")]
+    assert not lock.held
+
+
+def test_replacing_a_record_ring_asks_the_released_sink_whether_it_sealed(
+        monkeypatch, tmp_path):
+    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
+    engine.create_record_runtime(_record_format())
+    engine._record_sink.sealed_on_release = False
+    (lock,) = engine._test_locks
+    events.clear()
+
+    engine.enable_ring_transport(object())
+
+    assert [event[:2] for event in events] == [
+        ("sink", "flush"), ("ring", "stop"),
+        ("service", "flush"), ("service", "stop"), ("ring", "create")]
+    assert lock.held
+
+
+def test_replacing_a_record_ring_keeps_the_lock_when_the_sink_did_not_seal(
+        monkeypatch, tmp_path):
+    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
+    engine.create_record_runtime(_record_format())
+    _fail_the_sink_flush(engine, events)
+    (lock,) = engine._test_locks
+    events.clear()
+
+    engine.enable_ring_transport(object())
+
+    assert [event[:2] for event in events] == [
+        ("sink", "flush"), ("ring", "stop"),
+        ("service", "flush"), ("service", "stop"), ("ring", "create")]
+    assert lock.held
 
 
 def test_close_releases_the_lease_even_when_the_drain_fails(monkeypatch, tmp_path):
@@ -650,7 +917,9 @@ def test_close_releases_the_lease_even_when_the_drain_fails(monkeypatch, tmp_pat
 
     engine.close()
 
-    assert events[-1] == ("service", "stop")
+    # Whatever did not drain stays in the directory for the next process on
+    # the node to adopt; the lock goes either way.
+    assert events[-2:] == [("service", "stop"), ("lock", "release")]
 
 
 def test_replacing_a_record_ring_drains_and_stops_the_service(
@@ -667,16 +936,18 @@ def test_replacing_a_record_ring_drains_and_stops_the_service(
 
     assert [event[:2] for event in events] == [
         ("sink", "flush"), ("ring", "stop"),
-        ("service", "flush"), ("service", "stop"), ("ring", "create")]
+        ("service", "flush"), ("service", "stop"), ("lock", "release"),
+        ("ring", "create")]
     assert 59.0 <= events[0][2] <= 60.0
     assert engine._capture_storage is None
     assert engine._record_mode is False
 
-    # A second record runtime starts its own service; nothing still holds
-    # the lease it takes.
+    # A second record runtime starts its own service in a directory of its
+    # own; nothing still holds the lease it takes, or the lock.
     engine.create_record_runtime(_record_format())
     assert len(services) == 2
     assert engine._capture_storage is not None
+    assert [lock.held for lock in engine._test_locks] == [False, True]
 
 
 # --- the publisher lease knobs -------------------------------------------------

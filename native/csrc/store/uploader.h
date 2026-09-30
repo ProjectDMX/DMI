@@ -65,6 +65,11 @@ struct UploadFailure {
   // failed_packs. Attempts that ran out on failures of their own stay
   // failures, even when a cancel came in meanwhile.
   bool cancelled = false;
+  // False when no retry by this uploader can ever succeed: a pack over
+  // max_in_flight_bytes, a different object already at its key (a
+  // conflict), staged bytes that no longer match their checksum. The pack
+  // stays staged either way. A cancelled pack is retryable.
+  bool retryable = true;
 };
 
 struct UploadSnapshot {
@@ -116,13 +121,18 @@ class SpoolUploader {
 
   // Upload `pending`, packs a ListPending already returned, as UploadPending
   // does after its listing: in their order, refs and failures positional.
-  // A caller that uploads a listing in parts lists it once.
+  // A caller that uploads a listing in parts lists it once (the service's
+  // own spool a chunk at a time, and adoption, which lists a dead spool
+  // once, a pack a step through Spool::BeginRecovery, and uploads it a
+  // round at a time).
   UploadBatchResult UploadStaged(std::vector<StagedPack> pending);
 
   // Upload one staged entry with retry. Public for tests. *cancelled_out
-  // (when given) says whether a cancel ended it.
+  // (when given) says whether a cancel ended it; *retryable_out says, on
+  // failure, whether a later try could succeed (UploadFailure).
   bool UploadOne(const StagedPack& staged, PackRef* ref, int* attempts_out,
-                 std::string* error, bool* cancelled_out = nullptr);
+                 std::string* error, bool* cancelled_out = nullptr,
+                 bool* retryable_out = nullptr);
 
  private:
   Spool* spool_;
