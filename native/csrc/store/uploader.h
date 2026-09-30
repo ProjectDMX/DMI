@@ -123,7 +123,8 @@ class SpoolUploader {
   // does after its listing: in their order, refs and failures positional.
   // A caller that uploads a listing in parts lists it once (the service's
   // own spool a chunk at a time, and adoption, which lists a dead spool
-  // once through Recover and uploads it a round at a time).
+  // once, a pack a step through Spool::BeginRecovery, and uploads it a
+  // round at a time).
   UploadBatchResult UploadStaged(std::vector<StagedPack> pending);
 
   // Upload one staged entry with retry. Public for tests. *cancelled_out

@@ -872,7 +872,7 @@ class NativeCaptureStorage:
         Nor does a flush adopt, but it does wait, within ``timeout_s``, for
         the adoption step the loop is in when it is called: one of a dead
         spool's packs validated, which hashes it, or one round of their
-        uploads (at most ``uploader_max_workers`` packs) -- not a dead
+        uploads (at most four packs, one per upload worker) -- not a dead
         backlog's whole listing, which goes a pack a step.
         """
         if not self._service.flush(float(timeout_s)):
