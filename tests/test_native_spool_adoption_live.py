@@ -936,6 +936,144 @@ def test_a_flush_waits_for_the_adoption_step_in_flight_not_its_slice(
         lock.release_and_remove_if_empty()
 
 
+def test_flushes_that_keep_coming_slow_an_adoption_down_but_never_stop_it(
+        fake_s3, tmp_path):
+    """A cycle adopting lets go of the cycle at its next step while a flush
+    is waiting for it -- but only after one step at least, or flushes that
+    keep coming, as a capture loop's do, would stop adoption altogether:
+    every adopting cycle would find one waiting and take no step. Here two
+    threads flush back to back while a sibling that was alive at start
+    dies; it is still adopted, a step a cycle.
+
+    Every cycle -- a flush's and the loop's -- first lists the service's
+    own spool, which here hashes a 32 MiB pack that fails validation and
+    cannot be set aside (a directory holds its quarantine name). So by the
+    time the loop's cycle comes to adopt, a flush is waiting for it.
+    Python threads flushing on their own leave gaps between their flushes,
+    and a cycle that took no step while a flush waited still adopted
+    through those gaps."""
+    base = tmp_path / "spool"
+    with _catalog() as prefix:
+        config = _storage_config(fake_s3, prefix, reconcile_on_start=False)
+        sibling = _claim(base, config)
+        dead = Path(sibling.directory)
+        _stage_into(sibling.directory, STAGED_BY_THE_DEAD)
+        staged = sorted(dead.rglob("*.dmi-pack.ready"))
+        assert len(staged) == len(STAGED_BY_THE_DEAD) // RECORDS_PER_PACK
+        lock = _claim(base, config)
+        (slow,) = _sparse_backlog(Path(lock.directory) / "slow", 1, 32 << 20)
+        with open(slow, "r+b") as corrupt:
+            corrupt.write(b"x")  # no longer the zeros its name hashes
+        slow.with_name(slow.name[:-len(".ready")] + ".quarantined").mkdir()
+        native = config._native_dict()
+        native.update(
+            spool_root=lock.directory, spool_max_bytes=1 << 30,
+            holder="flush-storm-test", poll_interval_ns=50_000_000,
+            sweep_spool_on_start=True, reconcile_on_start=False,
+            spool_owner_lock="held_by_caller", adopt_sibling_spools=True,
+            adoption_recheck_interval_ns=100_000_000,
+            **config._lease_native())
+        service = _store().StorageService(native)
+        done = threading.Event()
+        flushed = [0, 0]
+        failures = []
+
+        def _flush_back_to_back(index: int) -> None:
+            try:
+                while not done.is_set():
+                    service.flush(10.0)
+                    flushed[index] += 1
+                    # Not straight back for the lock the cycle just let go
+                    # of: the loop, woken for it, takes its turn.
+                    time.sleep(0.005)
+            except Exception as exc:  # noqa: BLE001 -- reported below
+                failures.append(exc)
+
+        flushers = [threading.Thread(target=_flush_back_to_back, args=(i,),
+                                     daemon=True) for i in range(2)]
+        service.start()
+        try:
+            # The first look finds the sibling alive, and leaves it.
+            _wait_for(lambda: not service.snapshot()["adoption_owed"])
+            assert service.snapshot()["live_siblings"] == 1
+            for flusher in flushers:
+                flusher.start()
+            _wait_for(lambda: min(flushed) >= 3)
+            sibling.release()  # its owner is gone, the flushes still coming
+            before = list(flushed)
+            _wait_for(_adopted(service, 1), 60.0)
+            snapshot = service.snapshot()
+            # The flushes kept coming all the while.
+            assert all(now > then for now, then in zip(flushed, before)), (
+                flushed, before)
+            assert not failures, failures
+            assert snapshot["adopted_packs"] == len(staged), snapshot
+            assert not dead.exists()
+            assert slow.exists()  # still listed, and still refused
+        finally:
+            done.set()
+            for flusher in flushers:
+                if flusher.ident is not None:  # started
+                    flusher.join(timeout=60.0)
+            service.stop()
+        lock.release_and_remove_if_empty()
+
+
+def test_a_cycle_adopts_nothing_while_its_own_packs_are_not_all_up(
+        fake_s3, tmp_path):
+    """A cycle adopts only once every pack this process staged has gone
+    up: its own records come first. Here the service's own spool holds a
+    pack the store refuses every time (its key is under the fake store's
+    fault/always-500/), so each cycle's own upload fails; the dead sibling
+    beside it waits, every pack in place, however many cycles pass. Once
+    that pack is gone, the next cycle adopts the sibling."""
+    import hashlib
+    import uuid
+
+    base = tmp_path / "spool"
+    with _catalog() as prefix:
+        config = _storage_config(fake_s3, prefix, reconcile_on_start=False)
+        sibling = _claim(base, config)
+        dead = Path(sibling.directory)
+        _stage_into(sibling.directory, STAGED_BY_THE_DEAD)
+        sibling.release()  # its owner is gone
+        staged = sorted(dead.rglob("*.dmi-pack.ready"))
+        assert staged
+        lock = _claim(base, config)
+        refused = Path(lock.directory) / "fault" / "always-500"
+        refused.mkdir(parents=True)
+        body = b"never goes up"
+        own = refused / (f"{uuid.uuid4()}.1.1."
+                         f"{hashlib.sha256(body).hexdigest()}.dmi-pack.ready")
+        own.write_bytes(body)
+        native = config._native_dict()
+        native.update(
+            spool_root=lock.directory, spool_max_bytes=1 << 30,
+            holder="own-first-test", poll_interval_ns=50_000_000,
+            max_backoff_ns=200_000_000, sweep_spool_on_start=True,
+            reconcile_on_start=False, spool_owner_lock="held_by_caller",
+            adopt_sibling_spools=True, uploader_max_attempts=1,
+            s3_max_attempts=1, **config._lease_native())
+        service = _store().StorageService(native)
+        service.start()
+        try:
+            _wait_for(lambda: service.snapshot()["upload_failures"] >= 5)
+            snapshot = service.snapshot()
+            assert snapshot["adopted_packs"] == 0, snapshot
+            assert snapshot["adoption_owed"] is True, snapshot
+            assert sorted(dead.rglob("*.dmi-pack.ready")) == staged
+            assert _store().spool_owner(str(dead)) is None  # not even taken
+
+            own.unlink()
+            _wait_for(_adopted(service, 1))
+            snapshot = service.snapshot()
+            assert snapshot["adopted_packs"] == len(staged), snapshot
+            assert not dead.exists()
+        finally:
+            service.stop()
+        lock.release_and_remove_if_empty()
+
+
 def test_a_latched_service_lets_go_of_the_sibling_it_was_adopting(
         fake_s3, tmp_path):
     """A service whose catalog another publisher keeps for 2 x TTL latches,
