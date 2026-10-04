@@ -354,7 +354,7 @@ class MonitoringEngine:
             raise
 
     def record_iteration_start(self, iteration: int) -> None:
-        """Optional drop measurements at the full training-step boundary."""
+        """Optional drop measurements at a training-step or evaluation-batch boundary."""
         sink = self._drop_sink
         if sink is None:
             return
