@@ -344,18 +344,20 @@ void CaptureStorageService::sweep_and_reconcile_at_start() {
     state_.adoption_owed = true;
   }
 
-  // A failed pass is not fatal -- the bucket is still there next time. Nor
-  // is a lease lost while it runs, to a quarantine or to another holder:
-  // that is the running service's case, and the loop handles it as it does
-  // there, taking a fresh lease once it can (or latching after 2 x TTL of a
-  // rival). The pass it cut short is owed, and the loop runs it once it
-  // holds a lease again.
+  // A pass that did not finish is not fatal -- the bucket is still there --
+  // but it is owed, whatever stopped it: a listing or a HEAD the object
+  // store failed, a catalog error, or a lease lost meanwhile, to a
+  // quarantine or to another holder. The loop runs it again (reconcile_or_owe)
+  // once it holds a lease -- taking a fresh one once it can, or latching
+  // after 2 x TTL of a rival, as it does for the running service. Owing
+  // only the lease loss left the rest for the next process start, with
+  // reconcile_interval_ns 0, the default: what a crashed process uploaded
+  // and never indexed stayed out of the catalog meanwhile.
   if (config_.reconcile_on_start) {
     try {
-      reconcile();
+      reconcile_or_owe();
     } catch (const CatalogError& exc) {
       if (is_lease_refusal(exc)) {
-        reconcile_owed_ = true;
         record_error(std::string("reconcile at start lost the publisher "
                                  "lease; the loop reconciles once it holds "
                                  "one again: ") +
@@ -691,17 +693,19 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
       if (adoption_cut) outcome.cut_short = true;
     }
 
-    // 4. Reconcile on its interval, or when the pass at start() lost the
-    //    lease before it finished -- in the loop's cycles only, and not
-    //    once a cancel came. The lease thread keeps the lease alive.
+    // 4. Reconcile on its interval, or when a pass that did not finish is
+    //    owed -- start()'s or an earlier cycle's -- once its retry backoff
+    //    is over: in the loop's cycles only, and not once a cancel came.
+    //    The backoff is the pass's own, so an object that never answers a
+    //    HEAD costs a listing of the bucket every max_backoff_ns at most,
+    //    and does not slow the uploads down. The lease thread keeps the
+    //    lease alive.
     if (allow_reconcile && catalog && !upload_cancel_.cancelled() &&
+        steady_ns() >= reconcile_retry_ns_ &&
         (reconcile_owed_ ||
          (config_.reconcile_interval_ns > 0 &&
           steady_ns() - last_reconcile_ns_ >= config_.reconcile_interval_ns))) {
-      if (reconcile()) {
-        reconcile_owed_ = false;
-        last_reconcile_ns_ = steady_ns();
-      }
+      reconcile_or_owe();
     }
 
     // Drained: every staged pack uploaded, every uploaded pack in the
@@ -1281,16 +1285,52 @@ void CaptureStorageService::reject(const PackRefData& ref,
   ++state_.index_failures;
 }
 
+bool CaptureStorageService::reconcile_or_owe() {
+  bool finished = false;
+  try {
+    finished = reconcile();
+  } catch (...) {
+    owe_reconcile();
+    throw;
+  }
+  if (!finished) {
+    owe_reconcile();
+    return false;
+  }
+  reconcile_owed_ = false;
+  reconcile_failures_ = 0;
+  reconcile_retry_ns_ = 0;
+  last_reconcile_ns_ = steady_ns();
+  return true;
+}
+
+void CaptureStorageService::owe_reconcile() {
+  reconcile_owed_ = true;
+  reconcile_failures_ = std::min(reconcile_failures_ + 1, 32);
+  // poll_interval * 2^failures, capped, as the loop's own backoff.
+  uint64_t wait_ns = config_.poll_interval_ns;
+  for (int i = 0; i < reconcile_failures_ && wait_ns < config_.max_backoff_ns;
+       ++i) {
+    wait_ns *= 2;
+  }
+  wait_ns = std::min(std::max(wait_ns, config_.poll_interval_ns),
+                     std::max(config_.max_backoff_ns, config_.poll_interval_ns));
+  reconcile_retry_ns_ = steady_ns() + wait_ns;
+}
+
 bool CaptureStorageService::reconcile() {
   // List every pack under the prefix, ask the catalog which it already
   // committed, and HEAD only the rest -- so a steady-state pass over a large
   // bucket costs listing pages and one catalog query per page, not a HEAD per
   // object. stop() ends it between requests: what it has not reached is
-  // still in the bucket, for the next pass.
+  // still in the bucket, for the next pass. So is a pack it could not HEAD
+  // or index, and then the pass reports it did not finish, so that a next
+  // pass runs.
   std::string token;
   uint64_t found = 0;
   uint64_t skipped = 0;
   uint64_t head_errors = 0;
+  bool all_indexed = true;
   do {
     if (upload_cancel_.cancelled()) return false;
     dmi_store::ListResult page;
@@ -1364,9 +1404,11 @@ bool CaptureStorageService::reconcile() {
     }
     found += missing.size();
     // A pack that fails here is still uncommitted in the bucket, so the next
-    // pass retries it; it is not added to the flush boundary.
+    // pass retries it; it is not added to the flush boundary. One set aside
+    // (reject) is not left unindexed: no pass could index it.
     std::vector<PackRefData> unindexed;
     if (!missing.empty()) index_bounded(std::move(missing), &unindexed);
+    if (!unindexed.empty()) all_indexed = false;
   } while (!token.empty());
 
   std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1374,7 +1416,7 @@ bool CaptureStorageService::reconcile() {
   state_.reconciled_packs += found;
   state_.reconcile_skipped_objects += skipped;
   state_.reconcile_head_errors += head_errors;
-  return true;
+  return head_errors == 0 && all_indexed;
 }
 
 void CaptureStorageService::keep_lease() {
