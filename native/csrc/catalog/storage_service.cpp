@@ -645,8 +645,12 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle(
               outcome.cut_short = true;
               break;
             }
-            // No request: a lease quarantined or refused meanwhile has
-            // already been dropped, and a fresh one is the next cycle's.
+          }
+          // Before the first chunk too: the lease was checked before the
+          // listing, which hashed every staged pack, and can have gone
+          // since. No request: a lease quarantined or refused meanwhile has
+          // already been dropped, and a fresh one is the next cycle's.
+          {
             LeaseScope lease(this);
             if (writer_.held_lease() == nullptr) {
               lost_lease = true;

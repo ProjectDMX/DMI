@@ -2226,6 +2226,55 @@ def test_a_quarantined_service_leaves_new_packs_in_the_spool(
         assert sorted(captures) == sorted(tensors)
 
 
+def test_a_lease_lost_while_the_spool_is_listed_uploads_nothing(
+        fake_s3, tmp_path):
+    """A cycle checks the lease at its start, then lists the spool, which
+    hashes every staged pack: seconds over a backlog. The lease was checked
+    again before every chunk but the first, so a lease quarantined during
+    the listing still let the first chunk go up, where it could only be
+    owed in memory -- and a crash then orphans it in the bucket when
+    reconcile_on_start is off. The first chunk is checked like the rest
+    now. 64 sparse packs of 128 MiB take the listing about 8 s; the cut
+    quarantines the lease at its next renewal, a second or so in."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    backlog = _sparse_backlog(spool_root, 64, 128 << 20)
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(
+            fake_s3, catalog.table_prefix,
+            clickhouse_port=switch.port)._native_dict()
+        native.update(
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="listing-lease-lost", lease_ttl_ns=3_000_000_000,
+            publish_timeout_ns=1_000_000_000, poll_interval_ns=50_000_000,
+            reconcile_on_start=False, sweep_spool_on_start=False,
+            indexer_max_packs=1, uploader_max_in_flight_bytes=1 << 30)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            time.sleep(0.3)  # the loop's first cycle is listing the backlog
+            listing = service.snapshot()["cycles"]
+            switch.cut()
+            _wait_for(lambda: service.snapshot()["lease_state"] == "quarantined",
+                      timeout_s=5.0)
+            snapshot = service.snapshot()
+            # Still listing: the lease went while the cycle hashed.
+            assert snapshot["cycles"] == listing, snapshot
+            assert snapshot["uploaded_packs"] == 0, snapshot
+            _wait_for(lambda: service.snapshot()["cycles"] > listing,
+                      timeout_s=60.0)
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+            switch.close()
+
+    assert snapshot["uploaded_packs"] == 0, snapshot
+    assert snapshot["pending_index"] == 0, snapshot
+    assert _ready(spool_root) == backlog
+
+
 def _lease_row_live(client, prefix) -> bool:
     """Whether the newest lease row on the catalog still keeps rivals out."""
     table = f"`{DATABASE}`.`{prefix}_publisher_lease`"

@@ -235,7 +235,8 @@ struct StorageServiceConfig {
   // take the lease and sweep while the first is still writing; one on
   // another (database, table_prefix) never meets the lease at all. Its
   // Recover() also lists the first's sealed packs, which the first may
-  // upload too. A cycle checks the lease before each chunk it uploads, and
+  // upload too. A cycle checks the lease before each chunk it uploads, the
+  // first included (after the listing, which hashes every staged pack), and
   // the uploads in flight do not stop when the lease is lost: a holder that
   // is quarantined, or refused a renewal or publish, while a chunk is in
   // flight finishes that chunk (which can outlast the TTL), and uploads
