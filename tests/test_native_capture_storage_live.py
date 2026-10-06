@@ -802,6 +802,92 @@ def test_a_failed_head_is_an_error_not_a_foreign_object(fake_s3, tmp_path):
     assert "HEAD" in snapshot["last_error"] and key in snapshot["last_error"]
 
 
+def test_a_reconcile_that_failed_at_start_is_run_again_by_the_loop(
+        fake_s3, tmp_path):
+    """Only a lease refusal left start()'s pass owed. A listing the object
+    store failed was reported and dropped, so with reconcile_interval_s 0,
+    the default, a pack a crashed process uploaded and never indexed waited
+    for the next process start. Now any pass that did not finish is owed,
+    and the loop runs it again."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    tensors = _stage(spool_root, range(3), records_per_pack=3)
+    # The crash window: uploaded and gone from the spool, never indexed.
+    store = _Driver(STORE_DRIVER)
+    try:
+        uploaded = store.call(
+            op="upload_pending", endpoint=fake_s3, bucket=BUCKET,
+            region=REGION, access=ACCESS, secret=SECRET, token=None,
+            insecure=True, connect_timeout=5, read_timeout=15, max_attempts=4,
+            store_id="s3", root=str(spool_root), spool_max_bytes=1 << 40,
+            limit=-1, max_workers=4, max_in_flight_bytes=1 << 30)
+        assert uploaded["ok"], uploaded
+    finally:
+        store.close()
+    assert _ready(spool_root) == []
+
+    s3 = _Switch.to_url(fake_s3)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(s3.url, catalog.table_prefix)._native_dict()
+        native.update(
+            spool_root=str(spool_root), spool_owner_lock=_held(spool_root),
+            holder="owed-reconcile", poll_interval_ns=20_000_000,
+            s3_max_attempts=1)
+        assert native.get("reconcile_interval_ns", 0) == 0  # no periodic pass
+        service = _load_native_store_extension().StorageService(native)
+        s3.cut()
+        service.start()  # its reconcile cannot list the bucket
+        try:
+            snapshot = service.snapshot()
+            assert snapshot["reconcile_passes"] == 0, snapshot
+            assert "listing failed" in snapshot["last_error"], snapshot
+            s3.restore()
+            _wait_for(lambda: service.snapshot()["reconciled_packs"] == 1)
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+            s3.close()
+
+        assert snapshot["reconcile_passes"] == 1, snapshot
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        assert sorted(_read_all(direct)) == sorted(tensors)
+
+
+def test_a_reconcile_that_missed_a_pack_is_run_again_backing_off(
+        fake_s3, tmp_path):
+    """A pass that could not HEAD a pack finished, and cleared what it owed:
+    "the next pass retries it" held only with a periodic pass configured.
+    The loop now runs such a pass again, on a backoff of its own, so an
+    object that never answers costs a listing every max_backoff_ns at most,
+    and the loop's uploads do not slow down for it."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    key = f"fault/forbidden/{uuid.uuid4()}.dmi-pack"
+    with STATE.lock:
+        STATE.objects[key] = {"body": b"x", "meta": {}, "content_type": "",
+                              "etag": '"0"'}
+    with _catalog() as (_client, catalog):
+        native = _storage_config(fake_s3, catalog.table_prefix)._native_dict()
+        native.update(spool_root=str(tmp_path / "spool"),
+                      spool_owner_lock=_held(tmp_path / "spool"),
+                      holder="head-retry-test", reconcile_prefix="fault/",
+                      s3_max_attempts=1, poll_interval_ns=20_000_000,
+                      max_backoff_ns=10_000_000_000)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()  # reconciles once, and cannot HEAD the object
+        try:
+            time.sleep(3.0)
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+
+    # 20 ms doubling reaches ~2.5 s of waits in 6 retries; a retry every
+    # 20 ms poll would have run ~150.
+    assert 3 <= snapshot["reconcile_head_errors"] <= 15, snapshot
+    assert snapshot["cycles"] >= 50, snapshot  # the loop kept its own poll
+
+
 def test_one_publisher_per_catalog(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
         # No start wait: the refusal is the point here, and waiting out the
