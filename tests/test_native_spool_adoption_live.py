@@ -633,6 +633,58 @@ def test_a_sibling_whose_owner_dies_after_start_is_adopted_by_a_recheck(
         lock.release_and_remove_if_empty()
 
 
+def test_a_sibling_that_appears_after_start_and_dies_is_adopted(
+        fake_s3, tmp_path):
+    """The siblings are looked at again on the recheck interval whether or
+    not the last look found a live one. A rank or a restart that claims its
+    directory after this service's first look, stages, and dies is adopted
+    while the service runs -- not left, charged against the live sink's
+    budget, until the next restart on the node. Under per-rank services
+    that is any rank that starts later than this one and crashes."""
+    base = tmp_path / "spool"
+    with _catalog() as prefix:
+        config = _storage_config(fake_s3, prefix)
+        lock = _claim(base, config)
+        native = config._native_dict()
+        native.update(
+            spool_root=lock.directory, spool_max_bytes=1 << 30,
+            holder="late-sibling-test", poll_interval_ns=50_000_000,
+            sweep_spool_on_start=True, spool_owner_lock="held_by_caller",
+            adopt_sibling_spools=True,
+            adoption_recheck_interval_ns=200_000_000,
+            **config._lease_native())
+        service = _store().StorageService(native)
+        service.start()
+        try:
+            # The first look finds no sibling at all.
+            _wait_for(lambda: not service.snapshot()["adoption_owed"]
+                      and service.snapshot()["cycles"] >= 1)
+            snapshot = service.snapshot()
+            assert snapshot["live_siblings"] == 0, snapshot
+            assert snapshot["adopted_spools"] == 0, snapshot
+
+            sibling = _claim(base, config)  # a rank that starts later
+            sibling_directory = Path(sibling.directory)
+            _stage_into(sibling.directory, STAGED_BY_THE_DEAD)
+            staged = sorted(sibling_directory.rglob("*.dmi-pack.ready"))
+            assert len(staged) == len(STAGED_BY_THE_DEAD) // RECORDS_PER_PACK
+            sibling.release()  # and dies with its packs staged
+
+            _wait_for(_adopted(service, 1))
+            snapshot = service.snapshot()
+            assert snapshot["adopted_packs"] == len(staged), snapshot
+            assert not sibling_directory.exists()
+            assert service.flush(60.0)
+            expected = {
+                capture_id: tensor.contiguous().view(-1).numpy().tobytes()
+                for capture_id, tensor in _envelope(
+                    STAGED_BY_THE_DEAD).expected.items()}
+            assert _read_all(config) == expected
+        finally:
+            service.stop()
+        lock.release_and_remove_if_empty()
+
+
 def test_flush_adopts_nothing_while_the_loop_is_idle(fake_s3, tmp_path):
     """flush() covers this process's records, and its cycles never adopt:
     a dead backlog is the loop's. With the object store down, a flush that
