@@ -104,7 +104,8 @@ struct SpoolConfig {
   // the node's spool; before the layout every restart reused one directory
   // and one budget. The charge is refreshed wherever the committed account
   // is (Open, and before a stage is refused), so the capacity comes back as
-  // adoption drains them.
+  // adoption drains them; the service finds a sibling that died after its
+  // last look at its next one (adoption_recheck_interval_ns).
   bool charge_dead_siblings = false;
 };
 
