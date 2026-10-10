@@ -113,6 +113,132 @@ struct CompiledRecordSchema {
   const dmx_host::RecordSchema schema;
 };
 
+// Internal column-role binding. Integrations supply the meanings and current
+// values; the transport never interprets model/rank/sample coordinates.
+struct CompiledRecordLayout {
+  std::shared_ptr<CompiledRecordSchema> owner;
+  dmx_host::RecordLayout layout;
+  std::vector<size_t> varying;
+  std::vector<size_t> common;
+  size_t payload;
+  ring::PayloadMaterialization materialization;
+
+  CompiledRecordLayout(std::shared_ptr<CompiledRecordSchema> schema,
+                       const std::string& name,
+                       const std::vector<size_t>& varying_columns,
+                       size_t payload_column)
+      : owner(std::move(schema)),
+        layout(dmx_host::FindRecordLayout(owner->schema, name)),
+        varying(varying_columns), payload(payload_column) {
+    const size_t width = layout.columns.size();
+    if (payload >= width) throw py::value_error("payload column out of range");
+    std::vector<bool> used(width, false);
+    used[payload] = true;
+    for (size_t col : varying) {
+      if (col >= width || used[col])
+        throw py::value_error("invalid or repeated varying column");
+      used[col] = true;
+    }
+    for (size_t col = 0; col < width; ++col) {
+      if (col != payload && layout.columns[col].type == dmx_host::RecordCellType::TENSOR)
+        throw py::value_error("columnar layout requires exactly one payload column");
+      if (!used[col]) common.push_back(col);
+    }
+    switch (layout.columns[payload].type) {
+      case dmx_host::RecordCellType::TENSOR:
+        materialization = ring::PayloadMaterialization::TENSOR; break;
+      case dmx_host::RecordCellType::FLOAT64:
+        materialization = ring::PayloadMaterialization::FLOAT_SCALAR; break;
+      case dmx_host::RecordCellType::INT64:
+        materialization = ring::PayloadMaterialization::INT_SCALAR; break;
+      default: throw py::value_error("unsupported payload column type");
+    }
+  }
+};
+
+ring::EncodedRecordCell CopyLiteralCell(const py::handle& value,
+                                       dmx_host::RecordCellType type) {
+  return std::visit([](auto&& item) -> ring::EncodedRecordCell {
+    using T = std::decay_t<decltype(item)>;
+    if constexpr (std::is_same_v<T, at::Tensor>) {
+      throw py::type_error("literal tensor cells are not supported");
+    } else {
+      return std::forward<decltype(item)>(item);
+    }
+  }, CopyLiteralRecordValue(value, type));
+}
+
+// Packet: (bound layout, common values, rows, output id). Each row contains
+// (varying values, byte offset, byte length or None, dtype, logical shape).
+// No Python object is retained by the resulting owned native descriptor.
+ring::RecordDescriptor CopyColumnarRecord(const py::tuple& packet,
+                                         const dmx_host::RecordSchema& schema) {
+  const auto& bound = packet[0].cast<const CompiledRecordLayout&>();
+  if (&schema != &bound.owner->schema) {
+    const auto& target = dmx_host::FindRecordLayout(schema, bound.layout.name);
+    if (target.columns.size() != bound.layout.columns.size())
+      throw py::value_error("columnar descriptor schema mismatch");
+    for (size_t i = 0; i < target.columns.size(); ++i) {
+      if (target.columns[i].name != bound.layout.columns[i].name ||
+          target.columns[i].type != bound.layout.columns[i].type)
+        throw py::value_error("columnar descriptor schema mismatch");
+    }
+  }
+  if (!packet[3].is_none() && packet[3].cast<int64_t>() < 0)
+    throw py::value_error("output_id must be non-negative");
+  const auto common = packet[1].cast<py::sequence>();
+  const auto rows = packet[2].cast<py::sequence>();
+  if (py::len(common) != bound.common.size())
+    throw py::value_error("columnar common width mismatch");
+  ring::EncodedRecordRow base;
+  base.cells.resize(bound.layout.columns.size());
+  // An empty descriptor remains an empty descriptor, not a dropped task.
+  // Match the generic encoder: it does not validate absent row cells.
+  if (py::len(rows)) {
+    for (size_t i = 0; i < bound.common.size(); ++i) {
+      const size_t col = bound.common[i];
+      base.cells[col] = CopyLiteralCell(common[i], bound.layout.columns[col].type);
+    }
+  }
+  ring::RecordDescriptor out;
+  out.layout = bound.layout.name;
+  out.rows.reserve(py::len(rows));
+  for (py::handle item : rows) {
+    const auto row = py::cast<py::sequence>(item);
+    if (py::len(row) != 5) throw py::value_error("invalid columnar row");
+    const auto values = row[0].cast<py::sequence>();
+    if (py::len(values) != bound.varying.size())
+      throw py::value_error("columnar varying width mismatch");
+    auto encoded = base;
+    for (size_t i = 0; i < bound.varying.size(); ++i) {
+      const size_t col = bound.varying[i];
+      encoded.cells[col] = CopyLiteralCell(values[i], bound.layout.columns[col].type);
+    }
+    ring::PayloadSlice slice;
+    slice.offset_bytes = row[1].cast<uint64_t>();
+    if (!row[2].is_none()) slice.length_bytes = row[2].cast<uint64_t>();
+    if (row[3].is_none()) throw py::value_error("PayloadSlice dtype is required");
+    slice.dtype = static_cast<int32_t>(row[3].cast<at::ScalarType>());
+    slice.materialization = bound.materialization;
+    slice.logical_shape = row[4].cast<std::vector<int64_t>>();
+    if (bound.materialization != ring::PayloadMaterialization::TENSOR &&
+        !slice.logical_shape.empty())
+      throw py::value_error("scalar PayloadSlice must not declare a shape");
+    for (size_t i = 0; i < slice.logical_shape.size(); ++i) {
+      if (slice.logical_shape[i] < -1)
+        throw py::value_error("invalid payload dimension");
+      if (slice.logical_shape[i] == -1) {
+        if (slice.inferred_dynamic_dim >= 0)
+          throw py::value_error("PayloadSlice supports at most one dynamic dimension");
+        slice.inferred_dynamic_dim = static_cast<int32_t>(i);
+      }
+    }
+    encoded.cells[bound.payload] = std::move(slice);
+    out.rows.push_back(std::move(encoded));
+  }
+  return out;
+}
+
 ring::PayloadMaterialization ParsePayloadMaterialization(
     const py::handle& slice_py, dmx_host::RecordCellType column_type) {
   const int storage = py::cast<int>(slice_py.attr("storage"));
@@ -171,6 +297,11 @@ std::shared_ptr<ring_py::RingEnginePy> MakeRingEngine(Args&&... args) {
 ring::RecordDescriptor CopyRecordDescriptor(
     const py::handle& descriptor_py,
     const dmx_host::RecordSchema& schema) {
+  if (py::isinstance<py::tuple>(descriptor_py)) {
+    auto packet = py::reinterpret_borrow<py::tuple>(descriptor_py);
+    if (py::len(packet) == 4 && py::isinstance<CompiledRecordLayout>(packet[0]))
+      return CopyColumnarRecord(packet, schema);
+  }
   ring::RecordDescriptor descriptor;
   descriptor.layout = py::cast<std::string>(descriptor_py.attr("layout"));
   const auto& layout = dmx_host::FindRecordLayout(schema, descriptor.layout);
@@ -250,10 +381,17 @@ std::vector<ring::RecordDescriptor> CopyRecordDescriptors(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #ifndef DMI_HOST_ONLY
   m.attr("PAYLOAD_ALIGN") = ring::PAYLOAD_ALIGN;
-  py::class_<CompiledRecordSchema>(m, "_CompiledRecordSchema");
+  py::class_<CompiledRecordSchema, std::shared_ptr<CompiledRecordSchema>>(m, "_CompiledRecordSchema");
   m.def("_compile_record_schema", [](py::object schema) {
-    return std::make_unique<CompiledRecordSchema>(schema);
+    return std::make_shared<CompiledRecordSchema>(schema);
   }, py::arg("schema"));
+  py::class_<CompiledRecordLayout>(m, "_CompiledRecordLayout");
+  m.def("_compile_record_layout", [](std::shared_ptr<CompiledRecordSchema> schema,
+                                   const std::string& layout,
+                                   const std::vector<size_t>& varying,
+                                   size_t payload) {
+    return std::make_unique<CompiledRecordLayout>(std::move(schema), layout, varying, payload);
+  });
 
   // ---- Hook definitions (native ABI table; mirrored by dmi/hooks/catalog.py) ----
   // Expose as list of (id, act_name, short_name, per_layer, group, tp_sharded,
@@ -824,6 +962,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              self.push_record_descriptors(std::move(encoded));
            },
            py::arg("descriptors"), py::arg("schema"))
+      .def("reserve_and_submit_records",
+           [](ring_py::RingEnginePy& self,
+              const std::vector<std::pair<uint64_t, bool>>& items,
+              py::sequence descriptors, const CompiledRecordSchema& schema,
+              bool submit_oversized) {
+             if (items.size() != py::len(descriptors))
+               throw py::value_error("reservation/descriptor count mismatch");
+             auto encoded = CopyRecordDescriptors(descriptors, schema.schema);
+             // Conversion must finish before reservation can change ring state.
+             py::gil_scoped_release release;
+             const int result = self.reserve_record(items);
+             if (result != ring_py::RingEnginePy::STEP_OVERSIZED || submit_oversized)
+               self.push_record_descriptors(std::move(encoded));
+             return result;
+           }, py::arg("reservation_items"), py::arg("descriptors"),
+           py::arg("schema"), py::arg("submit_oversized"))
       .def("submit_record_cpu_direct",
            [](ring_py::RingEnginePy& self, at::Tensor cpu_tensor,
               uint64_t tensor_bytes) {

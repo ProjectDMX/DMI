@@ -243,6 +243,12 @@ class RecordRuntime(Generic[MetadataT]):
         self._transport = transport
         self._format = record_format
         self._transport.configure_record_schema(record_format.schema)
+        self._combined_submit = getattr(transport, "_reserve_and_submit_records", None)
+        bind_encoder = getattr(record_format, "_bind_native_encoder", None)
+        self._native_encode = (
+            bind_encoder(transport) if bind_encoder is not None and self._combined_submit is not None
+            else None
+        )
         self._next_output_id = _DYNAMIC_OUTPUT_ID_BASE
         self._output_name_to_id: dict[str, int] = {}
         self._output_specs_by_name: dict[str, Any] = {}
@@ -381,13 +387,12 @@ class RecordRuntime(Generic[MetadataT]):
         output: HookOutput,
         reservation_bytes: int | None,
     ) -> StepReservation:
-        descriptor = self._encode(metadata, entry)
-        reservation = StepReservation(
-            self._transport.reserve_record(self._reservation_items(
-                (entry,), None if reservation_bytes is None else (reservation_bytes,),
-            ))
+        descriptor = self._encode_submission(metadata, entry)
+        reservation = self._submit_records(
+            (entry,), (descriptor,),
+            None if reservation_bytes is None else (reservation_bytes,),
+            submit_oversized=True,
         )
-        self._transport.push_record_descriptors((descriptor,))
         if reservation is StepReservation.OVERSIZED:
             self._transport.submit_record_cpu_direct(output, entry)
         return reservation
@@ -414,15 +419,26 @@ class RecordRuntime(Generic[MetadataT]):
         if self._transport.null_offload:
             return StepReservation.SKIPPED
         descriptors = tuple(
-            self._encode(item, entry)
+            self._encode_submission(item, entry)
             for item, entry in zip(metadata_items, plan.entries)
         )
-        reservation = StepReservation(
-            self._transport.reserve_record(self._reservation_items(
-                plan.entries, reservation_bytes,
-            ))
+        return self._submit_records(
+            plan.entries, descriptors, reservation_bytes, submit_oversized=False,
         )
-        if reservation is not StepReservation.OVERSIZED:
+
+    def _encode_submission(self, metadata: MetadataT, entry: ProducerPlanEntry) -> Any:
+        if self._native_encode is not None and not _hook_point._MONITORING_DEBUG:
+            return self._native_encode(metadata, entry)
+        return self._encode(metadata, entry)
+
+    def _submit_records(self, entries, descriptors, reservation_bytes, *, submit_oversized):
+        items = self._reservation_items(entries, reservation_bytes)
+        if self._combined_submit is not None:
+            return StepReservation(self._combined_submit(
+                items, descriptors, submit_oversized=submit_oversized,
+            ))
+        reservation = StepReservation(self._transport.reserve_record(items))
+        if submit_oversized or reservation is not StepReservation.OVERSIZED:
             self._transport.push_record_descriptors(descriptors)
         return reservation
 

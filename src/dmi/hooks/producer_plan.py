@@ -99,6 +99,39 @@ class ProducerPlanEntry:
             reservation_upper_bytes=upper_bytes,
         )
 
+    @classmethod
+    def _from_eager_output(
+        cls,
+        *,
+        output_id: int,
+        output_spec: TransportSpec,
+        output: HookOutput,
+        transport_args: tuple[int, ...],
+    ) -> tuple["ProducerPlanEntry", int]:
+        """Fresh eager entry and input bytes; never used by graph builders.
+
+        Only transport arguments are supplied by the binding. Tensor metadata
+        and the input byte count are read anew, including for runtime sizing.
+        The returned byte count is not the packed size or reservation bound.
+        """
+        tensor = output.tensor
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError("HookOutput.tensor must be a Tensor")
+        shape = tuple(int(dim) for dim in tensor.shape)
+        output_shape = (shape if output_spec.output_shape is None
+                        else tuple(int(dim) for dim in output_spec.output_shape))
+        input_bytes = int(tensor.numel()) * int(tensor.element_size())
+        upper_bytes = (input_bytes if output_spec.reservation_upper_bytes is None
+                       else int(output_spec.reservation_upper_bytes))
+        if upper_bytes < input_bytes and output_spec.transport_type is TransportType.IDENTITY:
+            raise ValueError("IDENTITY reservation_upper_bytes cannot be smaller than the tensor")
+        return cls(
+            output_id=int(output_id), input_shape=shape, output_shape=output_shape,
+            dtype=tensor.dtype, transport_type=output_spec.transport_type,
+            transport_args=transport_args, storage=output_spec.storage,
+            record_type=output_spec.record_type, reservation_upper_bytes=upper_bytes,
+        ), input_bytes
+
 
 class _WeakrefablePlan:
     # Keep Python 3.10 compatibility (dataclass weakref_slot arrived in 3.11).

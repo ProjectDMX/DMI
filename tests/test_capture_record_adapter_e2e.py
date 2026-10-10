@@ -28,8 +28,9 @@ pytestmark = [
 
 
 class _CaptureHookRuntime:
-    def __init__(self, runtime) -> None:
+    def __init__(self, runtime, *, eager=False) -> None:
         self._runtime = runtime
+        self._eager = eager
         self.metadata = None
 
     def should_emit(self, hook):
@@ -44,14 +45,21 @@ class _CaptureHookRuntime:
         output_spec,
         output,
     ):
-        from dmi.api.v1 import ProducerPlanBuilder
+        from dmi.api.v1 import ProducerPlanBuilder, ProducerPlanEntry
 
         assert self.metadata is not None
-        entry = ProducerPlanBuilder().record_output(
-            output_id=output_id,
-            output_spec=output_spec,
-            output=output,
-        )
+        if self._eager:
+            # This reference uses IDENTITY outputs, whose bound arguments are ().
+            entry, _ = ProducerPlanEntry._from_eager_output(
+                output_id=output_id, output_spec=output_spec, output=output,
+                transport_args=(),
+            )
+        else:
+            entry = ProducerPlanBuilder().record_output(
+                output_id=output_id,
+                output_spec=output_spec,
+                output=output,
+            )
         return self._runtime.emit_output(entry, self.metadata, output)
 
 
@@ -99,8 +107,9 @@ def _read_pack(store, ref):
     )
 
 
+@pytest.mark.parametrize("eager", [False, True])
 def test_reference_adapter_ring_and_cpu_direct_reach_filesystem_pack(
-    tmp_path: Path,
+    tmp_path: Path, eager: bool,
 ):
     from dmi.api.v1 import (
         HookPointV1,
@@ -147,7 +156,7 @@ def test_reference_adapter_ring_and_cpu_direct_reach_filesystem_pack(
         hook = HookPointV1(
             HookSpecV1("capture_tensor", (TransportSpec("payload"),))
         )
-        hook_runtime = _CaptureHookRuntime(runtime)
+        hook_runtime = _CaptureHookRuntime(runtime, eager=eager)
         runtime.bind_hook(hook, hook_runtime=hook_runtime)
 
         first = torch.arange(12, dtype=torch.float32).reshape(3, 4)

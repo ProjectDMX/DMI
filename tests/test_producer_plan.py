@@ -152,3 +152,48 @@ def test_runtime_sized_eager_entries_are_always_fresh_and_graphs_reject_them():
 def test_sizing_mode_requires_the_enum():
     with pytest.raises(TypeError, match="OutputSizingMode"):
         TransportSpec("bad", sizing_mode="runtime_sized")
+
+
+@pytest.mark.parametrize('transport', list(TransportType))
+def test_eager_entry_matches_original_for_live_shapes_dtypes_and_bounds(transport):
+    extra = {}
+    if transport is TransportType.PREFIX_STRIP:
+        extra['row_bytes'] = 4
+    if transport in (TransportType.SEQ_PREFIX_PACK, TransportType.SEGMENTED_PACK):
+        extra.update(feature_bytes=4, output_shape=(-1, 1))
+    spec = TransportSpec('live', transport_type=transport, **extra)
+    args = ProducerPlanBuilder._transport_args(spec)
+    for count, dtype in [(2, torch.float32), (7, torch.float16), (0, torch.int64), (2, torch.float64)]:
+        output = HookOutput(torch.empty(3, count, dtype=dtype).t())
+        old = ProducerPlanEntry.from_output(output_id=1, output_spec=spec, output=output)
+        new, nbytes = ProducerPlanEntry._from_eager_output(
+            output_id=1, output_spec=spec, output=output, transport_args=args)
+        assert new == old
+        assert nbytes == output.tensor.numel() * output.tensor.element_size()
+        assert new is not old
+    invalid = TransportSpec('bad', reservation_upper_bytes=1)
+    with pytest.raises(ValueError, match='cannot be smaller'):
+        ProducerPlanEntry._from_eager_output(output_id=1, output_spec=invalid,
+                                           output=HookOutput(torch.empty(2)), transport_args=())
+
+
+def test_graph_builder_never_calls_eager_entry_factory(monkeypatch):
+    def forbidden(*a, **kw):
+        raise AssertionError('eager factory reached graph builder')
+    monkeypatch.setattr(ProducerPlanEntry, '_from_eager_output', forbidden)
+    builder = ProducerPlanBuilder()
+    builder.record_output(output_id=1, output_spec=TransportSpec('graph'),
+                          output=HookOutput(torch.ones(3)))
+    assert builder.build().entries[0].input_shape == (3,)
+
+
+def test_eager_input_bytes_are_not_capacity_or_packed_payload_bytes():
+    spec = TransportSpec('packed', transport_type=TransportType.SEQ_PREFIX_PACK,
+                         feature_bytes=12, output_shape=(-1, 3),
+                         reservation_upper_bytes=1024)
+    out = HookOutput(torch.empty(4, 2, 3))
+    entry, input_bytes = ProducerPlanEntry._from_eager_output(
+        output_id=1, output_spec=spec, output=out, transport_args=(12,))
+    assert input_bytes == 96
+    assert entry.reservation_upper_bytes == 1024
+    assert entry.output_shape == (-1, 3)

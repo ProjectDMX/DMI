@@ -95,15 +95,67 @@ def test_record_alignment_uses_native_constant():
         assert _align_up(value) == expected
 
 
+@pytest.mark.native_backend
+@require_native_backend()
+def test_column_roles_are_checked_at_binding():
+    backend = native._load_extension()
+    schema = backend._compile_record_schema(_schema())
+    for varying, payload in [((0, 0), 1), ((1,), 1), ((3,), 1), ((), 3)]:
+        with pytest.raises(ValueError):
+            backend._compile_record_layout(schema, "values", varying, payload)
+
+
+@pytest.mark.gpu
+@require_cuda()
+@require_native_backend()
+def test_columnar_submission_owns_mutable_inputs_and_empty_rows(tmp_path):
+    backend = native._load_extension()
+    schema = _schema()
+    handle = backend._compile_record_schema(schema)
+    layout = backend._compile_record_layout(handle, "values", (), 1)
+    sink = native.DropRecordSink(schema, str(tmp_path), 0)
+    config = native.RingConfig()
+    config.task_ring_entries = 8
+    config.payload_ring_bytes = 256
+    config.pinned_staging_bytes = 256
+    engine = native.RingEngine.create_record(config, sink)
+    engine.init()
+    engine.start()
+    try:
+        for key in range(3):
+            common = [key]
+            shape = [128]
+            rows = [] if key == 1 else [[(), 0, 512, torch.float32, shape]]
+            packet = (layout, common, rows, 65536)
+            assert engine.reserve_and_submit_records(((512, False),), (packet,), handle, True) == 2
+            common[0] = 999
+            shape[0] = 1
+            rows.clear()
+            del packet
+            gc.collect()
+            payload = torch.arange(128, dtype=torch.float32).view(torch.uint8)
+            engine.submit_record_cpu_direct(payload, payload.nbytes)
+            assert engine.flush_records_and_wait(5000)
+    finally:
+        engine.stop()
+        sink.close()
+    events = [json.loads(line) for line in
+        (tmp_path / "rank_00000/events.jsonl").read_text().splitlines()]
+    assert [row["key"] for event in events if event["type"] == "record"
+        for row in event["rows"]] == [0, 2]
+
+
 @pytest.mark.gpu
 @require_cuda()
 @require_native_backend()
 @pytest.mark.parametrize("compiled", (False, True))
-def test_native_submissions_keep_conversion_checks_and_owned_rows(tmp_path, compiled):
+@pytest.mark.parametrize("combined", (False, True))
+def test_native_submissions_keep_conversion_checks_and_owned_rows(tmp_path, compiled, combined):
     backend = native._load_extension()
     semantic = _schema()
     source = _CountingSchema(semantic) if compiled else semantic
     schema = backend._compile_record_schema(source) if compiled else source
+    combined_schema = schema if compiled else backend._compile_record_schema(source)
     sink = native.DropRecordSink(semantic, str(tmp_path), 0)
     config = native.RingConfig()
     config.task_ring_entries = 8
@@ -117,8 +169,16 @@ def test_native_submissions_keep_conversion_checks_and_owned_rows(tmp_path, comp
         for key in range(3):
             descriptor = RecordDescriptor("values", ((key,
                 PayloadSlice(dtype=torch.float32, shape=(128,))),))
-            assert engine.reserve_record(((payload.nbytes, False),)) == 2
-            engine.push_record_descriptors((descriptor,), schema)
+            if combined:
+                # A graph cannot enqueue an oversized descriptor; eager then
+                # submits exactly one descriptor for its CPU-direct fallback.
+                assert engine.reserve_and_submit_records(((payload.nbytes, False),),
+                    (descriptor,), combined_schema, False) == 2
+                assert engine.reserve_and_submit_records(((payload.nbytes, False),),
+                    (descriptor,), combined_schema, True) == 2
+            else:
+                assert engine.reserve_record(((payload.nbytes, False),)) == 2
+                engine.push_record_descriptors((descriptor,), schema)
             del descriptor
             gc.collect()
             engine.submit_record_cpu_direct(payload, payload.nbytes)
@@ -129,6 +189,12 @@ def test_native_submissions_keep_conversion_checks_and_owned_rows(tmp_path, comp
                 PayloadSlice(dtype=torch.float32, shape=(128,))),)),), schema)
         with pytest.raises(ValueError, match="row width"):
             engine.push_record_descriptors((RecordDescriptor("values", ((1,),)),), schema)
+        if combined:
+            with pytest.raises(ValueError, match="row width"):
+                engine.reserve_and_submit_records(((16, False),),
+                    (RecordDescriptor("values", ((1,),)),), combined_schema, True)
+            # Conversion failure must not leave a reserved task without payload.
+            assert engine.flush_records_and_wait(5000)
         other = backend._compile_record_schema(_schema("other"))
         with pytest.raises((ValueError, RuntimeError), match="layout"):
             engine.push_record_descriptors((RecordDescriptor("values", ()),), other)

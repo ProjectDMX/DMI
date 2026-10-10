@@ -473,6 +473,20 @@ class RingTransport:
 
         return int(self._ring_engine.reserve_record(tuple(reservation_items)))
 
+    def _compile_record_layout(self, layout: str, varying: tuple[int, ...], payload: int) -> Any:
+        from .native import _load_extension
+
+        return _load_extension()._compile_record_layout(
+            self._compiled_record_schema, layout, varying, payload,
+        )
+
+    def _reserve_and_submit_records(
+        self, reservation_items: Any, descriptors: Any, *, submit_oversized: bool,
+    ) -> int:
+        return int(self._ring_engine.reserve_and_submit_records(
+            reservation_items, descriptors, self._compiled_record_schema, submit_oversized,
+        ))
+
     def push_record_descriptors(self, descriptors: Any) -> None:
         """Publish descriptors in the exact order of their producer tasks."""
 
