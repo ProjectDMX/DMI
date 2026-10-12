@@ -59,7 +59,7 @@ RingEngine::RingEngine(const RingConfig& cfg,
             "(unexpected: cudaMalloc guarantees >= 256-byte alignment)");
     }
 
-    staging_.init(cfg.effective_staging_bytes());
+    if (!cfg_.mirror_only) staging_.init(cfg.effective_staging_bytes());
     drain_ = std::make_unique<DrainThread>(ring_.state(), staging_, cfg_);
     record_sink_ = record_sink_lease_
         ? record_sink_lease_->claim() : nullptr;
@@ -91,6 +91,7 @@ void RingEngine::start() {
         throw std::logic_error(
             "record RingEngine cannot restart after stop");
     }
+    if (cfg_.mirror_only) return;  // nothing is drained to the host
     drain_->start();
     if (p2p_) p2p_->start();
     if (record_p2p_) record_p2p_->start();

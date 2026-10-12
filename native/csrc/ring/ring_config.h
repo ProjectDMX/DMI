@@ -59,6 +59,14 @@ struct RingConfig {
     // Batch drain flush rules.
     DrainFlushConfig drain_flush;
 
+    // Mirror-only record ring: the GPU payload ring keeps what producers
+    // write, but nothing is copied to the host.  No pinned staging is
+    // allocated, no drain/record threads run, and a reservation advances the
+    // tails together with the heads, so ring space is reusable at once and
+    // bytes stay until a later reservation wraps onto them.  Used on TP ranks
+    // whose captured data another rank already copies to the host.
+    bool mirror_only = false;
+
     // Clone per-request slices before submitting to host engine.
     // When true (and batch_size > 1), each slice is cloned so the full
     // tensor can be freed immediately. When false, slices are views

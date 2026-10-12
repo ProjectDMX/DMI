@@ -79,6 +79,9 @@ public:
     uint64_t cpu_task_head() const;
     uint64_t cpu_task_tail_committed() const;
 
+    // Mirror-only rings: reserve and immediately retire (tails = heads).
+    void reserve_mirror(uint64_t payload_bytes, uint64_t tasks);
+
     // Pre-allocate ring space for the next step's producer kernels.
     // Advances cpu_payload_head_ and cpu_task_head_ under mgmt_mu_.
     // Called from prepare_step after confirming space is available.

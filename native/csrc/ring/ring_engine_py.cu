@@ -359,6 +359,7 @@ static ring::RingConfig convert(const RingConfig& c) {
     r.clone_slices                = c.clone_slices;
     r.insert_queue_max_bytes      = c.insert_queue_max_bytes;
     r.insert_queue_max_items      = c.insert_queue_max_items;
+    r.mirror_only                 = c.mirror_only;
     return r;
 }
 
@@ -674,6 +675,17 @@ int RingEnginePy::reserve_record(
     if (items.empty()) return STEP_RING_OK;
     const uint64_t num_tasks = items.size();
 
+    if (impl_->engine.mirror_only()) {
+        // Nothing is drained: an item larger than the ring is skipped, the
+        // rest is reserved and retired at once.
+        if (reservation_bytes > impl_->engine.payload_cap() ||
+            num_tasks > impl_->engine.task_cap()) {
+            return STEP_OVERSIZED;
+        }
+        impl_->engine.drain_thread().reserve_mirror(reservation_bytes, num_tasks);
+        return STEP_RING_OK;
+    }
+
     const uint64_t payload_cap = impl_->engine.payload_cap();
     const uint64_t staging_cap = impl_->engine.staging_cap();
     const uint64_t effective_cap = std::min(payload_cap, staging_cap);
@@ -738,6 +750,7 @@ void RingEnginePy::begin_record_step() {
     if (!impl_->record_mode) {
         throw std::logic_error("record steps require a record ring");
     }
+    if (impl_->engine.mirror_only()) return;
     auto& consumer = impl_->engine.record_consumer();
     if (impl_->record_options.failure_policy ==
         ring::RecordFailurePolicy::kRaiseAtProducer) {
@@ -792,6 +805,7 @@ void RingEnginePy::push_record_descriptors(
     if (!impl_->record_mode) {
         throw std::logic_error("record descriptors require a record ring");
     }
+    if (impl_->engine.mirror_only()) return;  // no consumer for mirror records
     impl_->engine.record_consumer().push_descriptors(std::move(descriptors));
 }
 
@@ -800,6 +814,7 @@ void RingEnginePy::submit_record_cpu_direct(
     if (!impl_->record_mode) {
         throw std::logic_error("record CPU submission requires a record ring");
     }
+    if (impl_->engine.mirror_only()) return;  // oversized mirror items are skipped
     impl_->engine.drain_thread().submit_cpu_direct(
         std::move(cpu_tensor), tensor_bytes);
 }
@@ -808,6 +823,7 @@ bool RingEnginePy::flush_records_and_wait(uint64_t timeout_ms) {
     if (!impl_->record_mode) {
         throw std::logic_error("record flush requires a record ring");
     }
+    if (impl_->engine.mirror_only()) return true;  // nothing to flush
     const auto deadline = record_flush_deadline(timeout_ms);
     auto& drain = impl_->engine.drain_thread();
     auto& consumer = impl_->engine.record_consumer();
@@ -890,6 +906,14 @@ uint64_t RingEnginePy::staging_cap() const {
 
 uint64_t RingEnginePy::task_cap() const {
     return impl_->engine.task_cap();
+}
+
+uint64_t RingEnginePy::payload_reserved_head() {
+    return impl_->engine.drain_thread().cpu_payload_head();
+}
+
+uint64_t RingEnginePy::payload_committed_tail() {
+    return impl_->engine.drain_thread().cpu_payload_tail_committed();
 }
 
 at::Tensor RingEnginePy::payload_tensor() const {

@@ -259,6 +259,15 @@ void DrainThread::reserve(uint64_t payload_bytes, uint32_t num_tasks) {
     cpu_task_head_    += num_tasks;
 }
 
+void DrainThread::reserve_mirror(uint64_t payload_bytes, uint64_t tasks) {
+    std::lock_guard<std::mutex> lk(mgmt_mu_);
+    cpu_payload_head_ += payload_bytes;
+    cpu_payload_tail_ = cpu_payload_head_;
+    cpu_payload_tail_committed_ = cpu_payload_head_;
+    cpu_task_head_ += tasks;
+    cpu_task_tail_ = cpu_task_head_;
+}
+
 void DrainThread::reserve_record(
     const std::vector<RecordReservationItem>& items) {
     std::lock_guard<std::mutex> lk(mgmt_mu_);

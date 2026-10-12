@@ -44,6 +44,8 @@ struct RingConfig {
     // ClickHouse insert queue limits
     uint64_t insert_queue_max_bytes     = 4096ULL * 1024 * 1024;
     uint64_t insert_queue_max_items     = 65536;
+    // Mirror-only record ring (see ring::RingConfig::mirror_only).
+    bool     mirror_only                = false;
 };
 
 // How a record ring treats a sink that refuses or stalls.  Fixed for the
@@ -268,6 +270,22 @@ public:
     // which gives AOT autograd a real R/W dependency that prevents
     // inductor from reordering successive producer launches.
     at::Tensor payload_tensor() const;
+
+    // Payload-ring residency (read-only).  Both values are logical,
+    // monotonically increasing byte offsets (not wrapped by payload_cap()).
+    //   payload_reserved_head(): end of the latest host reservation.  The next
+    //     producer writes at this logical offset.
+    //   payload_committed_tail(): bytes up to here have been copied D2H and
+    //     their ring space may be reused.
+    // A record reserved at logical offset L with n bytes keeps its bytes in
+    // the GPU payload ring, at physical offset L % payload_cap() (wrapping
+    // once), until a later reservation moves payload_reserved_head() past
+    // L + payload_cap(): it stays intact while
+    //   payload_reserved_head() - L <= payload_cap().
+    // Producers write in current-stream order, so work enqueued on that
+    // stream before the next reservation reads the bytes before any overwrite.
+    uint64_t payload_reserved_head();
+    uint64_t payload_committed_tail();
 
     // ---- Runtime queries / actions used by the safety-net branch in
     //      HookPoint.forward (eager-only path).  Never called during

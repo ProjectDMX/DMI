@@ -641,6 +641,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("drain_flush_byte_threshold",  &ring_py::RingConfig::drain_flush_byte_threshold)
       .def_readwrite("drain_flush_timeout_us",     &ring_py::RingConfig::drain_flush_timeout_us)
       .def_readwrite("clone_slices",              &ring_py::RingConfig::clone_slices)
+      .def_readwrite("mirror_only",               &ring_py::RingConfig::mirror_only)
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
       .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items);
 
@@ -830,6 +831,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("staging_cap", &ring_py::RingEnginePy::staging_cap)
       .def("task_cap",    &ring_py::RingEnginePy::task_cap)
       .def("payload_tensor", &ring_py::RingEnginePy::payload_tensor)
+      // Payload-ring residency for consumers that read captured bytes back
+      // from the GPU ring before they are overwritten (see ring_engine_py.h).
+      .def("payload_reserved_head", &ring_py::RingEnginePy::payload_reserved_head)
+      .def("payload_committed_tail", &ring_py::RingEnginePy::payload_committed_tail)
       // Safety-net surface (eager only).  available_capacity(),
       // available_task_slots() and reserve_one() are CPU-only and fast --
       // no GIL release needed.
