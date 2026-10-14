@@ -642,7 +642,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("drain_flush_timeout_us",     &ring_py::RingConfig::drain_flush_timeout_us)
       .def_readwrite("clone_slices",              &ring_py::RingConfig::clone_slices)
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
-      .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items);
+      .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items)
+      .def_readwrite("drain_policy",              &ring_py::RingConfig::drain_policy);
 
   // Production sinks remain native-only.  The explicitly named reference
   // bridge below is opt-in and intentionally pays the Python GIL/copy cost.
@@ -758,6 +759,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("reservation_items"),
            py::call_guard<py::gil_scoped_release>())
       .def("begin_record_step", &ring_py::RingEnginePy::begin_record_step)
+      .def("allow_flush_step", &ring_py::RingEnginePy::allow_flush_step)
       .def("capture_status",
            [](const ring_py::RingEnginePy& self) {
              const ring_py::RecordCaptureStatus status =

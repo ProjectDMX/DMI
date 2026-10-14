@@ -37,6 +37,7 @@ public:
     bool record_mode() const { return static_cast<bool>(record_p2p_); }
 
     uint64_t  payload_cap() const { return cfg_.payload_ring_bytes; }
+    bool      drain_step_gated() const { return cfg_.drain_step_gated; }
     uint64_t  staging_cap() const { return staging_.capacity(); }
     uint64_t  task_cap()    const { return cfg_.task_ring_entries; }
 

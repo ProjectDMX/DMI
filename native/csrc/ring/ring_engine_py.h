@@ -44,6 +44,10 @@ struct RingConfig {
     // ClickHouse insert queue limits
     uint64_t insert_queue_max_bytes     = 4096ULL * 1024 * 1024;
     uint64_t insert_queue_max_items     = 65536;
+    // Drain policy: "autonomous" (flush on drain_flush rules and the poll
+    // timeout) or "step_gated" (record rings only: flush what
+    // allow_flush_step() grants; see ring::RingConfig::drain_step_gated).
+    std::string drain_policy            = "autonomous";
 };
 
 // How a record ring treats a sink that refuses or stalls.  Fixed for the
@@ -241,6 +245,15 @@ public:
     // (and output ids repeat within a step), and a CUDA-graph step replays
     // one plan, or several with piecewise graphs.
     void begin_record_step();
+
+    // Step-gated drain (drain_policy "step_gated"): close the current step's
+    // gap.  Call once per model step on the producing thread, after the
+    // step's producers are enqueued.  Grants the drain every ring record
+    // reserved since the previous call, flushable once the GPU passes an
+    // event recorded now on the current stream.  A gap without ring records
+    // (none reserved, or only oversized records, which bypass the ring)
+    // records no event.  Non-blocking.
+    void allow_flush_step();
 
     RecordCaptureStatus record_capture_status() const;
 

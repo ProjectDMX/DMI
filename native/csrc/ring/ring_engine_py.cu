@@ -165,6 +165,10 @@ struct RingEnginePy::Impl {
     at::Tensor       payload_view;
     bool             record_mode{false};
 
+    // Step-gated drain: ring records reserved since the last allow_flush_step()
+    // (the current step's gap).  Written by the reserving thread only.
+    uint64_t         gap_records{0};
+
     // Record rings only.  The step state is written by the reserving
     // thread; the atomics let record_capture_status read from any thread.
     RecordRuntimeOptions         record_options;
@@ -359,11 +363,22 @@ static ring::RingConfig convert(const RingConfig& c) {
     r.clone_slices                = c.clone_slices;
     r.insert_queue_max_bytes      = c.insert_queue_max_bytes;
     r.insert_queue_max_items      = c.insert_queue_max_items;
+    if (c.drain_policy == "step_gated") {
+        r.drain_step_gated = true;
+    } else if (c.drain_policy != "autonomous") {
+        throw std::invalid_argument(
+            "drain_policy must be 'autonomous' or 'step_gated', got '" +
+            c.drain_policy + "'");
+    }
     return r;
 }
 
 // ---------------------------------------------------------------------------
 RingEnginePy::RingEnginePy(RingConfig cfg, SubmitFn submit_fn) {
+    if (cfg.drain_policy == "step_gated") {
+        throw std::invalid_argument(
+            "drain_policy 'step_gated' requires a record ring");
+    }
     impl_ = std::make_unique<Impl>(convert(cfg), std::move(submit_fn));
 }
 
@@ -719,6 +734,7 @@ int RingEnginePy::reserve_record(
     if (reservation_bytes <= payload_cap - payload_used &&
         num_tasks <= task_cap - task_used) {
         drain.reserve_record(items);
+        if (impl_->engine.drain_step_gated()) impl_->gap_records += num_tasks;
         return STEP_RING_OK;
     }
 
@@ -731,12 +747,19 @@ int RingEnginePy::reserve_record(
             "record flush found incomplete producer reclaims");
     }
     drain.reserve_record(items);
+    if (impl_->engine.drain_step_gated()) impl_->gap_records += num_tasks;
     return STEP_RING_FLUSHED;
 }
 
 void RingEnginePy::begin_record_step() {
     if (!impl_->record_mode) {
         throw std::logic_error("record steps require a record ring");
+    }
+    if (impl_->engine.drain_step_gated() && impl_->gap_records != 0) {
+        // Those records would never be granted to the drain.
+        throw std::logic_error(
+            "step-gated drain: a record step began while the previous step "
+            "still has ring records not granted by allow_flush_step()");
     }
     auto& consumer = impl_->engine.record_consumer();
     if (impl_->record_options.failure_policy ==
@@ -754,6 +777,19 @@ void RingEnginePy::begin_record_step() {
         consumer.end_discard_window();
     }
     consumer.begin_step();
+}
+
+void RingEnginePy::allow_flush_step() {
+    if (!impl_->record_mode || !impl_->engine.drain_step_gated()) {
+        throw std::logic_error(
+            "allow_flush_step requires a record ring with drain_policy "
+            "'step_gated'");
+    }
+    const uint64_t records = impl_->gap_records;
+    impl_->gap_records = 0;
+    if (records == 0) return;  // nothing entered the ring in this gap
+    impl_->engine.drain_thread().allow_flush_step(
+        records, at::cuda::getCurrentCUDAStream().stream());
 }
 
 RecordCaptureStatus RingEnginePy::record_capture_status() const {
