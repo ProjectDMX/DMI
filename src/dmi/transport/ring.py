@@ -427,6 +427,12 @@ class RingTransport:
 
         self._ring_engine.begin_record_step()
 
+    def allow_flush_step(self) -> None:
+        """Step-gated drain: grant the step's ring records to the drain
+        (see RecordRuntime.allow_flush_step)."""
+
+        self._ring_engine.allow_flush_step()
+
     def push_record_descriptors(self, descriptors: Any) -> None:
         """Publish descriptors in the exact order of their producer tasks."""
 

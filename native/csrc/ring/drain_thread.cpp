@@ -63,6 +63,9 @@ DrainThread::DrainThread(RingState& rs, PinnedStaging& staging,
 
 DrainThread::~DrainThread() noexcept {
     stop();
+    // Grants left at stop were covered by the final flush.
+    for (FlushGrant& grant : grants_) cudaEventDestroy(grant.event);
+    grants_.clear();
     cudaStreamDestroy(stream_);
 }
 
@@ -326,6 +329,32 @@ void DrainThread::rethrow_drain_failure() {
 }
 
 // ---------------------------------------------------------------------------
+// allow_flush_step -- step-gated drain grant (producing thread).
+// ---------------------------------------------------------------------------
+void DrainThread::allow_flush_step(uint64_t records, cudaStream_t stream) {
+    if (records == 0) return;
+    cudaEvent_t event = nullptr;
+    throw_cuda_failure(
+        "cudaEventCreateWithFlags",
+        cudaEventCreateWithFlags(
+            &event, cudaEventBlockingSync | cudaEventDisableTiming));
+    const cudaError_t recorded = cudaEventRecord(event, stream);
+    if (recorded != cudaSuccess) {
+        cudaEventDestroy(event);
+        throw_cuda_failure("cudaEventRecord", recorded);
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (drain_failure_) {
+            cudaEventDestroy(event);
+            std::rethrow_exception(drain_failure_);
+        }
+        grants_.push_back({records, event});
+    }
+    cv_.notify_one();
+}
+
+// ---------------------------------------------------------------------------
 // submit_cpu_direct -- submit a CPU-direct tensor to drain -> p2p pipeline.
 // ---------------------------------------------------------------------------
 void DrainThread::submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes) {
@@ -361,6 +390,55 @@ void DrainThread::do_full_flush() {
                 flush_count++;
             }
             if (flush_count == 0) break;
+            flush_state_update(flush_count, flush_bytes);
+        }
+        {
+            std::unique_lock<std::mutex> lk(staging_mu_);
+            staging_cv_.wait(lk, [&] { return staging_.free_bytes() >= flush_bytes; });
+        }
+        enqueue_d2h(flush_bytes);
+        sync_stream();
+        {
+            std::lock_guard<std::mutex> lk(mgmt_mu_);
+            cpu_payload_tail_committed_ = cpu_payload_tail_;
+        }
+        submit_to_p2p(flush_count, flush_bytes);
+        {
+            std::lock_guard<std::mutex> lk(mgmt_mu_);
+            trim_scanned(flush_count, flush_bytes);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// flush_allowed -- step-gated drain: flush granted records.  Drain thread only.
+// Every record below allowed_records_ is published: its producer was enqueued
+// before the grant's event, which has completed.  A forced flush may already
+// have moved the tail past some of them.
+// ---------------------------------------------------------------------------
+void DrainThread::flush_allowed() {
+    for (;;) {
+        uint64_t flush_count = 0, flush_bytes = 0;
+        {
+            std::lock_guard<std::mutex> lk(mgmt_mu_);
+            if (cpu_task_tail_ >= allowed_records_) return;
+            const uint64_t granted = allowed_records_ - cpu_task_tail_;
+            scan_ready();
+            if (scanned_.size() < granted) {
+                throw std::runtime_error(
+                    "step-gated drain: a granted record is not published "
+                    "after its step event completed");
+            }
+            for (size_t i = 0; i < scanned_.size() && flush_count < granted; ++i) {
+                const uint64_t ab = align_up(scanned_[i], PAYLOAD_ALIGN);
+                if (flush_bytes + ab > staging_.capacity()) break;
+                flush_bytes += ab;
+                flush_count++;
+            }
+            if (flush_count == 0) {
+                throw std::runtime_error(
+                    "step-gated drain: a record does not fit the staging ring");
+            }
             flush_state_update(flush_count, flush_bytes);
         }
         {
@@ -428,6 +506,42 @@ void DrainThread::loop() {
             }
             flush_done_cv_.notify_all();
             continue;  // skip normal sleep, re-check immediately
+        }
+
+        if (cfg_.drain_step_gated) {
+            // Serve one grant: wait for its step event, then flush what it
+            // allows.  Otherwise sleep until a grant, a forced flush, or stop.
+            FlushGrant grant;
+            bool have_grant = false;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (!grants_.empty()) {
+                    grant = grants_.front();
+                    grants_.pop_front();
+                    have_grant = true;
+                }
+            }
+            if (have_grant) {
+                try {
+                    const cudaError_t waited = cudaEventSynchronize(grant.event);
+                    cudaEventDestroy(grant.event);
+                    throw_cuda_failure("cudaEventSynchronize", waited);
+                    allowed_records_ += grant.records;
+                    flush_allowed();
+                } catch (...) {
+                    record_drain_failure(std::current_exception());
+                }
+                continue;
+            }
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait(lk, [this] {
+                return !grants_.empty() ||
+                       flush_requested_generation_ >
+                           flush_completed_generation_ ||
+                       !running_.load(std::memory_order_relaxed);
+            });
+            notified_ = false;
+            continue;
         }
 
         uint64_t flush_count = 0, flush_bytes = 0;

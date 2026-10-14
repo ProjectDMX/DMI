@@ -41,6 +41,7 @@ def _legacy_engine(task_entries):
     config.payload_ring_bytes = RING_BYTES
     config.pinned_staging_bytes = RING_BYTES
     engine = MonitoringEngine(model_id="eager-safety-net", ring_config=config)
+    engine._ensure_ring_transport()  # the legacy ring is built on first use
     assert not engine._record_mode
     return engine
 

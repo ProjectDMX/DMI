@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from ...engine import effective_ring_bytes
-from ..base import _refuse_unwired_capture_storage
+from ..base import _refuse_unwired_capture_storage, engine_ring_transport
 from .adapter import (
     HuggingFaceAdapter,
     _prepare_profile_times,
@@ -237,7 +237,7 @@ def _generate_with_monitoring_impl(
             "capture), or detach it first "
             "(adapter.detach_model(model)) and let this call own the model."
         )
-    if engine._ring_transport is None:
+    if engine_ring_transport(engine) is None:
         raise RuntimeError(
             "generate_with_monitoring() found model.monitoring_engine, but "
             "ring transport is disabled. Construct MonitoringEngine with "
@@ -587,7 +587,7 @@ def generate_greedy_with_monitoring(
         _refuse_unwired_capture_storage(
             engine, "generate_greedy_with_monitoring()",
             HuggingFaceAdapter.__name__)
-        if engine is not None and engine._ring_transport is not None:
+        if engine is not None and engine_ring_transport(engine) is not None:
             adaptor = HuggingFaceAdapter(
                 engine, engine._model_id,
                 no_strip_left_pad=no_strip_left_pad,

@@ -329,6 +329,22 @@ class RecordRuntime(Generic[MetadataT]):
 
         self._transport.begin_record_step()
 
+    def allow_flush_step(self) -> None:
+        """Close one model step for a ``drain_policy="step_gated"`` ring.
+
+        Call it once per model step on the producing thread, after the
+        step's records are emitted (their producers enqueued). The drain may
+        then flush every ring record reserved since the previous call, once
+        the GPU passes an event recorded now on the current stream; it never
+        flushes on its own. A step with no ring records (none emitted, or
+        only oversized records, which bypass the ring) records no event.
+        Non-blocking. Beginning the next step while this step's ring records
+        are still ungranted raises. Records reserved before capture was
+        disabled are still granted: disabling stops new reservations only.
+        """
+
+        self._transport.allow_flush_step()
+
     def emit_output(
         self,
         entry: ProducerPlanEntry,

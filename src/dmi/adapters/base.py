@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import abc
 from enum import IntEnum
-from typing import List, NamedTuple, Optional, TYPE_CHECKING
+from typing import Any, List, NamedTuple, Optional, TYPE_CHECKING
 
 import torch
 
@@ -91,6 +91,14 @@ def _refuse_unwired_capture_storage(
     )
 
 
+
+def engine_ring_transport(engine: Any) -> Any:
+    """The engine's ring transport, building its legacy ring on first use
+    (``MonitoringEngine._ensure_ring_transport``); engines without lazy rings
+    expose ``_ring_transport`` directly."""
+    ensure = getattr(engine, "_ensure_ring_transport", None)
+    return ensure() if ensure is not None else engine._ring_transport
+
 class StepPlan(NamedTuple):
     """Immutable, tuple-compatible reservation inputs for one model step."""
 
@@ -122,7 +130,7 @@ class BackendAdapter(abc.ABC):
     def __init__(self, engine: "MonitoringEngine", model_id: str) -> None:
         self.engine = engine
         self.model_id = model_id
-        self.transport = engine._ring_transport
+        self.transport = engine_ring_transport(engine)
         self.ring_engine = getattr(engine, "_ring_engine", None)
         self.model_cfg: Optional[ModelShapeConfig] = None
         self.active_specs: List[HookSpec] = []
