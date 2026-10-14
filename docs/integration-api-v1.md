@@ -334,8 +334,15 @@ accessing those objects.
   engine from its one stage. Prefer explicit `host_engine` when the caller
   needs direct access to `raise_if_failed()` and other diagnostics.
 - `host_engine` and `db_config` are mutually exclusive.
-- Supplying `ring_config` starts a ring even when
+- Supplying `ring_config` configures a ring even when
   `enable_ring_transport=False`.
+- The constructor builds no ring: the ring is built on first use, from the
+  configured (or default) `RingConfig`. The first legacy entry point (an
+  adaptor attach, generation with monitoring, `ring_capacities()`,
+  `capture_enabled`, `set_capture_enabled()`) builds the legacy ring;
+  `create_record_runtime()` builds the record ring instead. An engine that
+  only records never builds a legacy ring, and no ring is built only to be
+  replaced. `enable_ring_transport()` still builds one at once.
 - With no explicit `ring_config`, the wrapper defaults to a 4096 MiB GPU
   payload ring, 4096 MiB pinned staging ring, and 65,536 task entries. These
   are much larger than raw `RingConfig()` defaults.
@@ -371,7 +378,9 @@ It raises `RuntimeError` if no ring is active. Reading it calls three native
 capacity getters; integrations should cache the snapshot for a loaded engine
 instead of querying it per forward.
 
-`capture_enabled` is false when no ring is active or capture is suppressed.
+`capture_enabled` builds the configured legacy ring on first use, like the
+other legacy entry points; it is false when no ring is configured or capture is
+suppressed.
 It reports the engine-owned suppression flag; it does not detect whether a
 caller separately cleared the process-global binding with
 `deactivate_ring_transport()`.
@@ -597,6 +606,24 @@ active and `flush_and_wait()` succeeds. Under `"raise"` the exhaustion is
 raised at the next `begin_step()` and at `flush_and_wait()`, never inside
 the forward that ran out of budget, and the runtime is failed from then on.
 `None`, the default, waits without bound.
+
+With `RingConfig.drain_policy = "step_gated"` the drain never flushes on its
+own. Such a config is for record rings only: a legacy ring refuses it. The
+integration calls `RecordRuntime.allow_flush()` once per model step
+on the producing thread, after the step's records are emitted (between
+`begin_step()` and the next `begin_step()`). The call records an event on the
+current stream and grants the drain every ring record reserved since the
+previous call; the drain sleeps until a grant arrives, waits on its event
+(the step's producers ran before it on the same stream), then flushes the
+granted records. Nothing synchronizes the forward's stream. A step without
+ring records (none emitted, or only oversized records, which take the forced
+flush and CPU-direct path as with the default policy) records no event.
+Beginning a step while the previous one still has ungranted ring records
+raises: those records would never be flushed. A forced flush (a reservation
+that does not fit, `flush_and_wait()`) works as with the default policy and
+may deliver records before their grant; the grant then has nothing left to
+do. Use it when each step's records are small next to a step, so flushing
+once per step neither delays the records nor overlaps other transfers.
 
 The skip still waits for the one envelope the sink is admitting, so a budget
 needs a sink whose admission is bounded, and `create_record_runtime()`

@@ -59,6 +59,16 @@ struct RingConfig {
     // Batch drain flush rules.
     DrainFlushConfig drain_flush;
 
+    // Step-gated drain (record rings only).  The drain never flushes on its
+    // own: no poll timeout, no drain_flush rule.  Once per model step, after
+    // the step's producers are enqueued, the producing thread calls
+    // allow_flush(): it records an event on the current stream and grants the
+    // drain the ring records reserved since the previous allow.  The drain
+    // sleeps until a grant arrives, waits on its event, then flushes the
+    // granted records.  A forced flush (full ring, oversized record,
+    // flush_and_wait) works as in the default policy.
+    bool drain_step_gated = false;
+
     // Clone per-request slices before submitting to host engine.
     // When true (and batch_size > 1), each slice is cloned so the full
     // tensor can be freed immediately. When false, slices are views

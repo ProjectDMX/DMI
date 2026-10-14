@@ -60,6 +60,11 @@ public:
     bool force_flush_and_wait_until(
         std::chrono::steady_clock::time_point deadline);
 
+    // Step-gated drain: grant `records` more ring records, flushable once
+    // the GPU passes an event recorded now on `stream` (the producers of
+    // those records were enqueued on it before this call).  Non-blocking.
+    void allow_flush(uint64_t records, cudaStream_t stream);
+
     // Submit a CPU-direct tensor to drain -> p2p pipeline.
     // The tensor is already in pageable CPU memory; skips D2H and staging.
     void submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes);
@@ -138,6 +143,17 @@ private:
     std::exception_ptr      drain_failure_;                  // guarded by mu_
     std::condition_variable flush_done_cv_;
 
+    // Step-gated drain grants (producing thread -> drain thread), guarded by
+    // mu_.  allowed_records_ is the drain thread's own running total of
+    // granted records whose event completed; a forced flush may move the
+    // record tail past it, and later grants then flush only what is below.
+    struct FlushGrant {
+        uint64_t    records{0};
+        cudaEvent_t event{nullptr};
+    };
+    std::deque<FlushGrant>  grants_;
+    uint64_t                allowed_records_{0};  // drain thread only
+
     std::deque<DrainTask>   task_queue_;
     std::mutex              queue_mu_;
     uint64_t                can_pop_count_{0};
@@ -153,6 +169,10 @@ private:
     // Drain all pending entries -- called by the drain thread for an
     // outstanding flush generation.  Flushes repeatedly until empty.
     void do_full_flush();
+
+    // Step-gated drain: flush records until the record tail reaches
+    // allowed_records_.  Called by the drain thread after a grant's event.
+    void flush_allowed();
 
     // Called under mgmt_mu_:
     void scan_ready();

@@ -227,11 +227,31 @@ class MonitoringEngine:
                     pinned_mb=ring_pinned_mb,
                     task_entries=ring_task_entries,
                 )
-            self.enable_ring_transport(ring_config)
+            if self._storage_backend == "none":
+                self.enable_ring_transport(ring_config)  # refuses: capture off
+            # Rings are built on first use, from this config: the legacy ring
+            # by the first legacy entry point (_ensure_ring_transport), the
+            # record ring by create_record_runtime. An engine never builds a
+            # ring it does not use, nor two rings for one runtime.
+            self._ring_config = ring_config
 
 
     # ------------------------------------------------------------------
     # Ring transport API
+
+    def _ensure_ring_transport(self) -> Optional[Any]:
+        """The active ring transport; builds the legacy ring on first use.
+
+        The constructor only keeps the ring config. A legacy entry point (an
+        adapter attach, generation with monitoring, the capture toggles and
+        capacities) builds the legacy ring here; create_record_runtime builds
+        the record ring instead, so a recording engine never builds the
+        legacy one. None when no ring is configured.
+        """
+        if (self._ring_transport is None and self._ring_config is not None
+                and not self._record_mode):
+            self.enable_ring_transport(self._ring_config)
+        return self._ring_transport
 
     def ring_capacities(self) -> RingCapacities:
         """Return a stable snapshot of the active ring's capacity limits.
@@ -240,6 +260,7 @@ class MonitoringEngine:
         object so integrations cannot mutate ring lifecycle or reservation
         state.
         """
+        self._ensure_ring_transport()
         ring_engine = getattr(self, "_ring_engine", None)
         if ring_engine is None:
             raise RuntimeError("Ring transport is not enabled")
@@ -252,7 +273,7 @@ class MonitoringEngine:
     @property
     def capture_enabled(self) -> bool:
         """Whether the active transport is accepting capture metadata."""
-        transport = self._ring_transport
+        transport = self._ensure_ring_transport()
         return transport is not None and not bool(transport.null_offload)
 
     def set_capture_enabled(self, enabled: bool) -> None:
@@ -264,7 +285,7 @@ class MonitoringEngine:
         suppression changes only after that transition succeeds, so an error
         leaves the Python-visible state unchanged.
         """
-        transport = self._ring_transport
+        transport = self._ensure_ring_transport()
         ring_engine = getattr(self, "_ring_engine", None)
         if transport is None or ring_engine is None:
             raise RuntimeError("Ring transport is not enabled")
@@ -408,7 +429,7 @@ class MonitoringEngine:
             failure_policy, step_stall_budget_ms, record_sink)
         transport = self._ring_transport
         ring_config = self._ring_config
-        if transport is None or ring_config is None:
+        if ring_config is None:
             raise RuntimeError("Ring transport is not enabled")
         if self._record_mode:
             raise RuntimeError("A record runtime is already active")
@@ -618,7 +639,7 @@ class MonitoringEngine:
         switched = False
         try:
             _rt = _ring_module()
-            if not self.capture_enabled:
+            if self._ring_transport is not None and not self.capture_enabled:
                 self.set_capture_enabled(True)
             ring_engine = getattr(self, "_ring_engine", None)
             if ring_engine is not None:
@@ -661,6 +682,7 @@ class MonitoringEngine:
                 self._ring_engine = None
                 self._record_mode = False
                 self._record_sink = None
+                self._ring_config = None  # rolled back: no ring is built later
             # Drop every Python owner of the new native engine.  Its native
             # lease joins the record worker before releasing the sink.
             runtime = None
@@ -1054,6 +1076,7 @@ class MonitoringEngine:
             self._ring_engine = None
             self._record_mode = False
             self._record_sink = None
+        self._ring_config = None  # closed: no ring is built afterwards
 
         if storage is not None:
             self._retire_capture_storage(storage, drain_deadline,
