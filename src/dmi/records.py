@@ -339,11 +339,10 @@ class RecordRuntime(Generic[MetadataT]):
         flushes on its own. A step with no ring records (none emitted, or
         only oversized records, which bypass the ring) records no event.
         Non-blocking. Beginning the next step while this step's ring records
-        are still ungranted raises.
+        are still ungranted raises. Records reserved before capture was
+        disabled are still granted: disabling stops new reservations only.
         """
 
-        if self._transport.null_offload:
-            return
         self._transport.allow_flush_step()
 
     def emit_output(

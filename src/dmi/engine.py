@@ -121,6 +121,7 @@ class MonitoringEngine:
 
         self._ring_transport: Optional[Any] = None
         self._ring_config: Optional[Any] = None
+        self._ring_device: Optional[int] = None  # CUDA device current when the ring was configured
         self._record_mode = False
         # The native sink the record runtime writes to, when the engine
         # holds one (the persistent path's pack sink, or an explicit one).
@@ -230,10 +231,15 @@ class MonitoringEngine:
             if self._storage_backend == "none":
                 self.enable_ring_transport(ring_config)  # refuses: capture off
             # Rings are built on first use, from this config: the legacy ring
-            # by the first legacy entry point (_ensure_ring_transport), the
+            # by the first legacy entry point (_ensure_ring_transport), on the
+            # device current here, where the constructor used to build it; the
             # record ring by create_record_runtime. An engine never builds a
             # ring it does not use, nor two rings for one runtime.
             self._ring_config = ring_config
+            import torch
+
+            if torch.cuda.is_available():
+                self._ring_device = torch.cuda.current_device()
 
 
     # ------------------------------------------------------------------
@@ -242,15 +248,22 @@ class MonitoringEngine:
     def _ensure_ring_transport(self) -> Optional[Any]:
         """The active ring transport; builds the legacy ring on first use.
 
-        The constructor only keeps the ring config. A legacy entry point (an
-        adapter attach, generation with monitoring, the capture toggles and
-        capacities) builds the legacy ring here; create_record_runtime builds
+        The constructor only keeps the ring config and its current device. A
+        legacy entry point (an adapter attach, generation with monitoring, the
+        capture toggles and capacities) builds the legacy ring here, on that
+        device; create_record_runtime builds
         the record ring instead, so a recording engine never builds the
         legacy one. None when no ring is configured.
         """
         if (self._ring_transport is None and self._ring_config is not None
                 and not self._record_mode):
-            self.enable_ring_transport(self._ring_config)
+            if self._ring_device is None:
+                self.enable_ring_transport(self._ring_config)
+            else:
+                import torch
+
+                with torch.cuda.device(self._ring_device):
+                    self.enable_ring_transport(self._ring_config)
         return self._ring_transport
 
     def ring_capacities(self) -> RingCapacities:

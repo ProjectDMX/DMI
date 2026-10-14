@@ -305,3 +305,32 @@ def test_engine_builds_a_ring_only_on_use(policy):
             assert not engine._record_mode
     finally:
         engine.close()
+
+
+def test_disabling_capture_keeps_the_pending_grant(ring):
+    ring.runtime.begin_step()
+    ring.emit(0)
+    ring.engine.set_capture_enabled(False)  # stops new reservations only
+    ring.runtime.allow_flush_step()
+    assert ring.target.wait_for(1) == [0]
+    ring.runtime.begin_step()  # nothing left ungranted
+    ring.engine.set_capture_enabled(True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_lazy_legacy_ring_uses_the_construction_device():
+    from dmi.api.v1 import MonitoringEngine, RingConfig
+
+    torch.zeros(1, device="cuda:0")
+    config = RingConfig()
+    config.task_ring_entries = 64
+    config.payload_ring_bytes = RING_BYTES
+    config.pinned_staging_bytes = RING_BYTES
+    with torch.cuda.device(1):
+        engine = MonitoringEngine(model_id="gated-gpu", ring_config=config)
+    try:
+        assert torch.cuda.current_device() == 0
+        engine.ring_capacities()  # builds the legacy ring
+        assert engine._ring_engine.payload_tensor().device == torch.device("cuda", 1)
+    finally:
+        engine.close()
