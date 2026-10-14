@@ -58,7 +58,7 @@ reserve exactly `transport_size` and later perform only the normal release.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `drain_poll_timeout_us` | `uint64_t` | 100 | Drain thread sleep timeout in microseconds. Must be > 0. |
-| `drain_policy` | `str` | `"autonomous"` | `"autonomous"`: flush on the `drain_flush` rules below and the poll timeout. `"step_gated"` (record rings only; a legacy ring refuses it): the drain never flushes on its own; it flushes the ring records `RecordRuntime.allow_flush()` grants once per model step (see the record runtime section of `integration-api-v1.md`). The `drain_flush` rules and the poll timeout are unused. |
+| `drain_policy` | `str` | `"autonomous"` | `"autonomous"`: flush on the `drain_flush` rules below and the poll timeout. `"step_gated"` (record rings only; a legacy ring refuses it): the drain never flushes on its own; it flushes the ring records `RecordRuntime.allow_flush_step()` grants once per model step (see the record runtime section of `integration-api-v1.md`). The `drain_flush` rules and the poll timeout are unused. |
 
 ### Drain Flush Thresholds (`drain_flush`)
 

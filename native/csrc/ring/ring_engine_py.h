@@ -45,8 +45,8 @@ struct RingConfig {
     uint64_t insert_queue_max_bytes     = 4096ULL * 1024 * 1024;
     uint64_t insert_queue_max_items     = 65536;
     // Drain policy: "autonomous" (flush on drain_flush rules and the poll
-    // timeout) or "step_gated" (record rings only: flush what allow_flush()
-    // grants; see ring::RingConfig::drain_step_gated).
+    // timeout) or "step_gated" (record rings only: flush what
+    // allow_flush_step() grants; see ring::RingConfig::drain_step_gated).
     std::string drain_policy            = "autonomous";
 };
 
@@ -253,7 +253,7 @@ public:
     // event recorded now on the current stream.  A gap without ring records
     // (none reserved, or only oversized records, which bypass the ring)
     // records no event.  Non-blocking.
-    void allow_flush();
+    void allow_flush_step();
 
     RecordCaptureStatus record_capture_status() const;
 

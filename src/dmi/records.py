@@ -329,7 +329,7 @@ class RecordRuntime(Generic[MetadataT]):
 
         self._transport.begin_record_step()
 
-    def allow_flush(self) -> None:
+    def allow_flush_step(self) -> None:
         """Close one model step for a ``drain_policy="step_gated"`` ring.
 
         Call it once per model step on the producing thread, after the
@@ -344,7 +344,7 @@ class RecordRuntime(Generic[MetadataT]):
 
         if self._transport.null_offload:
             return
-        self._transport.allow_flush()
+        self._transport.allow_flush_step()
 
     def emit_output(
         self,

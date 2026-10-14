@@ -1,7 +1,7 @@
 """Step-gated drain: a record ring that flushes only what each step grants.
 
 With ``RingConfig.drain_policy = "step_gated"`` the drain never flushes on its
-own. ``RecordRuntime.allow_flush()``, called once per step after the step's
+own. ``RecordRuntime.allow_flush_step()``, called once per step after the step's
 producers, records an event on the current stream and grants the drain the
 ring records reserved since the previous call; the drain waits on the event,
 then flushes them. Forced flushes (oversized records, ``flush_and_wait``) work
@@ -152,7 +152,7 @@ def test_nothing_is_flushed_without_a_grant(ring):
     torch.cuda.synchronize()
     time.sleep(SETTLE_S)
     assert ring.target.delivered() == []
-    ring.runtime.allow_flush()
+    ring.runtime.allow_flush_step()
     assert ring.target.wait_for(3) == [0, 1, 2]
 
 
@@ -160,7 +160,7 @@ def test_a_grant_covers_exactly_its_step(ring):
     ring.runtime.begin_step()
     for step in range(3):
         ring.emit(step)
-    ring.runtime.allow_flush()
+    ring.runtime.allow_flush_step()
     assert ring.target.wait_for(3) == [0, 1, 2]
 
     ring.runtime.begin_step()
@@ -169,7 +169,7 @@ def test_a_grant_covers_exactly_its_step(ring):
     torch.cuda.synchronize()
     time.sleep(SETTLE_S)
     assert ring.target.delivered() == [0, 1, 2]  # step 2 not granted yet
-    ring.runtime.allow_flush()
+    ring.runtime.allow_flush_step()
     assert ring.target.wait_for(5) == [0, 1, 2, 3, 4]
 
 
@@ -177,7 +177,7 @@ def test_grant_waits_for_the_gpu_without_host_sync(ring):
     # Warm-up: the first emit initializes the eager record path.
     ring.runtime.begin_step()
     ring.emit(100)
-    ring.runtime.allow_flush()
+    ring.runtime.allow_flush_step()
     assert ring.target.wait_for(1) == [100]
 
     a = torch.randn(4096, 4096, device="cuda")
@@ -189,7 +189,7 @@ def test_grant_waits_for_the_gpu_without_host_sync(ring):
     ring.emit(0)
     ring.emit(1)
     t0 = time.perf_counter()
-    ring.runtime.allow_flush()
+    ring.runtime.allow_flush_step()
     returned_ms = (time.perf_counter() - t0) * 1000
     # Neither the producers nor the grant waited for the queued work.
     assert not torch.cuda.current_stream().query()
@@ -205,25 +205,25 @@ def test_grants_are_delivered_in_order(ring):
         for _ in range(3):
             ring.emit(step)
             step += 1
-        ring.runtime.allow_flush()
+        ring.runtime.allow_flush_step()
     assert ring.target.wait_for(12) == list(range(12))
 
 
 def test_empty_step_records_no_grant(ring):
     ring.runtime.begin_step()
-    ring.runtime.allow_flush()  # nothing reserved: no event, no error
+    ring.runtime.allow_flush_step()  # nothing reserved: no event, no error
     ring.runtime.begin_step()
     ring.emit(0)
-    ring.runtime.allow_flush()
+    ring.runtime.allow_flush_step()
     assert ring.target.wait_for(1) == [0]
 
 
 def test_beginning_a_step_with_ungranted_records_raises(ring):
     ring.runtime.begin_step()
     ring.emit(0)
-    with pytest.raises(RuntimeError, match="not granted by allow_flush"):
+    with pytest.raises(RuntimeError, match="not granted by allow_flush_step"):
         ring.runtime.begin_step()
-    ring.runtime.allow_flush()
+    ring.runtime.allow_flush_step()
     assert ring.target.wait_for(1) == [0]
 
 
@@ -233,10 +233,10 @@ def test_forced_flush_delivers_ungranted_records_once(ring):
     ring.emit(1)
     ring.engine.flush_and_wait(timeout_s=30.0)
     assert ring.target.delivered() == [0, 1]
-    ring.runtime.allow_flush()  # its records are already delivered
+    ring.runtime.allow_flush_step()  # its records are already delivered
     ring.runtime.begin_step()
     ring.emit(2)
-    ring.runtime.allow_flush()
+    ring.runtime.allow_flush_step()
     assert ring.target.wait_for(3) == [0, 1, 2]
     time.sleep(SETTLE_S)
     assert ring.target.delivered() == [0, 1, 2]  # no duplicates
@@ -248,12 +248,12 @@ def test_oversized_records_bypass_the_ring_in_order(ring):
     ring.emit(0)
     ring.emit(1, elements=oversized)  # forced flush, then CPU-direct
     ring.emit(2)
-    ring.runtime.allow_flush()
+    ring.runtime.allow_flush_step()
     assert ring.target.wait_for(3) == [0, 1, 2]
 
     ring.runtime.begin_step()
     ring.emit(3, elements=oversized)  # the step's only record: no ring record
-    ring.runtime.allow_flush()
+    ring.runtime.allow_flush_step()
     assert ring.target.wait_for(4) == [0, 1, 2, 3]
 
 
@@ -261,7 +261,7 @@ def test_allow_flush_requires_the_step_gated_policy():
     r = _GatedRing(policy="autonomous")
     try:
         with pytest.raises(RuntimeError, match="step_gated"):
-            r.runtime.allow_flush()
+            r.runtime.allow_flush_step()
     finally:
         r.close()
 

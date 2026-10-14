@@ -165,7 +165,7 @@ struct RingEnginePy::Impl {
     at::Tensor       payload_view;
     bool             record_mode{false};
 
-    // Step-gated drain: ring records reserved since the last allow_flush()
+    // Step-gated drain: ring records reserved since the last allow_flush_step()
     // (the current step's gap).  Written by the reserving thread only.
     uint64_t         gap_records{0};
 
@@ -759,7 +759,7 @@ void RingEnginePy::begin_record_step() {
         // Those records would never be granted to the drain.
         throw std::logic_error(
             "step-gated drain: a record step began while the previous step "
-            "still has ring records not granted by allow_flush()");
+            "still has ring records not granted by allow_flush_step()");
     }
     auto& consumer = impl_->engine.record_consumer();
     if (impl_->record_options.failure_policy ==
@@ -779,15 +779,16 @@ void RingEnginePy::begin_record_step() {
     consumer.begin_step();
 }
 
-void RingEnginePy::allow_flush() {
+void RingEnginePy::allow_flush_step() {
     if (!impl_->record_mode || !impl_->engine.drain_step_gated()) {
         throw std::logic_error(
-            "allow_flush requires a record ring with drain_policy 'step_gated'");
+            "allow_flush_step requires a record ring with drain_policy "
+            "'step_gated'");
     }
     const uint64_t records = impl_->gap_records;
     impl_->gap_records = 0;
     if (records == 0) return;  // nothing entered the ring in this gap
-    impl_->engine.drain_thread().allow_flush(
+    impl_->engine.drain_thread().allow_flush_step(
         records, at::cuda::getCurrentCUDAStream().stream());
 }
 

@@ -759,7 +759,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("reservation_items"),
            py::call_guard<py::gil_scoped_release>())
       .def("begin_record_step", &ring_py::RingEnginePy::begin_record_step)
-      .def("allow_flush", &ring_py::RingEnginePy::allow_flush)
+      .def("allow_flush_step", &ring_py::RingEnginePy::allow_flush_step)
       .def("capture_status",
            [](const ring_py::RingEnginePy& self) {
              const ring_py::RecordCaptureStatus status =

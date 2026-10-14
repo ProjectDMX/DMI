@@ -320,9 +320,9 @@ void DrainThread::rethrow_drain_failure() {
 }
 
 // ---------------------------------------------------------------------------
-// allow_flush -- step-gated drain grant (producing thread).
+// allow_flush_step -- step-gated drain grant (producing thread).
 // ---------------------------------------------------------------------------
-void DrainThread::allow_flush(uint64_t records, cudaStream_t stream) {
+void DrainThread::allow_flush_step(uint64_t records, cudaStream_t stream) {
     if (records == 0) return;
     cudaEvent_t event = nullptr;
     throw_cuda_failure(

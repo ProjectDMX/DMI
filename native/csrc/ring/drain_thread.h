@@ -63,7 +63,7 @@ public:
     // Step-gated drain: grant `records` more ring records, flushable once
     // the GPU passes an event recorded now on `stream` (the producers of
     // those records were enqueued on it before this call).  Non-blocking.
-    void allow_flush(uint64_t records, cudaStream_t stream);
+    void allow_flush_step(uint64_t records, cudaStream_t stream);
 
     // Submit a CPU-direct tensor to drain -> p2p pipeline.
     // The tensor is already in pageable CPU memory; skips D2H and staging.

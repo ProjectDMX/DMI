@@ -609,7 +609,7 @@ the forward that ran out of budget, and the runtime is failed from then on.
 
 With `RingConfig.drain_policy = "step_gated"` the drain never flushes on its
 own. Such a config is for record rings only: a legacy ring refuses it. The
-integration calls `RecordRuntime.allow_flush()` once per model step
+integration calls `RecordRuntime.allow_flush_step()` once per model step
 on the producing thread, after the step's records are emitted (between
 `begin_step()` and the next `begin_step()`). The call records an event on the
 current stream and grants the drain every ring record reserved since the
