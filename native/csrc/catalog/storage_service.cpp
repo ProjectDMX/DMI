@@ -1654,7 +1654,16 @@ bool CaptureStorageService::ensure_publisher_lease() {
     record_error(std::string("publisher lease acquisition failed: ") +
                  exc.what());
     note_lease_failure(exc);
-    if (!writer_.quarantined()) {
+    if (writer_.quarantined()) {
+      // A claim sends its INSERT only once its head read found no live
+      // holder, so whoever refused this service before had left by then:
+      // the run of refusals ends here, as it does at a refusal by our own
+      // late row (lease_held_elsewhere). Otherwise a rival that left, this
+      // claim timing out and a second rival refusing the claims after the
+      // quarantine add up to 2 x TTL, and latch the service over a catalog
+      // nobody held in between.
+      held_elsewhere_since_ns_ = 0;
+    } else {
       next_claim_ns_ = steady_ns() + lease_tick_ns(config_.writer.lease_ttl_ns);
     }
     publish_lease_state();
