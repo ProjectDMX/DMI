@@ -823,10 +823,13 @@ bool CaptureStorageService::adopt_step(uint64_t deadline_ns, size_t* deferred,
   *cut_short = false;
   const uint64_t started = steady_ns();
   if (adopting_ == nullptr && adoption_queue_.empty()) {
-    // Look at the siblings when that is owed (from start() on) or, while
-    // the last look found a live one, again on the recheck interval.
+    // Look at the siblings when that is owed (from start() on), and again
+    // on the recheck interval -- whatever the last look found: a sibling
+    // claimed after it, by a rank or a restart that then dies, is dead and
+    // charged against this spool's budget without ever having been seen
+    // alive.
     const bool recheck_due =
-        live_siblings_ && config_.adoption_recheck_interval_ns > 0 &&
+        config_.adoption_recheck_interval_ns > 0 &&
         started - last_adoption_scan_ns_ >=
             config_.adoption_recheck_interval_ns;
     if (!adoption_scan_owed_ && !recheck_due) return true;
@@ -951,7 +954,6 @@ bool CaptureStorageService::scan_siblings() {
     }
   }
   adoption_scan_owed_ = false;
-  live_siblings_ = live != 0;
   last_adoption_scan_ns_ = steady_ns();
   std::lock_guard<std::mutex> state(state_mutex_);
   state_.live_siblings = live;
@@ -966,7 +968,6 @@ void CaptureStorageService::begin_adoption(const std::string& directory) {
       dmi_store::SpoolOwnerLock::TryAdopt(directory, &adoption->lock, &error);
   if (locked == dmi_store::SpoolStatus::kOwned) {
     // Alive after all (taken since the look): its owner's, and not owed.
-    live_siblings_ = true;
     std::lock_guard<std::mutex> state(state_mutex_);
     ++state_.live_siblings;
     return;
