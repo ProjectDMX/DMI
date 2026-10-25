@@ -522,21 +522,19 @@ def test_https_verifies_the_server_against_a_private_ca_directory(driver, ca):
 
 
 def test_https_refuses_a_server_its_roots_do_not_vouch_for(driver, ca):
-    """Without the private CA the handshake fails: no request is sent, the
+    """Without the private CA verification fails: no request is sent, the
     password never leaves, and a refused certificate is not retried."""
     with FakeClickHouse(tls=ca) as fake:
         _opened(driver, clickhouse_scheme="https", clickhouse_port=fake.port,
                 clickhouse_user="catalog_writer", clickhouse_password=PASSWORD)
         response = driver.execute(READ)
-        # The fake counts on its own thread, which may learn of the refused
-        # handshake a moment after the client has given up.
-        deadline = time.monotonic() + 5.0
-        while fake.failed_handshakes < 1 and time.monotonic() < deadline:
-            time.sleep(0.01)
     assert not response["ok"]
     assert "certificate" in response["message"].lower(), response
     assert fake.requests == []
-    assert (fake.handshakes, fake.failed_handshakes) == (1, 1)
+    # libcurl 8.18's OpenSSL backend completes the handshake before checking
+    # trust. Server-side handshake failure is not the certificate verdict;
+    # rejection without a request or a second connection is the contract.
+    assert fake.handshakes == 1
 
 
 def test_https_refuses_a_certificate_for_another_name(driver, ca):

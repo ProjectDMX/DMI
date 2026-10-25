@@ -140,8 +140,8 @@ class FakeClickHouse:
 
     With `tls`, the listening socket speaks TLS with the private CA's server
     certificate; `handshakes` counts accepted connections and
-    `failed_handshakes` those whose handshake failed (a client that refused
-    the certificate).
+    `failed_handshakes` those whose handshake failed. A client may complete
+    the handshake and then reject the certificate before sending a request.
     """
 
     def __init__(self, respond: Optional[Responder] = None, *,
@@ -228,6 +228,10 @@ class TlsTerminator:
         self.port = self._listener.getsockname()[1]
         self.handshakes = 0
         self.failed_handshakes = 0
+        self.client_data_received = threading.Event()
+        # Signals that at least one client has closed. Tests can wait for
+        # their first, untrusted attempt to finish before checking for data.
+        self.connection_closed = threading.Event()
         threading.Thread(target=self._accept, daemon=True).start()
 
     def _accept(self):
@@ -242,24 +246,28 @@ class TlsTerminator:
     def _serve(self, client):
         self.handshakes += 1
         try:
-            tls = self._context.wrap_socket(client, server_side=True)
-        except (ssl.SSLError, OSError):
-            self.failed_handshakes += 1
-            client.close()
-            return
-        try:
-            upstream = socket.create_connection(self._target)
-        except OSError:
-            tls.close()
-            return
-        threading.Thread(target=self._pump, args=(upstream, tls),
-                         daemon=True).start()
-        self._pump(tls, upstream)
+            try:
+                tls = self._context.wrap_socket(client, server_side=True)
+            except (ssl.SSLError, OSError):
+                self.failed_handshakes += 1
+                client.close()
+                return
+            try:
+                upstream = socket.create_connection(self._target)
+            except OSError:
+                tls.close()
+                return
+            threading.Thread(target=self._pump, args=(upstream, tls),
+                             daemon=True).start()
+            self._pump(tls, upstream, from_client=True)
+        finally:
+            self.connection_closed.set()
 
-    @staticmethod
-    def _pump(source, sink):
+    def _pump(self, source, sink, *, from_client=False):
         try:
             while data := source.recv(65536):
+                if from_client:
+                    self.client_data_received.set()
                 sink.sendall(data)
         except OSError:
             pass
