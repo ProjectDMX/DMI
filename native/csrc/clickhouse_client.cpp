@@ -1,5 +1,6 @@
 // clickhouse_client.cpp
 #include "clickhouse_client.h"
+#include "clickhouse_key.h"
 // For DMXHostEngine::QueueT (the queue type actually used in bindings.cpp)
 #include "dmx_host_engine.h"
 
@@ -93,6 +94,9 @@ ClickHouseMetricsSnapshot ClickHouseRuntimeMetrics::Snapshot() const {
 }
 
 namespace {
+
+using detail::IsSafeIdentifier;
+using detail::ParseIdentifierKey;
 
 thread_local std::unique_ptr<clickhouse::Client> tl_client;
 thread_local bool tl_inited = false;
@@ -456,15 +460,6 @@ StagedRow StageOneRow(ClickHouseRow&& row) {
   return r;
 }
 
-bool IsSafeIdentifier(const std::string& value) {
-  if (value.empty()) return false;
-  const auto first = static_cast<unsigned char>(value.front());
-  if (!(std::isalpha(first) || value.front() == '_')) return false;
-  return std::all_of(value.begin() + 1, value.end(), [](unsigned char c) {
-    return std::isalnum(c) || c == '_';
-  });
-}
-
 const char* ClickHouseTypeName(RecordCellType type) {
   switch (type) {
     case RecordCellType::STRING: return "String";
@@ -651,67 +646,6 @@ const RecordLayout& FindRecordLayoutImpl(const RecordSchema& schema,
     throw std::invalid_argument("unknown record layout: " + name);
   }
   return *it;
-}
-
-std::optional<std::vector<std::string>> ParseIdentifierKey(
-    std::string_view expression) {
-  std::vector<std::string> names;
-  std::size_t cursor = 0;
-  while (cursor < expression.size()) {
-    while (cursor < expression.size() &&
-           std::isspace(static_cast<unsigned char>(expression[cursor]))) {
-      ++cursor;
-    }
-    if (cursor == expression.size()) break;
-
-    std::string name;
-    if (expression[cursor] == '`') {
-      ++cursor;
-      bool closed = false;
-      while (cursor < expression.size()) {
-        const char character = expression[cursor++];
-        if (character != '`') {
-          name.push_back(character);
-          continue;
-        }
-        if (cursor < expression.size() && expression[cursor] == '`') {
-          name.push_back('`');
-          ++cursor;
-          continue;
-        }
-        closed = true;
-        break;
-      }
-      if (!closed) return std::nullopt;
-    } else {
-      const std::size_t begin = cursor;
-      while (cursor < expression.size()) {
-        const unsigned char character =
-            static_cast<unsigned char>(expression[cursor]);
-        if (!std::isalnum(character) && expression[cursor] != '_') break;
-        ++cursor;
-      }
-      if (cursor == begin) return std::nullopt;
-      name.assign(expression.substr(begin, cursor - begin));
-    }
-    if (!IsSafeIdentifier(name)) return std::nullopt;
-    names.push_back(std::move(name));
-
-    while (cursor < expression.size() &&
-           std::isspace(static_cast<unsigned char>(expression[cursor]))) {
-      ++cursor;
-    }
-    if (cursor == expression.size()) break;
-    if (expression[cursor] != ',') return std::nullopt;
-    ++cursor;
-    std::size_t next = cursor;
-    while (next < expression.size() &&
-           std::isspace(static_cast<unsigned char>(expression[next]))) {
-      ++next;
-    }
-    if (next == expression.size()) return std::nullopt;
-  }
-  return names;
 }
 
 std::optional<int> ParsePositiveIntegerSetting(
