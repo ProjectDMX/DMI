@@ -118,6 +118,52 @@ def test_schema_driven_rows_round_trip_with_tensor_expansion():
         assert tensor_row[7] == payload.numpy().tobytes().hex().upper()
 
 
+@pytest.mark.parametrize("keys, key_style", [
+    (("run",), "created-by-dmi"),
+    (("run",), "bare"),
+    (("run",), "parenthesized"),
+    (("run", "event_id"), "created-by-dmi"),
+    (("run", "event_id"), "parenthesized"),
+])
+def test_schema_driven_identifier_keys_round_trip(keys, key_style):
+    """Validate both keys on fresh and existing tables across server versions."""
+    clickhouse_driver = pytest.importorskip("clickhouse_driver")
+    from dmi.api.v1 import RecordCellType, RecordColumn, RecordLayout, RecordSchema
+    from dmi.transport.native import ClickHouseClientConfig, DMXHostEngine, StageConfig
+
+    table = f"dmi_record_keys_{uuid.uuid4().hex[:12]}"
+    host = os.environ.get("DMX_DB_HOST", "127.0.0.1")
+    port = int(os.environ.get("DMX_DB_PORT", "9000"))
+    client = clickhouse_driver.Client(host=host, port=port)
+    schema = RecordSchema(
+        (RecordLayout(
+            name="event", table=table,
+            columns=(RecordColumn("run", RecordCellType.STRING),
+                     RecordColumn("event_id", RecordCellType.INT64)),
+            primary_key=keys, order_by=keys,
+        ),),
+        index_granularity=1024,
+    )
+    config = ClickHouseClientConfig()
+    config.host, config.port, config.database = host, port, "default"
+    engine = DMXHostEngine(StageConfig.clickhouse_records(config, schema, parallelism=1))
+    with _engine_table_cleanup(engine, client, (table,), graceful=True):
+        if key_style != "created-by-dmi":
+            expression = ", ".join(f"`{key}`" for key in keys)
+            if key_style == "parenthesized":
+                expression = f"({expression})"
+            client.execute(
+                f"CREATE TABLE `{table}` (run String, event_id Int64) "
+                f"ENGINE = MergeTree PRIMARY KEY {expression} "
+                f"ORDER BY {expression} SETTINGS index_granularity = 1024"
+            )
+        engine.start()
+        assert engine.wait_until_ready(10.0), [f.exc_what for f in engine.failures()]
+        engine.submit_record("event", ["run-a", 7], ["string", "int64"], nbytes=13)
+        assert engine.flush_and_wait(10.0)
+        assert client.execute(f"SELECT run, event_id FROM `{table}`") == [("run-a", 7)]
+
+
 @pytest.mark.parametrize(
     ("table_definition", "expected_failure"),
     (
@@ -144,6 +190,22 @@ def test_schema_driven_rows_round_trip_with_tensor_expansion():
             "SETTINGS index_granularity = 1024",
             "primary key",
             id="primary-key",
+        ),
+        pytest.param(
+            "(`run` String, `event_id` Int64, `score` Float64) "
+            "ENGINE = MergeTree PRIMARY KEY lower(`run`) "
+            "ORDER BY (lower(`run`), `event_id`) "
+            "SETTINGS index_granularity = 1024",
+            "primary key",
+            id="primary-key-expression",
+        ),
+        pytest.param(
+            "(`run` String, `event_id` Int64, `score` Float64) "
+            "ENGINE = MergeTree PRIMARY KEY (`run`) "
+            "ORDER BY (`run`, abs(`event_id`)) "
+            "SETTINGS index_granularity = 1024",
+            "ORDER BY",
+            id="order-by-expression",
         ),
         pytest.param(
             "(`run` String, `event_id` Int64, `score` Float64) "
