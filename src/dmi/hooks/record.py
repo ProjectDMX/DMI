@@ -13,6 +13,7 @@ from enum import Enum, IntEnum
 from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 
 import torch
+from torch.nn.modules import module as _module
 import torch.nn as nn
 
 from ..adapters.base import StepReservation
@@ -52,6 +53,22 @@ class RecordType(IntEnum):
     PER_EXECUTION = 2
 
 
+def plain_eager_execution() -> bool:
+    """Whether nothing traces or observes this call.
+
+    False under torch.compile or torch.jit tracing, an enabled autograd
+    profiler, or CUDA stream capture. Fast paths that skip nn.Module call
+    machinery or operator dispatch, or that replace eager ops, run only when
+    this is True, so tracing and profiling always see the original path.
+    """
+    return not (
+        torch.autograd.profiler._is_profiler_enabled
+        or torch.compiler.is_compiling()
+        or torch._C._get_tracing_state() is not None
+        or (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class HookOutput:
     """One tensor output and any device tensors consumed by its transport."""
@@ -65,6 +82,16 @@ class HookOutput:
         object.__setattr__(self, "producer_meta", tuple(self.producer_meta))
         if not all(isinstance(item, torch.Tensor) for item in self.producer_meta):
             raise TypeError("HookOutput producer metadata must contain only tensors")
+
+    @classmethod
+    def _trusted(
+        cls, tensor: torch.Tensor, producer_meta: tuple[torch.Tensor, ...],
+    ) -> "HookOutput":
+        """Integration-owned constructor for already validated tensors."""
+        output = object.__new__(cls)
+        object.__setattr__(output, "tensor", tensor)
+        object.__setattr__(output, "producer_meta", producer_meta)
+        return output
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,10 +275,30 @@ class HookPointV1(nn.Module):
         self._gate_tensor = gate_tensor
         self._gate_value = int(gate_value)
 
+    def __call__(self, *inputs: Any, **kwargs: Any) -> Any:
+        # An armed runtime fast path skips nn.Module's call machinery, but only
+        # when no module forward hooks would observe this call.
+        runtime = self._hook_runtime
+        fast_forward = None if runtime is None else getattr(runtime, "fast_forward", None)
+        if (
+            fast_forward is not None and not kwargs and self.enabled
+            and not (self._forward_hooks or self._forward_pre_hooks
+                     or _module._global_forward_hooks or _module._global_forward_pre_hooks)
+            and plain_eager_execution()
+            and fast_forward(self, inputs)
+        ):
+            return None
+        return super().__call__(*inputs, **kwargs)
+
     def forward(self, *inputs: Any) -> None:
         spec = self.spec
         runtime = self._hook_runtime
         if not self.enabled or spec is None or runtime is None:
+            return None
+        # Optional runtime fast path (e.g. a pre-reserved static batch): it
+        # returns True when it fully handled this call, else the normal path runs.
+        fast_forward = getattr(runtime, "fast_forward", None)
+        if fast_forward is not None and plain_eager_execution() and fast_forward(self, inputs):
             return None
         if not runtime.should_emit(self):
             return None
@@ -427,6 +474,7 @@ class HookPointV1(nn.Module):
 
 
 __all__ = [
+    "plain_eager_execution",
     "OutputSizingMode",
     "HookOutput",
     "HookPointV1",

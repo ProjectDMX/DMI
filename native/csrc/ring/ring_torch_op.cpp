@@ -190,6 +190,10 @@ void checked_record_index_tensor(const at::Tensor& value,
 
 }  // namespace
 
+uint64_t ring_current_stream_handle(int device) {
+    return reinterpret_cast<uint64_t>(at::cuda::getCurrentCUDAStream(device).stream());
+}
+
 void ring_record_producer_impl(
     const at::Tensor& /*ring_payload*/,
     const at::Tensor& tensor,

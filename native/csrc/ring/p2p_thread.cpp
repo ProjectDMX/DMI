@@ -6,11 +6,79 @@
 
 #include <ATen/ATen.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <new>
+#include <unordered_map>
+#include <sys/mman.h>
 
 namespace ring {
+
+// ---------------------------------------------------------------------------
+// Reusable pageable payload buffers for the record path.  A fresh allocation
+// per record maps new pages, and their first-touch faults cap the pinned-to-
+// pageable copy at ~2 GiB/s for 128 MiB records.  Recycled buffers are already
+// faulted in.  Payloads stay owned CPU tensors; a buffer returns to the pool
+// when the sink drops its last reference.
+// ---------------------------------------------------------------------------
+class PageablePayloadPool
+    : public std::enable_shared_from_this<PageablePayloadPool> {
+public:
+    // Smaller payloads keep plain at::empty (malloc serves them from the heap).
+    static constexpr uint64_t kMinPooledBytes = 1ull << 20;
+    static constexpr uint64_t kAlign = 2ull << 20;  // huge-page granularity
+    static constexpr uint64_t kMaxIdleBytes = 2ull << 30;
+
+    ~PageablePayloadPool() {
+        for (auto& [capacity, buffers] : idle_)
+            for (void* p : buffers) std::free(p);
+    }
+
+    at::Tensor acquire(uint64_t bytes) {
+        const auto options = at::TensorOptions().dtype(at::kByte).device(at::kCPU);
+        if (bytes < kMinPooledBytes)
+            return at::empty({static_cast<int64_t>(bytes)}, options);
+        const uint64_t capacity = (bytes + kAlign - 1) / kAlign * kAlign;
+        void* p = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = idle_.find(capacity);
+            if (it != idle_.end() && !it->second.empty()) {
+                p = it->second.back();
+                it->second.pop_back();
+                idle_bytes_ -= capacity;
+            }
+        }
+        if (!p) {
+            p = std::aligned_alloc(kAlign, capacity);
+            if (!p) throw std::bad_alloc();
+            madvise(p, capacity, MADV_HUGEPAGE);  // advisory; ignore failure
+        }
+        auto self = shared_from_this();
+        return at::from_blob(
+            p, {static_cast<int64_t>(bytes)},
+            [self, capacity](void* q) { self->release(q, capacity); }, options);
+    }
+
+private:
+    void release(void* p, uint64_t capacity) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (idle_bytes_ + capacity <= kMaxIdleBytes) {
+                idle_[capacity].push_back(p);
+                idle_bytes_ += capacity;
+                return;
+            }
+        }
+        std::free(p);
+    }
+
+    std::mutex mu_;
+    std::unordered_map<uint64_t, std::vector<void*>> idle_;
+    uint64_t idle_bytes_ = 0;
+};
 
 // ---------------------------------------------------------------------------
 // ATen helpers (no GIL required for CPU tensors)
@@ -334,7 +402,8 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
 // ---------------------------------------------------------------------------
 RecordP2PThread::RecordP2PThread(
     DrainThread& drain, std::shared_ptr<RecordSink> sink)
-    : drain_(drain), consumer_(std::move(sink)) {}
+    : drain_(drain), consumer_(std::move(sink)),
+      pool_(std::make_shared<PageablePayloadPool>()) {}
 
 RecordP2PThread::~RecordP2PThread() noexcept {
     stop();
@@ -378,9 +447,7 @@ void RecordP2PThread::process(std::vector<DrainTask>& tasks) {
                     }
                 }
             } else {
-                payload = at::empty(
-                    {static_cast<int64_t>(task.tensor_total_bytes)},
-                    at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+                payload = pool_->acquire(task.tensor_total_bytes);
                 uint8_t* dst = payload.data_ptr<uint8_t>();
                 if (task.data_len1 > 0) {
                     std::memcpy(dst, task.data_ptr1, task.data_len1);

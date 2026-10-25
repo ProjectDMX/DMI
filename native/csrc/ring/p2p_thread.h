@@ -59,6 +59,8 @@ private:
     void do_post_processing(at::Tensor& tensor, const DrainTask& first_task);
 };
 
+class PageablePayloadPool;
+
 // Schema-driven record path.  It intentionally has a distinct worker class
 // from P2PThread so the released inference path never selects a consumer per
 // payload.  Construction fixes the consumer for the lifetime of the ring.
@@ -79,6 +81,8 @@ public:
 private:
     DrainThread&  drain_;
     RecordConsumer consumer_;
+    // Shared with the deleters of payloads still held by the sink.
+    std::shared_ptr<PageablePayloadPool> pool_;
     std::thread   thread_;
 
     void loop();

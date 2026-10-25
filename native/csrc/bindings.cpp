@@ -1,6 +1,7 @@
 // Pybind11 module — ring transport + ClickHouse pipeline bindings
 
 #ifdef DMI_HOST_ONLY
+#include <torch/csrc/Dtype.h>
 #include <torch/csrc/utils/pybind.h>
 #else
 #include <torch/extension.h>
@@ -376,9 +377,145 @@ std::vector<ring::RecordDescriptor> CopyRecordDescriptors(
 }
 #endif
 
+#ifndef DMI_HOST_ONLY
+// Pre-bound eager producer launches for a confirmed static record plan.
+// Slots carry everything the generic ring::record_producer* operations
+// validate per call; a launch checks only device, dtype and byte size.
+class StaticLauncher {
+ public:
+  explicit StaticLauncher(std::shared_ptr<ring_py::RingEnginePy> engine)
+      : engine_(std::move(engine)) {}
+
+  int add(bool packed, std::vector<int64_t> shape, py::object dtype, int device,
+          uint32_t batch, uint64_t feature_bytes, uint64_t gate_ptr,
+          int32_t gate_value) {
+    if (!THPDtype_Check(dtype.ptr())) throw py::type_error("dtype must be a torch.dtype");
+    const auto scalar = reinterpret_cast<THPDtype*>(dtype.ptr())->scalar_type;
+    uint64_t nbytes = c10::elementSize(scalar);
+    for (const auto dim : shape) {
+      if (dim < 0) throw py::value_error("invalid static producer shape");
+      nbytes *= static_cast<uint64_t>(dim);
+    }
+    if (packed && (batch == 0 || feature_bytes == 0 || shape.size() < 2 ||
+                   shape[1] != static_cast<int64_t>(batch))) {
+      throw py::value_error("invalid static packed producer slot");
+    }
+    slots_.push_back({packed, std::move(shape), nbytes, scalar, device, batch,
+                      feature_bytes, gate_ptr, gate_value, 0, 0});
+    return static_cast<int>(slots_.size()) - 1;
+  }
+
+  void set_counts(int slot, uint64_t valid_ptr, uint64_t prefix_ptr) {
+    auto& s = slots_.at(slot);
+    s.valid_ptr = valid_ptr;
+    s.prefix_ptr = prefix_ptr;
+  }
+
+  // Descriptor template for one microbatch of the static plan: parsed once,
+  // then each submit patches only the batch and microbatch id cells.
+  int add_template(std::vector<std::pair<uint64_t, bool>> items,
+                   py::sequence descriptors, const CompiledRecordSchema& schema,
+                   size_t batch_index, size_t microbatch_index) {
+    Template t{std::move(items), {}, {}};
+    for (const py::handle item : descriptors) {
+      const auto packet = py::reinterpret_borrow<py::tuple>(item);
+      const auto& bound = packet[0].cast<const CompiledRecordLayout&>();
+      if (batch_index >= bound.common.size() || microbatch_index >= bound.common.size())
+        throw py::value_error("template id index outside the common columns");
+      t.descriptors.push_back(CopyColumnarRecord(packet, schema.schema));
+      t.columns.emplace_back(bound.common[batch_index], bound.common[microbatch_index]);
+    }
+    if (t.items.size() != t.descriptors.size())
+      throw py::value_error("template reservation/descriptor count mismatch");
+    templates_.push_back(std::move(t));
+    return static_cast<int>(templates_.size()) - 1;
+  }
+
+  int submit(int template_id, int64_t batch, int64_t microbatch) {
+    const auto& t = templates_.at(template_id);
+    auto descriptors = t.descriptors;
+    for (size_t d = 0; d < descriptors.size(); ++d) {
+      for (auto& row : descriptors[d].rows) {
+        SetId(row.cells.at(t.columns[d].first), batch);
+        SetId(row.cells.at(t.columns[d].second), microbatch);
+      }
+    }
+    py::gil_scoped_release release;
+    const int result = engine_->reserve_record(t.items);
+    if (result != ring_py::RingEnginePy::STEP_OVERSIZED)
+      engine_->push_record_descriptors(std::move(descriptors));
+    return result;
+  }
+
+  void launch(int slot, const at::Tensor& tensor) {
+    const auto& s = slots_.at(slot);
+    TORCH_CHECK(tensor.is_cuda() && tensor.get_device() == s.device &&
+                    tensor.scalar_type() == s.dtype && tensor.sizes() == s.shape,
+                "DMI static producer input does not match its reserved slot");
+    TORCH_CHECK(!s.packed || (s.valid_ptr && s.prefix_ptr),
+                "DMI static producer slot has no valid-count metadata");
+    const at::Tensor src = tensor.is_contiguous() ? tensor : tensor.contiguous();
+    const auto stream = ring_current_stream_handle(s.device);
+    const auto ptr = reinterpret_cast<uint64_t>(src.data_ptr());
+    if (s.packed) {
+      engine_->record_no_notify_seq_prefix_pack(
+          ptr, s.nbytes, s.valid_ptr, s.prefix_ptr, s.batch, s.feature_bytes,
+          s.gate_ptr, s.gate_value, stream);
+    } else {
+      engine_->record_no_notify(ptr, s.nbytes, s.gate_ptr, s.gate_value, stream);
+    }
+  }
+
+ private:
+  struct Slot {
+    bool packed;
+    std::vector<int64_t> shape;
+    uint64_t nbytes;
+    at::ScalarType dtype;
+    int device;
+    uint32_t batch;
+    uint64_t feature_bytes;
+    uint64_t gate_ptr;
+    int32_t gate_value;
+    uint64_t valid_ptr;
+    uint64_t prefix_ptr;
+  };
+  struct Template {
+    std::vector<std::pair<uint64_t, bool>> items;
+    std::vector<ring::RecordDescriptor> descriptors;
+    std::vector<std::pair<size_t, size_t>> columns;
+  };
+  // Keep the cell's encoded integer width (Int32 or Int64 column).
+  static void SetId(ring::EncodedRecordCell& cell, int64_t value) {
+    if (auto* v = std::get_if<int64_t>(&cell)) { *v = value; return; }
+    if (auto* v = std::get_if<int32_t>(&cell)) { *v = static_cast<int32_t>(value); return; }
+    throw std::runtime_error("template id cell is not an integer");
+  }
+  std::shared_ptr<ring_py::RingEnginePy> engine_;
+  std::vector<Slot> slots_;
+  std::vector<Template> templates_;
+};
+#endif
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+#ifndef DMI_HOST_ONLY
+  py::class_<StaticLauncher>(m, "StaticLauncher")
+      .def(py::init<std::shared_ptr<ring_py::RingEnginePy>>(), py::arg("engine"))
+      .def("add", &StaticLauncher::add, py::arg("packed"), py::arg("shape"),
+           py::arg("dtype"), py::arg("device"), py::arg("batch"),
+           py::arg("feature_bytes"), py::arg("gate_ptr"), py::arg("gate_value"))
+      .def("set_counts", &StaticLauncher::set_counts, py::arg("slot"),
+           py::arg("valid_ptr"), py::arg("prefix_ptr"))
+      .def("launch", &StaticLauncher::launch, py::arg("slot"), py::arg("tensor"))
+      .def("add_template", &StaticLauncher::add_template, py::arg("items"),
+           py::arg("descriptors"), py::arg("schema"), py::arg("batch_index"),
+           py::arg("microbatch_index"))
+      .def("submit", &StaticLauncher::submit, py::arg("template_id"),
+           py::arg("batch"), py::arg("microbatch"));
+#endif
+
 #ifndef DMI_HOST_ONLY
   m.attr("PAYLOAD_ALIGN") = ring::PAYLOAD_ALIGN;
   py::class_<CompiledRecordSchema, std::shared_ptr<CompiledRecordSchema>>(m, "_CompiledRecordSchema");
