@@ -29,6 +29,8 @@
 // pattern; the only differences are the byte count and the kernel
 // setup (none / scalar read / K-vector + prefix sum).
 
+#include <cstdlib>
+#include <cstdio>
 #include "producer.cuh"
 #include "payload_ring.cuh"
 #include "task_ring.cuh"
@@ -656,11 +658,24 @@ __global__ void record_producer_segmented_pack_kernel(
 // Host launchers
 // ---------------------------------------------------------------------------
 
+// DMI_PRODUCER_LARGE_BLOCKS overrides the block count for copies above TIER3_THRESHOLD
+// (default TIER3_BLOCKS). Smaller tiers are unchanged.
+static uint32_t large_copy_blocks() {
+    static const uint32_t blocks = [] {
+        const char* v = std::getenv("DMI_PRODUCER_LARGE_BLOCKS");
+        const unsigned long n = v ? std::strtoul(v, nullptr, 10) : 0;
+        const uint32_t b = n > 0 ? static_cast<uint32_t>(n) : TIER3_BLOCKS;
+        std::fprintf(stderr, "DMI_EFFECTIVE_PRODUCER_LARGE_BLOCKS=%u\n", b);
+        return b;
+    }();
+    return blocks;
+}
+
 static inline uint32_t pick_tier_blocks(uint64_t nbytes) {
     if      (nbytes <= TIER1_THRESHOLD) return TIER0_BLOCKS;
     else if (nbytes <= TIER2_THRESHOLD) return TIER1_BLOCKS;
     else if (nbytes <= TIER3_THRESHOLD) return TIER2_BLOCKS;
-    else                                return TIER3_BLOCKS;
+    else                                return large_copy_blocks();
 }
 
 void launch_producer_static(

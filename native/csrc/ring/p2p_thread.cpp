@@ -5,6 +5,7 @@
 #include "pinned_staging.h"
 
 #include <ATen/ATen.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +14,10 @@
 #include <new>
 #include <unordered_map>
 #include <sys/mman.h>
+#include <condition_variable>
+#include <functional>
+#include <thread>
+#include <vector>
 
 namespace ring {
 
@@ -428,6 +433,103 @@ void RecordP2PThread::loop() {
     }
 }
 
+// Staging -> pageable copy of one record, optionally split across threads.
+// DMI_P2P_COPY_THREADS (default 1) threads copy disjoint byte slices of the SAME record and
+// are joined before the caller releases its staging range and hands the payload to the
+// consumer, so staging release order and payload/descriptor order are unchanged.
+// Records smaller than DMI_P2P_COPY_PARALLEL_MIN_BYTES (default 8 MiB) use one thread.
+static uint64_t env_u64(const char* name, uint64_t fallback) {
+    const char* v = std::getenv(name);
+    return v ? std::strtoull(v, nullptr, 10) : fallback;
+}
+
+// Persistent workers for the parallel copy, created once on first use and joined at exit, so a
+// record copy does not create and destroy threads (per-thread stack mmap/munmap per record).
+class CopyWorkers {
+public:
+    explicit CopyWorkers(uint64_t n) {
+        for (uint64_t i = 0; i < n; ++i) workers_.emplace_back([this, i] { run(i); });
+    }
+    ~CopyWorkers() {
+        { std::lock_guard<std::mutex> lk(mu_); stop_ = true; ++generation_; }
+        cv_.notify_all();
+        for (auto& w : workers_) w.join();
+    }
+    // Worker i runs jobs[i] (i < jobs.size()); wait() returns when all of them finished.
+    void start(const std::vector<std::function<void()>>& jobs) {
+        { std::lock_guard<std::mutex> lk(mu_); jobs_ = &jobs; pending_ = jobs.size(); ++generation_; }
+        cv_.notify_all();
+    }
+    void wait() {
+        std::unique_lock<std::mutex> lk(mu_);
+        done_cv_.wait(lk, [this] { return pending_ == 0; });
+        jobs_ = nullptr;
+    }
+private:
+    void run(uint64_t index) {
+        uint64_t seen = 0;
+        while (true) {
+            const std::function<void()>* job = nullptr;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return stop_ || generation_ != seen; });
+                if (stop_) return;
+                seen = generation_;
+                if (jobs_ && index < jobs_->size()) job = &(*jobs_)[index];
+            }
+            if (!job) continue;
+            (*job)();
+            std::lock_guard<std::mutex> lk(mu_);
+            if (--pending_ == 0) done_cv_.notify_one();
+        }
+    }
+    std::vector<std::thread> workers_;
+    std::mutex mu_;
+    std::condition_variable cv_, done_cv_;
+    const std::vector<std::function<void()>>* jobs_ = nullptr;
+    uint64_t pending_ = 0, generation_ = 0;
+    bool stop_ = false;
+};
+
+static void copy_record_payload(uint8_t* dst, const uint8_t* src1, uint64_t len1,
+                                const uint8_t* src2, uint64_t len2) {
+    static const uint64_t threads = [] {
+        const uint64_t n = std::max<uint64_t>(1, env_u64("DMI_P2P_COPY_THREADS", 1));
+        std::fprintf(stderr, "DMI_EFFECTIVE_P2P_COPY_THREADS=%llu (persistent workers)\n", (unsigned long long)n);
+        return n;
+    }();
+    static const uint64_t min_bytes = [] {
+        const uint64_t n = env_u64("DMI_P2P_COPY_PARALLEL_MIN_BYTES", 8ull << 20);
+        std::fprintf(stderr, "DMI_EFFECTIVE_P2P_COPY_PARALLEL_MIN_BYTES=%llu\n", (unsigned long long)n);
+        return n;
+    }();
+    const uint64_t total = len1 + len2;
+    // Copies [begin, end) of the logical payload (src1 followed by src2) into dst.
+    auto copy_range = [=](uint64_t begin, uint64_t end) {
+        if (begin < len1) {
+            const uint64_t e = std::min(end, len1);
+            std::memcpy(dst + begin, src1 + begin, e - begin);
+            begin = e;
+        }
+        if (begin < end) std::memcpy(dst + begin, src2 + (begin - len1), end - begin);
+    };
+    if (threads <= 1 || total < min_bytes) {
+        copy_range(0, total);
+        return;
+    }
+    static CopyWorkers workers(threads - 1);  // only the record P2P thread calls this
+    const uint64_t slice = (total + threads - 1) / threads;
+    std::vector<std::function<void()>> jobs;
+    jobs.reserve(threads - 1);
+    for (uint64_t i = 1; i < threads; ++i) {
+        const uint64_t b = std::min(total, i * slice), e = std::min(total, (i + 1) * slice);
+        jobs.emplace_back([=] { if (b < e) copy_range(b, e); });
+    }
+    workers.start(jobs);
+    copy_range(0, std::min(total, slice));
+    workers.wait();
+}
+
 void RecordP2PThread::process(std::vector<DrainTask>& tasks) {
     for (DrainTask& task : tasks) {
         try {
@@ -448,14 +550,9 @@ void RecordP2PThread::process(std::vector<DrainTask>& tasks) {
                 }
             } else {
                 payload = pool_->acquire(task.tensor_total_bytes);
-                uint8_t* dst = payload.data_ptr<uint8_t>();
-                if (task.data_len1 > 0) {
-                    std::memcpy(dst, task.data_ptr1, task.data_len1);
-                }
-                if (task.data_len2 > 0) {
-                    std::memcpy(dst + task.data_len1,
-                                task.data_ptr2, task.data_len2);
-                }
+                copy_record_payload(payload.data_ptr<uint8_t>(),
+                                    static_cast<const uint8_t*>(task.data_ptr1), task.data_len1,
+                                    static_cast<const uint8_t*>(task.data_ptr2), task.data_len2);
             }
 
             // Once bytes are copied into pageable memory, the pinned range can
