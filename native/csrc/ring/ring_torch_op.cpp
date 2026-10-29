@@ -339,6 +339,48 @@ void ring_record_producer_segmented_pack_impl(
         reinterpret_cast<uint64_t>(stream.stream()));
 }
 
+// Segment ranges for selected row shards of a [rows, cols] bool mask (no ring
+// state; independent of the active engine). See launch_mask_shard_segment_ranges.
+void ring_mask_shard_segment_ranges_impl(
+    const at::Tensor& mask,
+    c10::IntArrayRef selected_shards,
+    int64_t num_shards,
+    const at::Tensor& starts,
+    const at::Tensor& ends,
+    const at::Tensor& counts) {
+    TORCH_CHECK(mask.is_cuda() && mask.scalar_type() == at::kBool && mask.dim() == 2 &&
+                    mask.is_contiguous(),
+                "mask_shard_segment_ranges requires a contiguous CUDA bool [rows, cols] mask");
+    const int64_t rows = mask.size(0), cols = mask.size(1);
+    const int64_t count = static_cast<int64_t>(selected_shards.size());
+    TORCH_CHECK(num_shards > 0 && rows % num_shards == 0,
+                "mask_shard_segment_ranges requires rows divisible by num_shards");
+    TORCH_CHECK(count >= 1 && count <= static_cast<int64_t>(ring::MAX_SHARD_SELECTION),
+                "mask_shard_segment_ranges supports 1..8 selected shards");
+    ring::ShardSelection selection{};
+    selection.count = static_cast<int32_t>(count);
+    for (int64_t k = 0; k < count; ++k) {
+        TORCH_CHECK(selected_shards[k] >= 0 && selected_shards[k] < num_shards,
+                    "mask_shard_segment_ranges shard id out of range");
+        TORCH_CHECK(k == 0 || selected_shards[k] > selected_shards[k - 1],
+                    "mask_shard_segment_ranges shard ids must be strictly increasing");
+        selection.ids[k] = selected_shards[k];
+    }
+    for (const at::Tensor* t : {&starts, &ends}) {
+        TORCH_CHECK(t->is_cuda() && t->scalar_type() == at::kLong && t->is_contiguous() &&
+                        t->numel() == cols * count && t->device() == mask.device(),
+                    "mask_shard_segment_ranges starts/ends must be contiguous CUDA int64 [cols*count]");
+    }
+    TORCH_CHECK(counts.is_cuda() && counts.scalar_type() == at::kLong && counts.is_contiguous() &&
+                    counts.numel() == cols && counts.device() == mask.device(),
+                "mask_shard_segment_ranges counts must be contiguous CUDA int64 [cols]");
+    auto stream = at::cuda::getCurrentCUDAStream(mask.device().index());
+    ring::launch_mask_shard_segment_ranges(
+        mask.data_ptr<bool>(), rows, cols, rows / num_shards, selection,
+        starts.data_ptr<int64_t>(), ends.data_ptr<int64_t>(), counts.data_ptr<int64_t>(),
+        stream.stream());
+}
+
 void ring_advance_boundary_impl(
     const at::Tensor& /*ring_payload*/,
     const at::Tensor& device_packed_progress,
@@ -390,6 +432,8 @@ TORCH_LIBRARY(ring, m) {
     m.def("record_producer_segmented_pack(Tensor(a!) ring_payload, Tensor x, "
           "Tensor segment_start, Tensor segment_end, int feature_bytes, "
           "Tensor? emit_gate=None, int emit_value=0) -> ()");
+    m.def("mask_shard_segment_ranges(Tensor mask, int[] selected_shards, int num_shards, "
+          "Tensor(a!) starts, Tensor(b!) ends, Tensor(c!) counts) -> ()");
     m.def("advance_boundary(Tensor(a!) ring_payload, "
           "Tensor(b!) device_packed_progress, "
           "Tensor(c!) cpu_visible_packed_progress) -> ()");
@@ -406,5 +450,6 @@ TORCH_LIBRARY_IMPL(ring, CUDA, m) {
            ring_record_producer_seq_prefix_pack_impl);
     m.impl("record_producer_segmented_pack",
            ring_record_producer_segmented_pack_impl);
+    m.impl("mask_shard_segment_ranges", ring_mask_shard_segment_ranges_impl);
     m.impl("advance_boundary", ring_advance_boundary_impl);
 }

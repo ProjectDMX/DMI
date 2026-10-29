@@ -25,12 +25,26 @@
 #pragma once
 
 #include <cstdint>
+#include <cuda_runtime_api.h>
 
 namespace ring {
 
 // Upper bound on K (chunk count) for shared-memory sizing in the
 // chunked kernel and host-side argument validation.
 static constexpr uint32_t PRODUCER_MAX_K = 64;
+
+// Segment ranges of selected row shards of a [rows, cols] boolean mask, in the
+// order of a column-major stable permutation (see producer.cu).
+static constexpr uint32_t MAX_SHARD_SELECTION = 8;
+struct ShardSelection {
+    int64_t ids[MAX_SHARD_SELECTION];
+    int32_t count;
+};
+
+void launch_mask_shard_segment_ranges(
+    const bool* mask, int64_t rows, int64_t cols, int64_t shard_rows,
+    const ShardSelection& selection, int64_t* starts, int64_t* ends,
+    int64_t* counts, cudaStream_t stream = 0);
 
 }  // namespace ring
 
@@ -57,6 +71,9 @@ static constexpr uint32_t TIER3_BLOCKS = 64;  // > 32 MB
 // Record-only row packers use one block per logical output row and cap the
 // grid so a conservative upper bound cannot create an unbounded launch.
 static constexpr uint32_t RECORD_PACK_MAX_BLOCKS = 1024;
+// Segmented pack: segment tables up to this size are staged in shared memory
+// and copied unit-parallel; larger tables use the row-by-row walk.
+static constexpr uint32_t SEGMENT_PACK_SHARED_SEGMENTS = 1024;
 
 // Static: copy all `nbytes`; no actual_dev_ptr, no row_bytes.
 __global__ void producer_static_kernel(

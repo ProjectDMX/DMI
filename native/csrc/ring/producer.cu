@@ -599,19 +599,43 @@ __global__ void record_producer_segmented_pack_kernel(
 
     const uint64_t input_rows = feature_bytes == 0
         ? 0 : nbytes_upper / feature_bytes;
+
+    // Segment starts and prefix row offsets, clamped exactly as before, once
+    // per block in shared memory.
+    __shared__ uint64_t seg_start[SEGMENT_PACK_SHARED_SEGMENTS];
+    __shared__ uint64_t seg_prefix[SEGMENT_PACK_SHARED_SEGMENTS + 1];
+    const bool shared_segments = segment_count <= SEGMENT_PACK_SHARED_SEGMENTS;
     uint64_t total_rows = 0;
-    for (uint32_t segment = 0; segment < segment_count; ++segment) {
-        int64_t start = segment_start_dev_ptr[segment];
-        int64_t end = segment_end_dev_ptr[segment];
-        if (start < 0) start = 0;
-        if (end < start) end = start;
-        if (static_cast<uint64_t>(start) > input_rows) {
-            start = static_cast<int64_t>(input_rows);
+    if (shared_segments) {
+        for (uint32_t segment = threadIdx.x; segment < segment_count; segment += blockDim.x) {
+            int64_t start = segment_start_dev_ptr[segment];
+            int64_t end = segment_end_dev_ptr[segment];
+            if (start < 0) start = 0;
+            if (end < start) end = start;
+            if (static_cast<uint64_t>(start) > input_rows) start = static_cast<int64_t>(input_rows);
+            if (static_cast<uint64_t>(end) > input_rows) end = static_cast<int64_t>(input_rows);
+            seg_start[segment] = static_cast<uint64_t>(start);
+            seg_prefix[segment + 1] = static_cast<uint64_t>(end - start);
         }
-        if (static_cast<uint64_t>(end) > input_rows) {
-            end = static_cast<int64_t>(input_rows);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            seg_prefix[0] = 0;
+            for (uint32_t segment = 0; segment < segment_count; ++segment) {
+                seg_prefix[segment + 1] += seg_prefix[segment];
+            }
         }
-        total_rows += static_cast<uint64_t>(end - start);
+        __syncthreads();
+        total_rows = seg_prefix[segment_count];
+    } else {
+        for (uint32_t segment = 0; segment < segment_count; ++segment) {
+            int64_t start = segment_start_dev_ptr[segment];
+            int64_t end = segment_end_dev_ptr[segment];
+            if (start < 0) start = 0;
+            if (end < start) end = start;
+            if (static_cast<uint64_t>(start) > input_rows) start = static_cast<int64_t>(input_rows);
+            if (static_cast<uint64_t>(end) > input_rows) end = static_cast<int64_t>(input_rows);
+            total_rows += static_cast<uint64_t>(end - start);
+        }
     }
     if (total_rows > input_rows) total_rows = input_rows;
 
@@ -622,30 +646,65 @@ __global__ void record_producer_segmented_pack_kernel(
     const TwoSpan spans = payload_compute_spans(
         payload_head, ring.payload_cap, alloc_bytes);
 
-    for (uint64_t row = blockIdx.x; row < total_rows; row += gridDim.x) {
-        uint64_t remaining = row;
-        uint64_t source_row = 0;
-        for (uint32_t segment = 0; segment < segment_count; ++segment) {
-            int64_t start = segment_start_dev_ptr[segment];
-            int64_t end = segment_end_dev_ptr[segment];
-            if (start < 0) start = 0;
-            if (end < start) end = start;
-            if (static_cast<uint64_t>(start) > input_rows) {
-                start = static_cast<int64_t>(input_rows);
+    if (shared_segments) {
+        // Grid-stride over fixed-size units of the packed output: coalesced like
+        // a contiguous copy. A unit never crosses a row (unit divides
+        // feature_bytes) or the ring wrap (span lengths are multiples of 16).
+        const uintptr_t src_bits = reinterpret_cast<uintptr_t>(src);
+        uint64_t unit = 1;
+        if (feature_bytes % 16 == 0 && src_bits % 16 == 0) unit = 16;
+        else if (feature_bytes % 8 == 0 && src_bits % 8 == 0) unit = 8;
+        else if (feature_bytes % 4 == 0 && src_bits % 4 == 0) unit = 4;
+        const uint64_t units = actual_bytes / unit;
+        const uint64_t gtid = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+        const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
+        for (uint64_t u = gtid; u < units; u += stride) {
+            const uint64_t off = u * unit;
+            const uint64_t row = off / feature_bytes;
+            const uint64_t within = off - row * feature_bytes;
+            uint32_t lo = 0, hi = segment_count;  // largest seg with prefix[seg] <= row
+            while (hi - lo > 1) {
+                const uint32_t mid = (lo + hi) >> 1;
+                if (seg_prefix[mid] <= row) lo = mid; else hi = mid;
             }
-            if (static_cast<uint64_t>(end) > input_rows) {
-                end = static_cast<int64_t>(input_rows);
+            while (seg_prefix[lo + 1] <= row) ++lo;  // skip empty segments
+            const uint8_t* sp = src + (seg_start[lo] + (row - seg_prefix[lo])) * feature_bytes + within;
+            uint8_t* dp = off < spans.len1
+                ? ring.payload_buf + spans.off1 + off
+                : ring.payload_buf + spans.off2 + (off - spans.len1);
+            if (unit == 16) {
+                *reinterpret_cast<uint4*>(dp) = *reinterpret_cast<const uint4*>(sp);
+            } else if (unit == 8) {
+                *reinterpret_cast<uint2*>(dp) = *reinterpret_cast<const uint2*>(sp);
+            } else if (unit == 4) {
+                *reinterpret_cast<uint32_t*>(dp) = *reinterpret_cast<const uint32_t*>(sp);
+            } else {
+                *dp = *sp;
             }
-            const uint64_t length = static_cast<uint64_t>(end - start);
-            if (remaining < length) {
-                source_row = static_cast<uint64_t>(start) + remaining;
-                break;
-            }
-            remaining -= length;
         }
-        record_copy_row_block(
-            ring.payload_buf, spans, row * feature_bytes,
-            src + source_row * feature_bytes, feature_bytes);
+    } else {
+        // More segments than fit in shared memory: row-by-row walk.
+        for (uint64_t row = blockIdx.x; row < total_rows; row += gridDim.x) {
+            uint64_t remaining = row;
+            uint64_t source_row = 0;
+            for (uint32_t segment = 0; segment < segment_count; ++segment) {
+                int64_t start = segment_start_dev_ptr[segment];
+                int64_t end = segment_end_dev_ptr[segment];
+                if (start < 0) start = 0;
+                if (end < start) end = start;
+                if (static_cast<uint64_t>(start) > input_rows) start = static_cast<int64_t>(input_rows);
+                if (static_cast<uint64_t>(end) > input_rows) end = static_cast<int64_t>(input_rows);
+                const uint64_t length = static_cast<uint64_t>(end - start);
+                if (remaining < length) {
+                    source_row = static_cast<uint64_t>(start) + remaining;
+                    break;
+                }
+                remaining -= length;
+            }
+            record_copy_row_block(
+                ring.payload_buf, spans, row * feature_bytes,
+                src + source_row * feature_bytes, feature_bytes);
+        }
     }
 
     __threadfence();
@@ -816,15 +875,126 @@ void launch_record_producer_segmented_pack(
         throw std::invalid_argument(
             "record segmented producer requires positive segment count and feature bytes");
     }
-    uint64_t max_rows = feature_bytes == 0 ? 0 : nbytes_upper / feature_bytes;
-    if (max_rows == 0) max_rows = 1;
-    const uint32_t blocks = static_cast<uint32_t>(
-        max_rows < RECORD_PACK_MAX_BLOCKS ? max_rows : RECORD_PACK_MAX_BLOCKS);
+    // Shared-segment path: one thread per 16-byte unit of the largest possible
+    // selection, capped; the row-walk fallback uses the same grid.
+    const uint64_t threads_needed = nbytes_upper / 16 + 1;
+    uint64_t blocks64 = (threads_needed + PRODUCER_BLOCK_DIM - 1) / PRODUCER_BLOCK_DIM;
+    if (blocks64 > RECORD_PACK_MAX_BLOCKS) blocks64 = RECORD_PACK_MAX_BLOCKS;
+    const uint32_t blocks = static_cast<uint32_t>(blocks64);
     record_producer_segmented_pack_kernel<<<
         blocks, PRODUCER_BLOCK_DIM, 0, stream>>>(
         ring, d_src, nbytes_upper, segment_start_dev_ptr,
         segment_end_dev_ptr, segment_count, feature_bytes,
         emit_gate, emit_value);
+}
+
+
+// ---------------------------------------------------------------------------
+// mask_shard_segment_ranges -- segment ranges of selected row shards in a
+// column-major (stable) permutation of a [rows, cols] boolean mask.
+//
+// Rows of column c appear in increasing row order inside column c's block, and
+// blocks follow column order. For selected shard k (rows [id_k*L, (id_k+1)*L)),
+// column c's rows form one contiguous segment:
+//   start[c*count+k] = block_start(c) + #{r < id_k*L : mask[r,c]}
+//   end  [c*count+k] = start + #{id_k*L <= r < (id_k+1)*L : mask[r,c]}
+// counts[c] = sum_k (end - start). One block; no host synchronization.
+// ---------------------------------------------------------------------------
+__global__ void mask_shard_segment_ranges_kernel(
+    const bool* mask, int64_t rows, int64_t cols, int64_t shard_rows,
+    ShardSelection selection, int64_t* starts, int64_t* ends, int64_t* counts) {
+    extern __shared__ int32_t partial[];  // [groups][cols][1 + 2*count], per-group counts
+    const int count = selection.count;
+    const int width = 1 + 2 * count;
+    const int groups = blockDim.x / static_cast<int>(cols);
+    const int c = threadIdx.x % static_cast<int>(cols);
+    const int g = threadIdx.x / static_cast<int>(cols);
+    if (g < groups) {
+        int64_t total = 0;
+        int64_t before[MAX_SHARD_SELECTION] = {0};
+        int64_t within[MAX_SHARD_SELECTION] = {0};
+        for (int64_t r = g; r < rows; r += groups) {
+            const int64_t v = mask[r * cols + c] ? 1 : 0;
+            total += v;
+            for (int k = 0; k < count; ++k) {
+                const int64_t lo = selection.ids[k] * shard_rows;
+                if (r < lo) before[k] += v;
+                else if (r < lo + shard_rows) within[k] += v;
+            }
+        }
+        int32_t* slot = partial + (static_cast<int64_t>(g) * cols + c) * width;
+        slot[0] = static_cast<int32_t>(total);
+        for (int k = 0; k < count; ++k) {
+            slot[1 + k] = static_cast<int32_t>(before[k]);
+            slot[1 + count + k] = static_cast<int32_t>(within[k]);
+        }
+    }
+    __syncthreads();
+    // One thread per column sums its groups; thread 0 then only scans the
+    // column totals for the block starts.
+    __shared__ int64_t col_total[1024];
+    __shared__ int64_t col_start[1024];
+    int64_t sums[1 + 2 * MAX_SHARD_SELECTION] = {0};
+    if (g == 0) {
+        for (int gg = 0; gg < groups; ++gg) {
+            const int32_t* slot = partial + (static_cast<int64_t>(gg) * cols + c) * width;
+            for (int j = 0; j < width; ++j) sums[j] += slot[j];
+        }
+        col_total[c] = sums[0];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int64_t block_start = 0;
+        for (int64_t col = 0; col < cols; ++col) {
+            col_start[col] = block_start;
+            block_start += col_total[col];
+        }
+    }
+    __syncthreads();
+    if (g == 0) {
+        int64_t selected = 0;
+        for (int k = 0; k < count; ++k) {
+            const int64_t start = col_start[c] + sums[1 + k];
+            starts[static_cast<int64_t>(c) * count + k] = start;
+            ends[static_cast<int64_t>(c) * count + k] = start + sums[1 + count + k];
+            selected += sums[1 + count + k];
+        }
+        counts[c] = selected;
+    }
+}
+
+void launch_mask_shard_segment_ranges(
+    const bool* mask, int64_t rows, int64_t cols, int64_t shard_rows,
+    const ShardSelection& selection, int64_t* starts, int64_t* ends,
+    int64_t* counts, cudaStream_t stream) {
+    if (rows < 0 || rows > INT32_MAX || cols <= 0 || cols > 1024 || selection.count <= 0 ||
+        selection.count > static_cast<int32_t>(MAX_SHARD_SELECTION)) {
+        throw std::invalid_argument(
+            "mask_shard_segment_ranges requires 1 <= cols <= 1024 and 1 <= shard count <= 8");
+    }
+    const int64_t width = 1 + 2 * static_cast<int64_t>(selection.count);
+    int64_t groups = 1024 / cols;
+    const int64_t smem_cap = 32 * 1024;  // plus 16 KiB static per-column tables
+    while (groups > 1 && groups * cols * width * 4 > smem_cap) --groups;
+    const size_t smem = static_cast<size_t>(groups * cols * width) * sizeof(int32_t);
+    if (smem > static_cast<size_t>(smem_cap)) {
+        // Only very wide masks with several shards exceed the default limit.
+        const cudaError_t attr = cudaFuncSetAttribute(
+            mask_shard_segment_ranges_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem));
+        if (attr != cudaSuccess) {
+            throw std::runtime_error(std::string("mask_shard_segment_ranges shared memory: ") +
+                                     cudaGetErrorString(attr));
+        }
+    }
+    mask_shard_segment_ranges_kernel<<<1, static_cast<uint32_t>(groups * cols), smem, stream>>>(
+        mask, rows, cols, shard_rows, selection, starts, ends, counts);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("mask_shard_segment_ranges launch failed: ") +
+                                 cudaGetErrorString(err) + " threads=" +
+                                 std::to_string(groups * cols) + " smem=" + std::to_string(smem));
+    }
 }
 
 }  // namespace ring
