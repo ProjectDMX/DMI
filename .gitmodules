@@ -10,3 +10,6 @@
 [submodule "third_party/DMI-Megatron-Integration"]
 	path = third_party/DMI-Megatron-Integration
 	url = https://github.com/ProjectDMX/DMI-Megatron-Integration.git
+[submodule "third_party/sglang-integration"]
+	path = third_party/sglang-integration
+	url = https://github.com/ProjectDMX/DMI-SGLang-Integration.git
