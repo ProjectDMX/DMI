@@ -497,8 +497,17 @@ class CaptureStorageService {
   size_t index_bounded(std::vector<PackRefData> refs,
                        std::vector<PackRefData>* unindexed,
                        uint64_t deadline_ns = 0);
-  // False when stop() cut it short, between two of its requests.
+  // False when the pass did not finish: stop() cut it short, between two
+  // of its requests, or a pack it listed could not be read (HEAD) or
+  // indexed. A pass that threw did not finish either.
   bool reconcile();
+  // Runs a pass and books it: one that finished clears what was owed; one
+  // that did not -- false, or thrown, which it rethrows -- is owed
+  // (owe_reconcile). Requires cycle_mutex_, or start() before the loop runs.
+  bool reconcile_or_owe();
+  // The loop runs an owed pass again no sooner than poll_interval_ns
+  // doubled per pass that did not finish, capped at max_backoff_ns.
+  void owe_reconcile();
   void keep_lease();          // the lease thread's body
   void renew_lease_if_due();  // requires lease_mutex_
   // LeaseScope's before_request hook: renew_lease_if_due() before each
@@ -574,9 +583,14 @@ class CaptureStorageService {
   // hammer the lease table. Guarded by lease_mutex_.
   uint64_t next_claim_ns_ = 0;
   uint64_t last_reconcile_ns_ = 0;
-  // The reconcile at start() lost the lease before it finished; the loop
-  // runs one once it holds a lease again. Guarded by cycle_mutex_.
+  // A reconcile pass -- start()'s or the loop's -- did not finish; the loop
+  // runs one once it holds a lease, from reconcile_retry_ns_ on. Without
+  // this, a pass the object store or the catalog failed waited for the
+  // next process start when reconcile_interval_ns is 0, the default.
+  // Guarded by cycle_mutex_.
   bool reconcile_owed_ = false;
+  uint64_t reconcile_retry_ns_ = 0;
+  int reconcile_failures_ = 0;  // consecutive passes that did not finish
   // Adoption's state, guarded by cycle_mutex_: whether a look at the
   // siblings is due (from start() on), the dead ones the last look found,
   // the one being adopted, whether the last look found a live one and when
