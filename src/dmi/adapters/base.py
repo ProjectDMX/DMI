@@ -11,8 +11,12 @@ every concrete adapter:
     -> plan_step        (base; walks active_specs once for
                          total_bytes + hook_count + needs_eager)
     -> commit_step      (base)
+       -> reject an eager-only plan before reservation when eager fallback
+          is disabled
        -> prepare_step  (skipped when hook_count == 0)
        on result == 2:
+         -> reject before metadata publication when eager fallback is
+            disabled
          -> adapt_for_cpu_direct  (subclass; default no-op)
          -> on_capacity_exceeded  (subclass)
          -> _warn_once_capacity   (base stub; subclass overrides)
@@ -21,7 +25,9 @@ every concrete adapter:
     -> pre_push_all_metas
 
 The unit-test gate (``tests/test_adapter_protocol.py``) exercises the driver
-ordering with mocks.
+ordering and the strict rejection with mocks.  Native ``prepare_step`` may
+synchronize and drain earlier work before returning OVERSIZED; a strict
+rejection does not undo that, and that native branch reserves nothing.
 """
 from __future__ import annotations
 
@@ -127,7 +133,10 @@ class BackendAdapter(abc.ABC):
     ``commit_step`` (reservation + context/metadata publication).
     """
 
-    def __init__(self, engine: "MonitoringEngine", model_id: str) -> None:
+    def __init__(self, engine: "MonitoringEngine", model_id: str,
+                 *, allow_eager_fallback: bool = True) -> None:
+        if type(allow_eager_fallback) is not bool:
+            raise ValueError("allow_eager_fallback must be a bool")
         self.engine = engine
         self.model_id = model_id
         self.transport = engine_ring_transport(engine)
@@ -138,6 +147,27 @@ class BackendAdapter(abc.ABC):
         # Steps seen by this adapter since attach. Feeds the capture
         # schedule's stride/warmup gate in before_forward.
         self._step_counter: int = 0
+        # False: a step that would need the eager safety net (a hook that
+        # needs eager dispatch, or a step larger than the ring) raises
+        # instead, before anything is reserved or published.  For
+        # deployments where a silent switch to eager dispatch (and CPU-direct
+        # copies) is worse than a refused step.
+        self.allow_eager_fallback = allow_eager_fallback
+        self._dispatch_counts = dict(
+            prepared_steps=0, ring_flushed_steps=0, oversized_steps=0,
+            eager_required_steps=0, forced_eager_steps=0,
+            rejected_eager_steps=0)
+
+    def capture_dispatch_state(self) -> dict:
+        """Cumulative step-preparation counts (not completed executions)."""
+        return {"allow_eager_fallback": self.allow_eager_fallback,
+                **self._dispatch_counts}
+
+    def _reject_eager(self, reason: str, plan: "StepPlan") -> None:
+        self._dispatch_counts["rejected_eager_steps"] += 1
+        raise RuntimeError(
+            f"capture eager fallback forbidden: {reason}; "
+            f"planned_bytes={plan.total_bytes}, hooks={plan.hook_count}")
 
     @property
     def active_hook_specs(self) -> tuple[HookSpec, ...]:
@@ -395,6 +425,15 @@ class BackendAdapter(abc.ABC):
         # their internal loops produce nothing to push when the
         # active-spec list is empty or every shape was empty.
         if plan.hook_count > 0:
+            counts = getattr(self, "_dispatch_counts", None)
+            strict = not getattr(self, "allow_eager_fallback", True)
+            if plan.needs_eager:
+                if counts is not None:
+                    counts["eager_required_steps"] += 1
+                if strict:
+                    # The plan alone establishes that graph dispatch is
+                    # impossible: reject before reserving ring space.
+                    self._reject_eager("hook requires eager execution", plan)
             # A needs_eager step runs every hook through the eager safety
             # net, which reserves each hook's entry itself (reserve_one), so
             # prepare_step only makes room for it. Reserving the step as
@@ -406,10 +445,22 @@ class BackendAdapter(abc.ABC):
                     reserve=not plan.needs_eager,
                 )
             )
+            if counts is not None:
+                counts["prepared_steps"] += 1
+                counts["ring_flushed_steps"] += int(
+                    reservation is StepReservation.FLUSHED)
+                counts["oversized_steps"] += int(
+                    reservation is StepReservation.OVERSIZED)
+            if reservation is StepReservation.OVERSIZED and strict:
+                # OVERSIZED flushed earlier work but reserved nothing: publish
+                # no metadata and arm no producer for this step.
+                self._reject_eager("step exceeds ring capacity", plan)
             self.transport.force_eager = (
                 reservation is StepReservation.OVERSIZED
                 or plan.needs_eager
             )
+            if counts is not None:
+                counts["forced_eager_steps"] += int(self.transport.force_eager)
             if reservation is StepReservation.OVERSIZED:
                 ctx = self.adapt_for_cpu_direct(ctx)
                 self.on_capacity_exceeded(ctx)
@@ -439,7 +490,8 @@ class BackendAdapter(abc.ABC):
     def plan_step(self, ctx: StepContext) -> StepPlan:
         """Build a side-effect-free reservation plan for one step.
 
-        Single walk over ``active_specs``:
+        Single walk over ``active_specs`` (``transport.specs_for_step()``
+        while the node toggle is active):
         - ``total_bytes`` and ``hook_count`` feed ``prepare_step``.
           ``hook_count``
           counts only specs whose ``compute_hook_shape`` returns a
@@ -456,7 +508,16 @@ class BackendAdapter(abc.ABC):
         total = 0
         n = 0
         needs_eager = False
-        for spec in self.active_specs:
+        # While the node toggle gates steps, reserve for the per-step spec
+        # set the transport also publishes metadata for (the enabled subset
+        # on a gated step, the full active set otherwise).  Reserving for a
+        # different set than the one that fires drifts the ring's head and
+        # tail.  With the toggle inactive this is active_specs, as before.
+        specs = self.active_specs
+        transport = getattr(self, "transport", None)
+        if getattr(transport, "toggle_gate_active", False) is True:
+            specs = transport.specs_for_step()
+        for spec in specs:
             # When the adapter has populated actual_q_len AND the spec is
             # prefix-strip-eligible, size the byte budget for the unpadded
             # data the producer will actually write.  Other specs and the

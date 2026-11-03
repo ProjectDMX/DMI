@@ -312,6 +312,92 @@ public:
     // ensure FIFO ordering before consuming the next meta out-of-band.
     void flush_and_wait();
 
+    // ---- Runtime CUDA-graph node toggling (legacy rings) -----------------
+    // cudaGraph_t / cudaGraphNode_t / cudaGraphExec_t travel as opaque
+    // uint64_t so this header stays CUDA-free (bindings.cpp is compiled with
+    // g++).  The enabled (hook_type, layer_no) set is the single source of
+    // truth: apply_toggle()/ensure_graph_current() (device node state) and
+    // is_hook_enabled()/effective_enabled_mask() (host metadata gate) all
+    // read it.  State and CUDA-graph operations live in ToggleRegistry
+    // (toggle_registry.h); these methods delegate.
+
+    // While enabled, the producer ops record their kernel node (through
+    // cudaStreamGetCaptureInfo) during stream capture.  Default off.
+    // Refused on a record ring.
+    void enable_toggle_capture(bool enabled);
+    bool toggle_capture_enabled() const;
+    // Called by the producer ops during capture (C++ only, not bound).
+    void register_capture_node(uint64_t graph, int hook_type, int layer_no,
+                               uint64_t node);
+    // Called by the producer ops when a capture-time recording cannot be
+    // validated (non-kernel tail dependency, unreadable capture state, or a
+    // producer the toggle does not manage): activation then fails closed.
+    void note_capture_anomaly();
+    uint64_t capture_anomaly_count() const;
+    // Bind a captured graph to its instantiated exec (after capture).
+    void bind_graph_exec(uint64_t graph, uint64_t exec);
+    // Bumped by every registry mutation (capture flag, node recording,
+    // anomaly, bind, clear).  Host-side guard verdicts are cached on it.
+    uint64_t toggle_registry_version() const;
+    // Replace the enabled (hook_type, layer_no) set and activate the gate.
+    void set_enabled_hooks(const std::vector<std::pair<int,int>>& enabled);
+    // Apply the enabled set to every bound exec (cudaGraphNodeSetEnabled,
+    // diff-based).  Returns the first CUDA error code (0 = success).  Eager:
+    // call only when no bound exec has a replay in flight.
+    int  apply_toggle();
+    // Host metadata gate: true iff the hook is enabled AND registered, or
+    // the gate is inactive.
+    bool is_hook_enabled(int hook_type, int layer_no) const;
+    // Batched is_hook_enabled, one entry per query.
+    std::vector<int> effective_enabled_mask(
+        const std::vector<std::pair<int,int>>& query) const;
+    // Lazy per-graph apply: bring ONE graph up to the current enabled set if
+    // it is stale.  Call just before that graph replays.  Nonzero is a CUDA
+    // error and must be treated as fatal by the caller (the metadata for the
+    // new set has already been pushed).
+    int  ensure_graph_current(uint64_t graph);
+    // Record an event after a graph's replay for the optional pre-apply wait
+    // (set_toggle_pre_apply_sync).  Nonzero must be treated as fatal.
+    int  record_replay_event(uint64_t graph);
+    void set_toggle_pre_apply_sync(bool enabled);
+    uint64_t toggle_node_count() const;
+    // Producer nodes recorded for one captured graph (0 when none or when
+    // the graph was captured outside the capture window).
+    uint64_t toggle_node_count_for_graph(uint64_t graph) const;
+    // Process-wide count of producer kernels launched by the ring producer
+    // ops (eager or under capture).  A change across a graph capture means
+    // the graph captured at least one producer.
+    uint64_t producer_launch_count() const;
+    uint64_t bound_graph_count() const;          // 0 => apply is a no-op
+    uint64_t last_apply_count() const;           // SetEnabled calls in the last apply_toggle
+    bool     toggle_registry_uniform() const;    // all graphs share one hook set
+    // Read-only replay-time check: the graph has recorded producer nodes AND
+    // a bound exec.  A graph captured after the capture window closed is
+    // neither, so its producers would run while the metadata gate filters.
+    bool     is_graph_ready(uint64_t graph) const;
+    // The node registry and the exec bindings cover exactly the same graphs.
+    bool     toggle_registry_complete() const;
+    // Full reset (re-enables disabled nodes of bound execs first): registry,
+    // bindings, enabled set, gate, capture flag and lazy state.
+    void clear_toggle_registry();
+
+    // Device-side toggling (toggle_device.h).  Opt in before the capture
+    // window opens; returns false when the build, driver or device lacks
+    // device graph updates (the mode then stays off).
+    bool enable_device_toggle(bool enabled);
+    bool toggle_device_mode() const;
+    uint64_t toggle_device_node_count() const;
+    uint64_t toggle_device_errors() const;
+    // Upload a captured graph's exec if it holds device-updatable producers
+    // and was not uploaded yet (required before its first launch); a no-op
+    // returning 0 otherwise.  Returns the CUDA error.
+    int  upload_graph_exec(uint64_t graph, uint64_t exec);
+
+    // Test-only: make ensure_graph_current fail with `code` (0 disables), and
+    // query whether a graph's applied version is current.
+    void _test_force_apply_error(int code);
+    bool _test_applied_current(uint64_t graph) const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

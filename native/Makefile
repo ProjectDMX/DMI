@@ -27,7 +27,8 @@ HEADERS := csrc/dmx_host_utils.h \
            csrc/ring/record_sink.h \
            csrc/ring/p2p_thread.h csrc/ring/pinned_staging.h \
            csrc/ring/ring_engine.h csrc/ring/ring_engine_py.h \
-           csrc/ring/ring_torch_op.h csrc/ring/tensor_meta.h
+           csrc/ring/ring_torch_op.h csrc/ring/tensor_meta.h \
+           csrc/ring/toggle_device.h csrc/ring/toggle_registry.h
 BUILD_DIR := build
 HOST_BUILD_DIR := $(BUILD_DIR)/host
 OBJS := $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
@@ -185,7 +186,8 @@ NVCCFLAGS := \
 
 RING_SRCS := csrc/ring/producer.cu \
              csrc/ring/ring_engine.cu \
-             csrc/ring/ring_engine_py.cu
+             csrc/ring/ring_engine_py.cu \
+             csrc/ring/toggle_registry.cu
 RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))
 
 OBJS += $(RING_OBJS)

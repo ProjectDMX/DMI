@@ -7,7 +7,7 @@ this module owns only native-op registration and ring runtime state.
 """
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple
 
 import torch
 import torch.library
@@ -24,6 +24,9 @@ from ..hooks.specs import (
     _id_by_short,
     compute_hook_shape,
 )
+
+if TYPE_CHECKING:
+    from ..node_toggle import NodeToggleController
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +252,20 @@ class RingTransport:
         self._active_specs: List[HookSpec] = []
         self._using_forward_hooks: bool = False
 
+        # Runtime node-toggle controller (dmi.node_toggle), created on first
+        # use. None means the toggle is inactive: every active spec fires
+        # every step.
+        self._toggle: "Optional[NodeToggleController]" = None
+        # Per-step gate selector.  The toggle (cudaGraphNodeSetEnabled on
+        # captured producer nodes) governs only producers that run inside a
+        # replayed graph.  On an eager or prefill step producers run
+        # unconditionally, so metadata publication and capacity reservation
+        # must use the full active set that step.  The integration sets this
+        # per step (True: a toggled graph replays, the gate applies; False:
+        # the full active set fires).  Default True so a caller that only
+        # replays toggled graphs keeps gating.
+        self._gated_step: bool = True
+
         # Hook selection preset name (e.g. "full", "hidden-states", "logits").
         # Set by the active adapter before hook installation.
         self._hook_selection: Optional[str] = None
@@ -320,6 +337,81 @@ class RingTransport:
         """Set the model shape config for analytical shape computation."""
         self._model_cfg = cfg
 
+    # ------------------------------------------------------------------
+    # Runtime node toggling (see dmi.node_toggle)
+
+    @property
+    def effective_specs(self) -> "List[HookSpec]":
+        """The specs that fire on a gated step: the enabled-and-captured
+        subset while the toggle gate is active, else every active spec."""
+        toggle = getattr(self, "_toggle", None)
+        if (toggle is not None and toggle.gate_active
+                and toggle.effective_enabled_specs is not None):
+            return toggle.effective_enabled_specs
+        return self._active_specs
+
+    def specs_for_step(self) -> "List[HookSpec]":
+        """The spec set that drives capacity reservation and metadata
+        publication THIS step: ``effective_specs`` on a gated step, the full
+        active set on an ungated (eager or prefill) step.  Identical when the
+        toggle is inactive."""
+        if getattr(self, "_gated_step", True):
+            return self.effective_specs
+        return self._active_specs
+
+    def set_gated_step(self, gated: bool) -> None:
+        """Declare whether this step replays a toggled graph.
+
+        Integrations call this before planning each step: True when the
+        step's producers run inside a toggle-managed graph (the enabled
+        subset fires), False on an eager or partial-graph step (the full
+        active set fires)."""
+        self._gated_step = bool(gated)
+
+    def gated_step_requires_registry(self) -> bool:
+        """True when this step's producers must all be toggle-managed, i.e.
+        a graph excluded from the registry must not replay."""
+        return bool(getattr(self, "_gated_step", True))
+
+    def _toggle_ctrl(self) -> "NodeToggleController":
+        if self._toggle is None:
+            from ..node_toggle import NodeToggleController
+            self._toggle = NodeToggleController(self._ring_engine, self)
+        return self._toggle
+
+    @property
+    def toggle_gate_active(self) -> bool:
+        toggle = getattr(self, "_toggle", None)
+        return toggle is not None and toggle.gate_active
+
+    @property
+    def toggle_lazy_active(self) -> bool:
+        toggle = getattr(self, "_toggle", None)
+        return toggle is not None and toggle.lazy_active
+
+    def set_active_hooks(self, enabled: "Iterable[Tuple[int, int]]") -> None:
+        """Eager node-toggle reconfiguration (quiescent points only).  See
+        ``NodeToggleController.set_active_hooks``."""
+        self._toggle_ctrl().set_active_hooks(enabled)
+
+    def set_active_hooks_lazy(self, enabled: "Iterable[Tuple[int, int]]") -> None:
+        """Lazy node-toggle reconfiguration (device apply deferred per
+        graph).  See ``NodeToggleController.set_active_hooks_lazy``."""
+        self._toggle_ctrl().set_active_hooks_lazy(enabled)
+
+    def is_graph_ready(self, raw_graph: int) -> bool:
+        return self._toggle_ctrl().is_graph_ready(raw_graph)
+
+    def ensure_graph_current(self, raw_graph: int) -> int:
+        return self._toggle_ctrl().ensure_graph_current(raw_graph)
+
+    def record_replay_event(self, raw_graph: int) -> int:
+        return self._toggle_ctrl().record_replay_event(raw_graph)
+
+    def clear_toggle(self) -> None:
+        """Clear the registry and deactivate the host gate together."""
+        self._toggle_ctrl().clear()
+
     def pre_push_all_metas(self, batch: int, q_len: int, kv_dim: int,
                            logits_to_keep: int = 0,
                            token_ids_dtype: Optional[torch.dtype] = None,
@@ -353,7 +445,9 @@ class RingTransport:
         shapes = []
         dtypes = []
         flags = []
-        for spec in self._active_specs:
+        # The per-step spec set: the metadata published here, the device
+        # node state and the capacity reservation stay in lockstep.
+        for spec in self.specs_for_step():
             spec_q_len = (actual_q_len if actual_q_len is not None
                           and spec.dim0_is_actual_tokens
                           else q_len)
@@ -569,7 +663,16 @@ def activate(transport: RingTransport) -> None:
 
 def deactivate() -> None:
     global _active_transport
+    transport = _active_transport
     _active_transport = None
+    if transport is not None:
+        # A node-toggle capture window must not keep the engine alive, and
+        # tearing the transport down ends its engine's monitoring session
+        # (restoring torch.cuda.CUDAGraph once no session remains).
+        from .. import node_toggle
+        engine = getattr(transport, "_ring_engine", None)
+        node_toggle._forget_window(engine)
+        node_toggle.end_session(engine)
     try:
         from . import native as _ne
         _ne.ring_clear_active_engine()

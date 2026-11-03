@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "ring_torch_op.h"
 #include "producer.cuh"
+#include "toggle_device.h"   // dmx_capture_info
 
 #include <limits>
 
@@ -17,6 +18,15 @@ static ring_py::RingEnginePy* g_active_engine = nullptr;
 #define HOST_HOOK_MAX 32
 static std::atomic<uint64_t> g_host_calls[HOST_HOOK_MAX] = {};
 
+// Producer kernels launched by the ring producer ops, eager or captured.  The
+// CUDA-graph replay guard compares it across a capture to tell a graph that
+// captured producers from one that did not (dmi.node_toggle).
+static std::atomic<uint64_t> g_producer_launches{0};
+
+uint64_t ring_producer_launch_count() {
+    return g_producer_launches.load(std::memory_order_relaxed);
+}
+
 void ring_diag_reset_host_counters() {
     for (int i = 0; i < HOST_HOOK_MAX; ++i) g_host_calls[i].store(0);
 }
@@ -31,8 +41,65 @@ void ring_diag_print_host_counters() {
     fprintf(stderr, "  total=%lu\n", total);
 }
 
+// Node-toggle capture flag (see ring_torch_op.h).
+static bool g_toggle_capture = false;
+
+void ring_set_toggle_capture(bool enabled) {
+    g_toggle_capture = enabled;
+}
+
 void ring_set_active_engine(ring_py::RingEnginePy* e) {
     g_active_engine = e;
+    // A stale capture flag after the engine is cleared would record into
+    // nothing.
+    if (e == nullptr) g_toggle_capture = false;
+}
+
+// Node-toggle capture: record THIS producer's kernel node (the capture's
+// current tail dependency) so it can be enabled or disabled after
+// instantiation with cudaGraphNodeSetEnabled.  No-op outside the capture
+// window.
+//   supported = true   (static and prefix producers): each is a single kernel
+//     launch, so the tail dependency is its kernel node.  Validated: a
+//     non-kernel tail (a multi-op producer, a capture event join) must not be
+//     registered as the wrong node.
+//   supported = false  (chunked producer): the toggle does not manage it.
+//     Recorded as an anomaly so activation fails loud instead of leaving a
+//     producer that fires while the gate filters its metadata.
+// Every state where a producer fired under capture but its node could not be
+// recorded is an anomaly.  The one silent case is a stream that is not
+// actively capturing: an eager warmup run, not a graph node.
+static void dmx_record_capture_node(cudaStream_t stream, int hook_type,
+                                    int hook_id, bool supported) {
+    if (!g_toggle_capture || !g_active_engine) return;
+    cudaStreamCaptureStatus  cap_st    = cudaStreamCaptureStatusNone;
+    unsigned long long       cap_id    = 0;
+    cudaGraph_t              cap_graph = nullptr;
+    const cudaGraphNode_t*   cap_deps  = nullptr;
+    size_t                   cap_nd    = 0;
+    cudaError_t ce = dmx_capture_info(stream, &cap_st, &cap_id, &cap_graph,
+                                      &cap_deps, &cap_nd);
+    if (ce != cudaSuccess) {
+        // A healthy non-capturing stream returns success with status None,
+        // so this is a genuine error: the node cannot be confirmed.
+        g_active_engine->note_capture_anomaly();
+        return;
+    }
+    if (cap_st != cudaStreamCaptureStatusActive) return;  // eager run, not a node
+    if (cap_nd < 1 || !supported) {
+        g_active_engine->note_capture_anomaly();
+        return;
+    }
+    cudaGraphNode_t node = cap_deps[cap_nd - 1];
+    cudaGraphNodeType ntype;
+    if (cudaGraphNodeGetType(node, &ntype) == cudaSuccess
+        && ntype == cudaGraphNodeTypeKernel) {
+        g_active_engine->register_capture_node(
+            reinterpret_cast<uint64_t>(cap_graph), hook_type, hook_id,
+            reinterpret_cast<uint64_t>(node));
+    } else {
+        g_active_engine->note_capture_anomaly();
+    }
 }
 
 // Three side-effect ops, one per use case:
@@ -90,6 +157,9 @@ void ring_producer_impl(
             static_cast<uint64_t>(tensor.nbytes()),
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
+        g_producer_launches.fetch_add(1, std::memory_order_relaxed);
+        dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
+                                static_cast<int>(hook_id), /*supported=*/true);
     }
 }
 
@@ -114,6 +184,9 @@ void ring_producer_prefix_impl(
             static_cast<uint64_t>(row_bytes),
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
+        g_producer_launches.fetch_add(1, std::memory_order_relaxed);
+        dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
+                                static_cast<int>(hook_id), /*supported=*/true);
     }
 }
 
@@ -139,6 +212,10 @@ void ring_producer_chunked_impl(
             K,
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
+        g_producer_launches.fetch_add(1, std::memory_order_relaxed);
+        // Not toggle-managed: fail closed if captured inside the window.
+        dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
+                                static_cast<int>(hook_id), /*supported=*/false);
     }
 }
 

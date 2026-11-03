@@ -11,6 +11,7 @@
 #include "ring/producer.cuh"
 #include "ring/ring_debug.h"
 #include "ring/record_stall_budget.h"
+#include "ring/toggle_registry.h"
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
 #include <algorithm>
 #include <atomic>
@@ -138,7 +139,14 @@ void refuse_on_record_ring(bool record_mode, const char* what) {
 // on top of it without checking again. Unsaturated, cap - (head - tail) then
 // wraps to ~2^64, every check admits every reservation, and the producers
 // publish over unread slots.
+//
+// Saturated at the other end too: the tail can run ahead of the head when
+// producers recorded into a CUDA graph also fire during capture-time warmup
+// runs and the drain consumes them with no step reservation behind them.
+// The ring is then empty, not full; unsaturated, head - tail wraps to ~2^64
+// and every later step takes a spurious flush.
 uint64_t legacy_ring_room(uint64_t cap, uint64_t head, uint64_t tail) {
+    if (head < tail) return cap;
     const uint64_t outstanding = head - tail;
     return outstanding >= cap ? 0 : cap - outstanding;
 }
@@ -164,6 +172,10 @@ struct RingEnginePy::Impl {
     // Tensor(a!) mutation alias passed to every producer op call.
     at::Tensor       payload_view;
     bool             record_mode{false};
+
+    // Runtime CUDA-graph node toggling: all state and graph operations live
+    // in the registry; the engine methods delegate.
+    ToggleRegistry   toggle;
 
     // Step-gated drain: ring records reserved since the last allow_flush_step()
     // (the current step's gap).  Written by the reserving thread only.
@@ -969,6 +981,137 @@ at::Tensor RingEnginePy::payload_tensor() const {
 // reserve will still succeed because the actual ring state has at least
 // as much room as we computed.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Runtime CUDA-graph node toggling -- thin delegates to ToggleRegistry.  The
+// engine adds only the process-global capture flag the producer ops read
+// (ring_set_toggle_capture) and the current ATen stream for replay events.
+void RingEnginePy::enable_toggle_capture(bool enabled) {
+    if (enabled) refuse_on_record_ring(impl_->record_mode, "node-toggle capture");
+    impl_->toggle.set_capture(enabled);
+    ring_set_toggle_capture(enabled);
+}
+
+bool RingEnginePy::toggle_capture_enabled() const {
+    return impl_->toggle.capture_enabled();
+}
+
+void RingEnginePy::register_capture_node(uint64_t graph, int hook_type,
+                                         int layer_no, uint64_t node) {
+    impl_->toggle.register_node(graph, hook_type, layer_no, node);
+}
+
+void RingEnginePy::note_capture_anomaly() {
+    impl_->toggle.note_anomaly();
+}
+
+uint64_t RingEnginePy::capture_anomaly_count() const {
+    return impl_->toggle.anomaly_count();
+}
+
+void RingEnginePy::bind_graph_exec(uint64_t graph, uint64_t exec) {
+    impl_->toggle.bind_exec(graph, exec);
+}
+
+uint64_t RingEnginePy::toggle_registry_version() const {
+    return impl_->toggle.version();
+}
+
+void RingEnginePy::set_enabled_hooks(
+    const std::vector<std::pair<int,int>>& enabled) {
+    impl_->toggle.set_enabled(enabled);
+}
+
+int RingEnginePy::apply_toggle() {
+    return impl_->toggle.apply_all();
+}
+
+bool RingEnginePy::is_hook_enabled(int hook_type, int layer_no) const {
+    return impl_->toggle.is_enabled(hook_type, layer_no);
+}
+
+std::vector<int> RingEnginePy::effective_enabled_mask(
+    const std::vector<std::pair<int,int>>& query) const {
+    return impl_->toggle.effective_mask(query);
+}
+
+int RingEnginePy::ensure_graph_current(uint64_t graph) {
+    return impl_->toggle.ensure_current(graph);
+}
+
+int RingEnginePy::record_replay_event(uint64_t graph) {
+    return impl_->toggle.record_replay_event(
+        graph, at::cuda::getCurrentCUDAStream().stream());
+}
+
+void RingEnginePy::set_toggle_pre_apply_sync(bool enabled) {
+    impl_->toggle.set_pre_apply_sync(enabled);
+}
+
+uint64_t RingEnginePy::toggle_node_count() const {
+    return impl_->toggle.node_count();
+}
+
+uint64_t RingEnginePy::toggle_node_count_for_graph(uint64_t graph) const {
+    return impl_->toggle.node_count_for(graph);
+}
+
+uint64_t RingEnginePy::producer_launch_count() const {
+    return ring_producer_launch_count();
+}
+
+uint64_t RingEnginePy::bound_graph_count() const {
+    return impl_->toggle.bound_count();
+}
+
+uint64_t RingEnginePy::last_apply_count() const {
+    return impl_->toggle.last_apply_count();
+}
+
+bool RingEnginePy::toggle_registry_uniform() const {
+    return impl_->toggle.uniform();
+}
+
+bool RingEnginePy::is_graph_ready(uint64_t graph) const {
+    return impl_->toggle.is_ready(graph);
+}
+
+bool RingEnginePy::toggle_registry_complete() const {
+    return impl_->toggle.complete();
+}
+
+void RingEnginePy::clear_toggle_registry() {
+    impl_->toggle.clear();
+    ring_set_toggle_capture(false);
+}
+
+bool RingEnginePy::enable_device_toggle(bool enabled) {
+    return impl_->toggle.set_device_mode(enabled);
+}
+
+bool RingEnginePy::toggle_device_mode() const {
+    return impl_->toggle.device_mode();
+}
+
+uint64_t RingEnginePy::toggle_device_node_count() const {
+    return impl_->toggle.device_node_count();
+}
+
+uint64_t RingEnginePy::toggle_device_errors() const {
+    return impl_->toggle.device_errors();
+}
+
+int RingEnginePy::upload_graph_exec(uint64_t graph, uint64_t exec) {
+    return impl_->toggle.upload_device_graph(graph, exec);
+}
+
+void RingEnginePy::_test_force_apply_error(int code) {
+    impl_->toggle.force_apply_error(code);
+}
+
+bool RingEnginePy::_test_applied_current(uint64_t graph) const {
+    return impl_->toggle.applied_current(graph);
+}
 
 uint64_t RingEnginePy::available_capacity() const {
     auto& drain = impl_->engine.drain_thread();

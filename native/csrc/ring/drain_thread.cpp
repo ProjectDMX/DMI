@@ -258,6 +258,15 @@ uint64_t DrainThread::cpu_task_tail_committed() const {
 // ---------------------------------------------------------------------------
 void DrainThread::reserve(uint64_t payload_bytes, uint32_t num_tasks) {
     std::lock_guard<std::mutex> lk(mgmt_mu_);
+    // Producers that ran without a reservation (warmup runs of captured
+    // producers) can leave the drain's tails ahead of the reservation heads.
+    // Reserve from the tails: otherwise the heads stay behind them for as
+    // many reserved tasks as the skew, the room check reads a full ring as
+    // empty, and producers publish over unread slots.
+    if (cpu_payload_head_ < cpu_payload_tail_committed_)
+        cpu_payload_head_ = cpu_payload_tail_committed_;
+    if (cpu_task_head_ < cpu_task_tail_)
+        cpu_task_head_ = cpu_task_tail_;
     cpu_payload_head_ += payload_bytes;
     cpu_task_head_    += num_tasks;
 }

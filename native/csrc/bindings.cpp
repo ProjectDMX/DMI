@@ -692,7 +692,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
              ring_py::SubmitFn submit_fn;
-             if (!host_engine_obj.is_none()) {
+             if (!host_engine_obj.is_none() &&
+                 py::isinstance<dmx_host::DMXHostEngine>(host_engine_obj)) {
                  auto host = host_engine_obj.cast<std::shared_ptr<dmx_host::DMXHostEngine>>();
                  submit_fn = [host](const std::string& model_id, int32_t shard_rank,
                                     const std::string& req_id, const std::string& act_name,
@@ -709,6 +710,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                      uint64_t nbytes = static_cast<uint64_t>(slice.nbytes());
                      row.emplace_back(std::move(slice));
                      host->submit_direct(std::move(row), nbytes);
+                 };
+             } else if (!host_engine_obj.is_none()) {
+                 // An in-process consumer: any Python callable taking
+                 // (model_id, shard_rank, req_id, act_name, layer_no,
+                 //  start_token, end_token, tensor).  The P2P thread calls
+                 // it without the GIL, so take it for the call.  An
+                 // exception propagates to the P2P thread's submit-failure
+                 // handling (logged once, the slice is dropped).
+                 if (!PyCallable_Check(host_engine_obj.ptr())) {
+                     throw py::type_error(
+                         "RingEngine host_engine must be a DMXHostEngine, a "
+                         "callable consumer, or None");
+                 }
+                 auto fn = std::shared_ptr<py::object>(
+                     new py::object(host_engine_obj),
+                     [](py::object* held) {
+                         // The last reference can drop on the P2P thread.
+                         py::gil_scoped_acquire gil;
+                         delete held;
+                     });
+                 submit_fn = [fn](const std::string& model_id, int32_t shard_rank,
+                                  const std::string& req_id, const std::string& act_name,
+                                  int32_t layer_no, int32_t start_token, int32_t end_token,
+                                  at::Tensor slice) {
+                     py::gil_scoped_acquire gil;
+                     try {
+                         (*fn)(model_id, shard_rank, req_id, act_name, layer_no,
+                               start_token, end_token, std::move(slice));
+                     } catch (py::error_already_set& error) {
+                         std::string what = error.what();
+                         throw std::runtime_error(what);
+                     }
                  };
              }
              return MakeRingEngine(
@@ -918,7 +951,64 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("notify_drain",
            &ring_py::RingEnginePy::notify_drain,
-           py::call_guard<py::gil_scoped_release>());
+           py::call_guard<py::gil_scoped_release>())
+      // ---- Runtime CUDA-graph node toggling -------------------------------
+      // Graph, node and exec handles are the integers returned by
+      // torch.cuda.CUDAGraph.raw_cuda_graph() / raw_cuda_graph_exec().
+      .def("enable_toggle_capture",
+           &ring_py::RingEnginePy::enable_toggle_capture, py::arg("enabled"))
+      .def("toggle_capture_enabled",
+           &ring_py::RingEnginePy::toggle_capture_enabled)
+      .def("capture_anomaly_count",
+           &ring_py::RingEnginePy::capture_anomaly_count)
+      .def("bind_graph_exec", &ring_py::RingEnginePy::bind_graph_exec,
+           py::arg("graph"), py::arg("exec"))
+      .def("toggle_registry_version",
+           &ring_py::RingEnginePy::toggle_registry_version)
+      .def("set_enabled_hooks", &ring_py::RingEnginePy::set_enabled_hooks,
+           py::arg("enabled"))
+      .def("apply_toggle", &ring_py::RingEnginePy::apply_toggle)
+      .def("is_hook_enabled", &ring_py::RingEnginePy::is_hook_enabled,
+           py::arg("hook_type"), py::arg("layer_no"))
+      .def("effective_enabled_mask",
+           &ring_py::RingEnginePy::effective_enabled_mask, py::arg("query"))
+      .def("ensure_graph_current",
+           &ring_py::RingEnginePy::ensure_graph_current, py::arg("graph"))
+      .def("record_replay_event",
+           &ring_py::RingEnginePy::record_replay_event, py::arg("graph"))
+      .def("set_toggle_pre_apply_sync",
+           &ring_py::RingEnginePy::set_toggle_pre_apply_sync,
+           py::arg("enabled"))
+      .def("toggle_node_count", &ring_py::RingEnginePy::toggle_node_count)
+      .def("toggle_node_count_for_graph",
+           &ring_py::RingEnginePy::toggle_node_count_for_graph,
+           py::arg("graph"))
+      .def("producer_launch_count",
+           &ring_py::RingEnginePy::producer_launch_count)
+      .def("bound_graph_count", &ring_py::RingEnginePy::bound_graph_count)
+      .def("last_apply_count", &ring_py::RingEnginePy::last_apply_count)
+      .def("toggle_registry_uniform",
+           &ring_py::RingEnginePy::toggle_registry_uniform)
+      .def("is_graph_ready", &ring_py::RingEnginePy::is_graph_ready,
+           py::arg("graph"))
+      .def("toggle_registry_complete",
+           &ring_py::RingEnginePy::toggle_registry_complete)
+      .def("clear_toggle_registry",
+           &ring_py::RingEnginePy::clear_toggle_registry)
+      .def("enable_device_toggle",
+           &ring_py::RingEnginePy::enable_device_toggle, py::arg("enabled"))
+      .def("toggle_device_mode", &ring_py::RingEnginePy::toggle_device_mode)
+      .def("toggle_device_node_count",
+           &ring_py::RingEnginePy::toggle_device_node_count)
+      .def("toggle_device_errors",
+           &ring_py::RingEnginePy::toggle_device_errors)
+      .def("upload_graph_exec", &ring_py::RingEnginePy::upload_graph_exec,
+           py::arg("graph"), py::arg("exec"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("_test_force_apply_error",
+           &ring_py::RingEnginePy::_test_force_apply_error, py::arg("code"))
+      .def("_test_applied_current",
+           &ring_py::RingEnginePy::_test_applied_current, py::arg("graph"));
 
   // Register the active ring engine pointer so C++ ring_producer_impl can
   // call it during CUDA graph capture.  The raw pointer is valid as long as
