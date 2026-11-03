@@ -1,5 +1,6 @@
 // CPU-only stand-in for the CUDA runtime API used by the host half of
-// ring/toggle_registry.cu and by ring/ring_torch_op.cpp's producer ops.  No
+// ring/toggle_registry.cu, ring/ring_torch_op.cpp's producer ops and the
+// host-side P2P handoff (ring/p2p_thread.cpp, ring/pinned_staging.h).  No
 // CUDA library is linked or initialized: each call records what a real exec
 // would hold so tests can compare the registry's view with the exec's actual
 // node state.
@@ -79,6 +80,12 @@ inline int cudaMallocManaged(void** p, size_t n) {
     return *p ? 0 : 1;
 }
 inline int cudaFree(void* p) { std::free(p); return 0; }
+// Pinned host memory (ring/pinned_staging.h).  Declared only, with the C
+// linkage of the real runtime API: a host-only test that reaches them must
+// define them itself (or never call them, and drop them at link time).
+constexpr unsigned cudaHostAllocDefault = 0;
+extern "C" cudaError_t cudaHostAlloc(void** p, size_t n, unsigned flags);
+extern "C" cudaError_t cudaFreeHost(void* p);
 inline int cudaStreamCreateWithFlags(cudaStream_t* p, unsigned) {
     *p = reinterpret_cast<void*>(1);
     return 0;

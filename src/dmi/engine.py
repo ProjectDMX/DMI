@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import importlib
 import logging
 import time
+import warnings
 from typing import Any, Optional, Sequence, TYPE_CHECKING, TypeVar
 
 from .config import MonitoringConfig
@@ -105,6 +106,7 @@ class MonitoringEngine:
         model_id: Optional[str] = None,
         host_engine: Optional[Any] = None,
         db_config: Optional[HostEngineConfig] = None,
+        ring_consumer: Optional[Any] = None,
         enable_ring_transport: bool = True,
         ring_config: Optional[Any] = None,
         ring_payload_mb: int = 4096,
@@ -129,6 +131,14 @@ class MonitoringEngine:
 
         if host_engine is not None and db_config is not None:
             raise ValueError("Provide either host_engine or db_config, not both")
+        if ring_consumer is not None and (host_engine is not None
+                                          or db_config is not None):
+            raise ValueError(
+                "Provide either ring_consumer or host_engine/db_config, not "
+                "both: the legacy ring delivers to exactly one consumer")
+        # An in-process consumer of the legacy ring: a Python callable, a
+        # SliceQueue or a BatchQueue (see enable_ring_transport).
+        self._ring_consumer: Optional[Any] = ring_consumer
 
         # The canonical name: a deprecated one ("native", "capture") is
         # replaced here, for a MonitoringConfig and any config-like object
@@ -167,7 +177,8 @@ class MonitoringEngine:
         # before the service starts until the sink and the service are done.
         self._spool_claim: Optional[Any] = None
         host_configured = host_engine is not None or db_config is not None
-        if self._storage_backend == "in-memory" and not host_configured:
+        if (self._storage_backend == "in-memory" and not host_configured
+                and ring_consumer is None):
             raise ValueError(
                 f"config.storage_backend={self._backend_label()} delivers "
                 "records through "
@@ -181,7 +192,8 @@ class MonitoringEngine:
                 "engine allocates no ring, but a ring_config was given. Pick "
                 "'in-memory' or 'persistent' to capture, or drop ring_config"
             )
-        if self._storage_backend in ("persistent", "none") and host_configured:
+        if self._storage_backend in ("persistent", "none") and (
+                host_configured or ring_consumer is not None):
             raise ValueError(
                 f"config.storage_backend={self._backend_label()} does not "
                 "use the C++ ClickHouse host, but host_engine/db_config was "
@@ -901,16 +913,30 @@ class MonitoringEngine:
                 self._retire_capture_storage(storage, drain_deadline,
                                              sink_sealed=sealed)
 
-        # Pass the DMXHostEngine C++ object directly; RingEngine builds a
-        # SubmitFn that calls submit_direct without touching Python/GIL.
-        # Pass None for null/benchmark mode (no DB writes).
-        host_cpp = None
-        if self._host_engine is not None and isinstance(
+        # The consumer the ring delivers to.  A DMXHostEngine is passed as
+        # the C++ object, so RingEngine calls submit_direct without touching
+        # Python or the GIL; SliceQueue/BatchQueue consumers are pushed in
+        # C++ as well; a callable takes the GIL per slice.  None is the
+        # null/benchmark mode: captures are drained and dropped.
+        consumer = getattr(self, "_ring_consumer", None)
+        if consumer is None and self._host_engine is not None and isinstance(
             self._host_engine, _native_engine.DMXHostEngine
         ):
-            host_cpp = self._host_engine
+            consumer = self._host_engine
+        if consumer is None:
+            # Never run without a consumer by accident: an attribute that
+            # exists but holds None looks exactly like a configured consumer
+            # everywhere except here, where every capture is dropped.
+            warnings.warn(
+                "MonitoringEngine builds a legacy ring with no consumer: "
+                "captures are drained and dropped. Pass host_engine=, "
+                "db_config= or ring_consumer= to deliver them.",
+                RingWithoutConsumerWarning, stacklevel=2)
+        if consumer is not None and isinstance(
+                consumer, _native_engine.BatchQueue):
+            ring_config.batch_submit = True
 
-        ring_engine = _native_engine.RingEngine(ring_config, host_cpp)
+        ring_engine = _native_engine.RingEngine(ring_config, consumer)
 
         ring_engine.init()
         ring_engine.start()
@@ -1102,10 +1128,18 @@ class MonitoringEngine:
             except Exception:
                 pass
             self._host_engine = None
+        # An in-process consumer belongs to its caller; drop the reference
+        # only, after the ring that delivered to it has stopped.
+        self._ring_consumer = None
 
 
 # ---------------------------------------------------------------------------
 # Backend loader
 
 
-__all__ = ["MonitoringEngine", "RECORD_FAILURE_POLICIES", "RingCapacities"]
+class RingWithoutConsumerWarning(UserWarning):
+    """A legacy ring was built with no consumer: captures are dropped."""
+
+
+__all__ = ["MonitoringEngine", "RECORD_FAILURE_POLICIES", "RingCapacities",
+           "RingWithoutConsumerWarning"]

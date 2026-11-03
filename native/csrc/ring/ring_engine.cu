@@ -8,7 +8,7 @@
 namespace ring {
 
 RingEngine::RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
-                       SubmitFn submit_fn)
+                       SubmitFn submit_fn, BatchSink batch_sink)
     : cfg_(cfg), ring_(cfg)
 {
     if (cfg_.payload_ring_bytes % PAYLOAD_ALIGN != 0) {
@@ -32,7 +32,35 @@ RingEngine::RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
     staging_.init(staging_bytes);
 
     drain_ = std::make_unique<DrainThread>(ring_.state(), staging_, cfg_);
-    p2p_   = std::make_unique<P2PThread>(*drain_, fifo, cfg_, std::move(submit_fn));
+    p2p_   = std::make_unique<P2PThread>(*drain_, fifo, cfg_, std::move(submit_fn),
+                                         std::move(batch_sink));
+}
+
+bool RingEngine::drain_to_sink_and_wait(uint32_t timeout_ms) {
+    if (timeout_ms == 0) return drain_to_sink_and_wait_until(std::nullopt);
+    return drain_to_sink_and_wait_until(
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
+}
+
+bool RingEngine::drain_to_sink_and_wait_until(
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    if (!p2p_) {
+        throw std::logic_error(
+            "drain_to_sink_and_wait is a legacy-ring barrier; record rings "
+            "use flush_records_and_wait");
+    }
+    // Everything published is handed to the P2P queue by the flush, so the
+    // enqueued count read afterwards covers every task produced so far.
+    // One deadline bounds both phases: a flush stuck behind saturated
+    // staging (slow consumer) times out like the final delivery wait.
+    if (!deadline) {
+        drain_->force_flush_and_wait();
+        drain_->rethrow_drain_failure();
+        return p2p_->wait_until_processed(drain_->tasks_enqueued(), 0);
+    }
+    if (!drain_->force_flush_and_wait_until(*deadline)) return false;
+    drain_->rethrow_drain_failure();
+    return p2p_->wait_until_processed_until(drain_->tasks_enqueued(), *deadline);
 }
 
 RingEngine::RingEngine(const RingConfig& cfg,

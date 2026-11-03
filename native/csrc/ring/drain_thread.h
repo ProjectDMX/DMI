@@ -48,6 +48,13 @@ public:
 
     void notify();
 
+    // Expedite the tasks already reserved, without waiting on the producer
+    // stream: the drain flushes everything up to the current reservation
+    // head as soon as it is published, whatever the flush thresholds say.
+    // The target survives a wake-up that comes before the GPU publishes those
+    // tasks.  Returns false when nothing is reserved beyond the drain tail.
+    bool request_flush();
+
     // Request the drain thread to flush all pending entries, then block
     // until it finishes.  Caller must have done cudaStreamSynchronize on
     // the main stream first so all GPU writes are visible.
@@ -77,6 +84,12 @@ public:
     void notify_staging_freed_bytes(uint64_t nbytes);
 
     bool is_running() const { return running_.load(std::memory_order_relaxed); }
+
+    // Cumulative count of DrainTasks pushed to the P2P queue.  Paired with
+    // P2PThread::tasks_processed() for a barrier through the consumer.
+    uint64_t tasks_enqueued() const {
+        return tasks_enqueued_.load(std::memory_order_acquire);
+    }
 
     // Capacity query accessors (called from RingEnginePy::prepare_step).
     uint64_t cpu_payload_head() const;
@@ -116,6 +129,10 @@ private:
     uint64_t                pending_entries_{0};
     uint64_t                pending_bytes_{0};
     std::deque<uint64_t>    scanned_;
+    // Parallel to scanned_: when each entry was first seen published.
+    std::deque<int64_t>     scanned_ready_us_;
+    // request_flush() target: flush every task below this sequence.
+    uint64_t                async_flush_until_task_{0};
 
     uint64_t                cpu_task_head_{0};
     uint64_t                cpu_payload_head_{0};
@@ -157,6 +174,7 @@ private:
     std::deque<DrainTask>   task_queue_;
     std::mutex              queue_mu_;
     uint64_t                can_pop_count_{0};
+    std::atomic<uint64_t>   tasks_enqueued_{0};  // cumulative tasks pushed
     std::mutex              pop_mu_;
     std::condition_variable pop_cv_;
     bool                    p2p_stop_requested_{false};

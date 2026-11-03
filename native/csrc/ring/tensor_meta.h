@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include "ring/capture_lease.h"
+
 namespace ring_py {
 
 // ---------------------------------------------------------------------------
@@ -199,6 +201,9 @@ struct RequestMeta {
 // Per-step shared context.  Heap-allocated by push_step caller.
 // Ownership transfers to p2p thread via pop_context; p2p deletes it.
 struct StepContext {
+    // Integration-defined identity of the configuration that captured this
+    // step; delivered with every slice or batch of the step (capture_lease.h).
+    CaptureLease             capture_lease;
     std::string              model_id;
     int32_t                  tp_rank   = 0;
     int32_t                  dp_rank   = 0;
@@ -234,15 +239,50 @@ struct TensorMeta {
 };
 
 // Thread-safe dual FIFO for TensorMeta + StepContext.
+//
+// Ownership: the FIFO owns every StepContext it holds.  push_step stores ONE
+// context per step (the step's metas do not point at it), so each pending
+// context is owned exactly once; pop_context hands that ownership to the
+// caller (the P2P thread, which deletes it after the step's last hook).
+// Contexts still queued when the FIFO is cleared or destroyed -- metadata
+// published for a forward that never produced its payloads -- are deleted
+// then, releasing their CaptureLease references so lease.idle() can turn
+// true after teardown.
 class TensorMetaFifo {
 public:
+    TensorMetaFifo() = default;
+    TensorMetaFifo(const TensorMetaFifo&) = delete;
+    TensorMetaFifo& operator=(const TensorMetaFifo&) = delete;
+    ~TensorMetaFifo() { clear(); }
+
     // Push context + all hook metas in one lock.
     // ctx is heap-allocated by caller; ownership transfers here.
     void push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {
+        std::unique_ptr<StepContext> owned(ctx);
         std::lock_guard<std::mutex> lk(mu_);
-        ctx_q_.push_back(ctx);
+        if (owned) ctx_q_.push_back(std::move(owned));
         for (auto& m : metas)
             q_.push_back(std::move(m));
+    }
+
+    // Drop every pending meta and delete every pending context.  Only for a
+    // FIFO whose consumer has stopped (teardown): a context already popped
+    // by the consumer is the consumer's to delete.
+    void clear() {
+        std::deque<std::unique_ptr<StepContext>> ctxs;
+        std::deque<TensorMeta> metas;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            ctxs.swap(ctx_q_);
+            metas.swap(q_);
+        }
+        // Destroyed outside mu_: a lease's last release runs no callbacks
+        // today, but nothing here needs the lock.
+    }
+
+    size_t pending_contexts() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return ctx_q_.size();
     }
 
     bool pop(TensorMeta& out) {
@@ -257,15 +297,15 @@ public:
     StepContext* pop_context() {
         std::lock_guard<std::mutex> lk(mu_);
         if (ctx_q_.empty()) return nullptr;
-        StepContext* p = ctx_q_.front();
+        StepContext* p = ctx_q_.front().release();
         ctx_q_.pop_front();
         return p;
     }
 
 private:
-    std::mutex                mu_;
-    std::deque<TensorMeta>    q_;
-    std::deque<StepContext*>   ctx_q_;
+    mutable std::mutex                       mu_;
+    std::deque<TensorMeta>                   q_;
+    std::deque<std::unique_ptr<StepContext>> ctx_q_;
 };
 
 }  // namespace ring_py

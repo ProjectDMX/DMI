@@ -75,6 +75,16 @@ struct RingConfig {
     // that keep the full tensor alive until consumed.
     bool clone_slices = false;
 
+    // Maximum idle bytes the P2P thread's pageable buffer pool retains
+    // between steps (buffer_pool.h).  0 disables the pool entirely: every
+    // step gets an exact-size at::empty buffer (no size-class rounding).
+    uint64_t p2p_pool_cap_bytes = 256ULL * 1024 * 1024;
+
+    // Batch handoff: with a batch consumer (BatchQueue), packed (flattened)
+    // steps hand each hook's whole tensor and a segments table to the
+    // consumer once, instead of one slice per request.
+    bool batch_submit = false;
+
     // ClickHouse insert queue limits (host engine).
     // P2p thread blocks on submit_direct() when queue is full.
     uint64_t insert_queue_max_bytes = 4096ULL * 1024 * 1024;  // 4 GiB

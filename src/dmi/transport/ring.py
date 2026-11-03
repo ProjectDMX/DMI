@@ -253,6 +253,7 @@ class RingTransport:
         # keyed by (hook_type, layer_no); None = every hook uses the step
         # layout.
         self._current_hook_rows: Optional[dict] = None
+        self._current_capture_lease: Any = None
 
         # When True: meta pushes are skipped so the FIFO stays empty.
         # Producer kernel still fires (for CUDA graph capture) but as no-ops.
@@ -338,6 +339,7 @@ class RingTransport:
         flattened: bool = False,
         orig_positions: Optional[List[int]] = None,
         hook_rows: Optional[dict] = None,
+        capture_lease: Any = None,
     ) -> None:
         """Called before each forward pass to provide per-step batch metadata.
 
@@ -361,6 +363,9 @@ class RingTransport:
             keyed by ``(hook_type, layer_no)``.  A hook with a plan
             publishes ``row_count`` rows and its own request layout; others
             use the step layout.
+        capture_lease: an integration-defined ``CaptureLease`` delivered
+            with every slice or batch of this step; it is handed to the
+            next metadata publication only.
         """
         self._current_model_id = model_id
         self._current_tp_rank = tp_rank
@@ -380,6 +385,7 @@ class RingTransport:
         )
         self._current_orig_positions = orig_positions
         self._current_hook_rows = hook_rows
+        self._current_capture_lease = capture_lease
 
     def set_model_cfg(self, cfg: ModelShapeConfig) -> None:
         """Set the model shape config for analytical shape computation."""
@@ -491,6 +497,9 @@ class RingTransport:
         padding-strip mode.  Other specs and the no-strip case use
         ``q_len`` (today's behavior).
         """
+        # The lease belongs to this submission, never to a later step.
+        lease = getattr(self, "_current_capture_lease", None)
+        self._current_capture_lease = None
         if self.null_offload:
             return  # kernel launches happen; metas are intentionally skipped
         if self._model_cfg is None or not self._active_specs:
@@ -537,6 +546,8 @@ class RingTransport:
 
         if hook_types:
             extra = {}
+            if lease is not None:
+                extra["capture_lease"] = lease
             orig_positions = getattr(self, "_current_orig_positions", None)
             if orig_positions is not None:
                 extra["orig_positions"] = list(orig_positions)

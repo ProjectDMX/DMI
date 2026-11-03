@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "ring/capture_lease.h"
 #include "ring/tensor_meta.h"   // TensorMeta, TensorMetaFifo
 #include "ring/record_descriptor.h"
 #include "ring/record_failure_policy.h"
@@ -41,6 +42,12 @@ struct RingConfig {
     uint64_t drain_flush_timeout_us      = 0;
     // Clone per-request slices
     bool     clone_slices               = false;
+    // Idle bytes the P2P thread's pageable buffer pool retains (0 = no pool:
+    // exact-size buffers, no size-class rounding).
+    uint64_t p2p_pool_cap_bytes         = 256ULL * 1024 * 1024;
+    // Batch handoff for packed steps: with a batch consumer (BatchQueue),
+    // each hook's whole tensor and a segments table are handed over once.
+    bool     batch_submit               = false;
     // ClickHouse insert queue limits
     uint64_t insert_queue_max_bytes     = 4096ULL * 1024 * 1024;
     uint64_t insert_queue_max_items     = 65536;
@@ -97,7 +104,8 @@ struct RecordCaptureStatus {
     uint64_t max_step_wait_ns = 0;
 };
 
-// Called by the p2p thread for each per-request tensor slice.
+// Called by the p2p thread for each per-request tensor slice; see
+// ring/p2p_thread.h for capture_ts_us and capture_lease.
 using SubmitFn = std::function<void(
     const std::string& model_id,
     int32_t            shard_rank,
@@ -106,12 +114,32 @@ using SubmitFn = std::function<void(
     int32_t            layer_no,
     int32_t            start_token,
     int32_t            end_token,
-    at::Tensor         slice)>;
+    at::Tensor         slice,
+    int64_t            capture_ts_us,
+    CaptureLease       capture_lease)>;
+
+// Called by the p2p thread once per (hook x step) on the batch handoff, and
+// once per request slice for HF batched steps when it is the only consumer;
+// see ring/p2p_thread.h BatchSink.
+using BatchSink = std::function<void(
+    const std::string&       model_id,
+    int32_t                  shard_rank,
+    const std::string&       act_name,
+    int32_t                  layer_no,
+    uint64_t                 step_seq,
+    bool                     last_in_step,
+    at::Tensor               tensor,
+    std::vector<std::string> req_ids,
+    at::Tensor               segments,
+    CaptureLease             capture_lease,
+    int64_t                  capture_ts_us,
+    bool                     is_attn)>;
 
 // Opaque RAII engine.
 class RingEnginePy {
 public:
-    explicit RingEnginePy(RingConfig cfg, SubmitFn submit_fn);
+    explicit RingEnginePy(RingConfig cfg, SubmitFn submit_fn,
+                          BatchSink batch_sink = nullptr);
     explicit RingEnginePy(RingConfig cfg,
                           std::shared_ptr<ring::RecordSink> sink,
                           RecordRuntimeOptions options = {});
@@ -247,6 +275,11 @@ public:
     // Lightweight wake-up for the drain thread.
     void notify_drain();
 
+    // Nonblocking hint: flush the tasks already reserved as soon as they are
+    // published, whatever the flush thresholds say.  Returns false when
+    // nothing is reserved beyond the drain tail.
+    bool request_flush();
+
     // Pre-forward capacity check + conditional flush.
     //
     // Called once per generate() step from _prepare_wrapper (GIL released).
@@ -366,6 +399,24 @@ public:
     // GIL.  Used by safety-net branches that need to free ring space or
     // ensure FIFO ordering before consuming the next meta out-of-band.
     void flush_and_wait();
+
+    // Like flush_and_wait(), and additionally wait until the P2P thread has
+    // delivered everything flushed: every consumer call for every slice or
+    // batch captured so far has returned.  Returns true when delivered,
+    // false on timeout (timeout_ms = 0 waits forever).  A finite timeout is
+    // ONE deadline taken at entry; it bounds producer-stream completion
+    // (polled through an event, no unbounded stream synchronize), the flush
+    // and the delivery wait together.  Legacy rings only.
+    bool drain_to_sink_and_wait(uint32_t timeout_ms);
+
+    // Consumer failures: exceptions thrown by the consumer are counted and
+    // the latest message kept, instead of vanishing.  With
+    // abort-on-sink-error armed, sink_failed() turns true at the first one
+    // and prepare_step() raises it.
+    uint64_t    submit_exceptions() const;
+    std::string last_sink_error() const;
+    void        set_abort_on_sink_error(bool enabled);
+    bool        sink_failed() const;
 
     // ---- Runtime CUDA-graph node toggling (legacy rings) -----------------
     // cudaGraph_t / cudaGraphNode_t / cudaGraphExec_t travel as opaque

@@ -64,6 +64,8 @@ class StepContext:
     # (hook_type, layer_no).  A planned hook reserves and publishes its
     # plan's row_count rows; None = every hook uses the step layout.
     hook_rows:       Optional[dict] = None
+    # Integration-defined CaptureLease delivered with this step's payloads.
+    capture_lease:   Optional[object] = None
 
     def transport_kwargs(self) -> dict:
         """Return kwargs accepted by ``RingTransport.set_step_context``."""
@@ -83,6 +85,8 @@ class StepContext:
             kwargs["orig_positions"] = self.orig_positions
         if self.hook_rows is not None:
             kwargs["hook_rows"] = self.hook_rows
+        if self.capture_lease is not None:
+            kwargs["capture_lease"] = self.capture_lease
         return kwargs
 
 

@@ -2,13 +2,16 @@
 // Compiled with g++ (not nvcc); uses ATen for tensor operations.
 
 #include "p2p_thread.h"
+#include "buffer_pool.h"
 #include "pinned_staging.h"
 
 #include <ATen/ATen.h>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <optional>
 
 namespace ring {
 
@@ -121,8 +124,15 @@ static at::Tensor slice_flattened(
 
 // ---------------------------------------------------------------------------
 P2PThread::P2PThread(DrainThread& drain, ring_py::TensorMetaFifo& fifo,
-                     const RingConfig& cfg, SubmitFn submit_fn)
-    : drain_(drain), fifo_(fifo), cfg_(cfg), submit_fn_(std::move(submit_fn))
+                     const RingConfig& cfg, SubmitFn submit_fn,
+                     BatchSink batch_sink)
+    : drain_(drain), fifo_(fifo), cfg_(cfg), submit_fn_(std::move(submit_fn)),
+      batch_sink_(std::move(batch_sink)),
+      // p2p_pool_cap_bytes == 0: no pool at all -- exact-size at::empty
+      // buffers, as before the pool existed (no size-class rounding).
+      pool_(cfg.p2p_pool_cap_bytes > 0
+                ? std::make_unique<BufferPool>(cfg.p2p_pool_cap_bytes)
+                : nullptr)
 {}
 
 P2PThread::~P2PThread() noexcept {
@@ -131,6 +141,10 @@ P2PThread::~P2PThread() noexcept {
 }
 
 void P2PThread::start() {
+    {
+        std::lock_guard<std::mutex> lk(barrier_mu_);
+        stopped_ = false;
+    }
     thread_ = std::thread([this] { loop(); });
 }
 
@@ -140,6 +154,18 @@ void P2PThread::stop() {
 
 // ---------------------------------------------------------------------------
 void P2PThread::loop() {
+    // However the loop ends (stop, or an escaping exception), release every
+    // delivery barrier: no further task will be processed.
+    struct ExitNotice {
+        P2PThread* self;
+        ~ExitNotice() {
+            {
+                std::lock_guard<std::mutex> lk(self->barrier_mu_);
+                self->stopped_ = true;
+            }
+            self->barrier_cv_.notify_all();
+        }
+    } exit_notice{this};
     while (true) {
         uint64_t n = drain_.wait_for_tasks();
         if (n == 0) break;
@@ -147,7 +173,47 @@ void P2PThread::loop() {
         std::vector<DrainTask> local;
         drain_.pop_tasks(n, local);
         process(local);
+
+        // Publish progress under barrier_mu_ so a waiter cannot miss the
+        // wake-up (it checks the predicate under the same mutex).
+        {
+            std::lock_guard<std::mutex> lk(barrier_mu_);
+            tasks_processed_.fetch_add(local.size(), std::memory_order_release);
+        }
+        barrier_cv_.notify_all();
     }
+}
+
+// ---------------------------------------------------------------------------
+bool P2PThread::wait_until_processed(uint64_t target, uint32_t timeout_ms) {
+    std::unique_lock<std::mutex> lk(barrier_mu_);
+    auto reached = [&] {
+        return tasks_processed_.load(std::memory_order_acquire) >= target;
+    };
+    // A stopped thread processes nothing more: return its final verdict.
+    auto done = [&] { return reached() || stopped_; };
+    if (timeout_ms == 0)
+        barrier_cv_.wait(lk, done);
+    else
+        barrier_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms), done);
+    return reached();
+}
+
+bool P2PThread::wait_until_processed_until(
+    uint64_t target, std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock<std::mutex> lk(barrier_mu_);
+    auto reached = [&] {
+        return tasks_processed_.load(std::memory_order_acquire) >= target;
+    };
+    barrier_cv_.wait_until(lk, deadline, [&] { return reached() || stopped_; });
+    return reached();
+}
+
+// ---------------------------------------------------------------------------
+void P2PThread::note_submit_error(const char* what) {
+    submit_exceptions_.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(err_mu_);
+    last_error_ = what ? what : "unknown consumer error";
 }
 
 // ---------------------------------------------------------------------------
@@ -162,11 +228,20 @@ void P2PThread::process(std::vector<DrainTask>& tasks) {
             continue;
         }
 
-        // Normal tensor: copy from pinned staging to pageable
+        // Normal tensor: copy from pinned staging to pageable.  The
+        // destination comes from the warm-page pool; the tensor (and every
+        // view derived from it) keeps its pool block alive until the last
+        // reference drops (buffer_pool.h).  at::empty, exact size, without
+        // a pool (p2p_pool_cap_bytes == 0) or when it cannot serve the
+        // request.
         uint64_t total_bytes = task.tensor_total_bytes;
 
-        auto tensor = at::empty({static_cast<int64_t>(total_bytes)},
-                                at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+        at::Tensor tensor;
+        if (pool_) tensor = pool_->acquire(total_bytes);
+        if (!tensor.defined()) {
+            tensor = at::empty({static_cast<int64_t>(total_bytes)},
+                               at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+        }
         uint8_t* dst = tensor.data_ptr<uint8_t>();
 
         if (task.data_len1 > 0) {
@@ -194,16 +269,19 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
 
     // Get step context -- pop from context queue if this is the first
     // hook in a new step (current_ctx_ is null).
+    // Each new context starts a step: every batch of the step carries the
+    // same step_seq.
     if (!current_ctx_) {
         current_ctx_ = fifo_.pop_context();
         if (!current_ctx_) return;  // no context available
+        step_seq_++;
     }
 
     if (meta.shape.empty() || first_task.tensor_total_bytes == 0) {
         if (meta.last_in_step) { delete current_ctx_; current_ctx_ = nullptr; }
         return;
     }
-    if (!submit_fn_) {
+    if (!submit_fn_ && !batch_sink_) {
         if (meta.last_in_step) { delete current_ctx_; current_ctx_ = nullptr; }
         return;
     }
@@ -254,8 +332,146 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
     // An independently gathered hook carries its own request layout; every
     // other hook uses the step's.
     const auto& requests = meta.requests ? *meta.requests : current_ctx_->requests;
+
+    // Batch handoff: hand the WHOLE reshaped tensor and a segments table to
+    // the consumer once, instead of narrowing, copying and submitting one
+    // slice per request.  Packed steps only; batched (HF) steps and
+    // attention matrices use the per-slice path (with only a batch sink,
+    // delivered as one-request items, below).  The tensor is a view of
+    // the pooled buffer, never sliced or cloned here: consumers clone what
+    // they keep.
+    if (cfg_.batch_submit && batch_sink_ && current_ctx_->flattened && !is_attn) {
+        // One int32 row per request that yields a non-empty view:
+        // (dim0_offset, db_start, db_end, orig_position).  Rows the
+        // per-slice path would skip are omitted, so a step with no rows
+        // yields an empty table.
+        const int64_t n_req = static_cast<int64_t>(requests.size());
+        auto segments = at::empty({n_req, 4},
+                                  at::TensorOptions().dtype(at::kInt).device(at::kCPU));
+        int32_t* seg = segments.data_ptr<int32_t>();
+        std::vector<std::string> req_ids;
+        req_ids.reserve(requests.size());
+        int64_t kept = 0;
+        for (size_t j = 0; j < requests.size(); ++j) {
+            const ring_py::RequestMeta& req = requests[j];
+            int32_t db_start = req.start_token;
+            int32_t db_end   = req.end_token;
+            int64_t dim0;
+            if (meta.hook_type == ring_py::HOOK_TYPE_FINAL_LOGITS) {
+                // One logit row per request, indexed by the request's
+                // original position; it covers the request's last token.
+                dim0 = (req.orig_position >= 0)
+                           ? static_cast<int64_t>(req.orig_position)
+                           : static_cast<int64_t>(j);
+                if (dim0 < 0 || dim0 + 1 > tensor.size(0) || req.end_token <= 0)
+                    continue;
+                db_start = req.end_token - 1;
+                db_end   = req.end_token;
+            } else {
+                // Widen before subtracting: int32 token positions.
+                const int64_t num_tokens = static_cast<int64_t>(req.end_token) -
+                                           static_cast<int64_t>(req.start_token);
+                if (num_tokens <= 0 || req.dim0_offset < 0 ||
+                    req.dim0_offset + num_tokens > tensor.size(0))
+                    continue;
+                dim0 = req.dim0_offset;
+            }
+            seg[kept * 4 + 0] = static_cast<int32_t>(dim0);
+            seg[kept * 4 + 1] = db_start;
+            seg[kept * 4 + 2] = db_end;
+            seg[kept * 4 + 3] = req.orig_position;
+            req_ids.push_back(req.req_id);
+            kept++;
+        }
+        if (kept < n_req) segments = segments.narrow(0, 0, kept);
+
+        // Nothing to deliver: skip the push, but keep the context pairing.
+        if (kept > 0) {
+            try {
+                batch_sink_(current_ctx_->model_id, shard_rank, act_name,
+                            meta.layer_no, step_seq_, meta.last_in_step,
+                            tensor, std::move(req_ids), std::move(segments),
+                            current_ctx_->capture_lease, first_task.capture_ts_us,
+                            /*is_attn=*/false);
+            } catch (const std::exception& e) {
+                log_submit_failure_once(current_ctx_->model_id, "<batch>",
+                                        act_name, meta.layer_no, shard_rank,
+                                        0, 0, e.what());
+                note_submit_error(e.what());
+            } catch (...) {
+                log_submit_failure_once(current_ctx_->model_id, "<batch>",
+                                        act_name, meta.layer_no, shard_rank,
+                                        0, 0, "unknown non-std exception");
+                note_submit_error("unknown non-std exception");
+            }
+        }
+        if (meta.last_in_step) { delete current_ctx_; current_ctx_ = nullptr; }
+        return;
+    }
+    // Per-slice path: the legacy consumer (submit_fn_), or -- with only a
+    // batch consumer installed -- every capture the whole-batch branch above
+    // does not take (HF batched steps: tokens [batch, q_len, ...] and
+    // attention matrices [batch, heads, q_len, kv_len]).  Those go to the
+    // batch sink as one-request items, one per request slice, so a
+    // BatchQueue consumer receives them instead of losing them silently.
+    // Packed attention matrices are not sliceable per request on either
+    // path and stay skipped.
+    const bool to_batch_sink = !submit_fn_;
     bool should_clone = cfg_.clone_slices && requests.size() > 1;
 
+    struct Slice {
+        const ring_py::RequestMeta* req;
+        int32_t    db_start;
+        int32_t    db_end;
+        at::Tensor tensor;
+    };
+    auto deliver = [&](Slice& sl, bool last_item) {
+        const ring_py::RequestMeta& req = *sl.req;
+        const int32_t db_start = sl.db_start;
+        const int32_t db_end   = sl.db_end;
+        try {
+            if (!to_batch_sink) {
+                submit_fn_(current_ctx_->model_id, shard_rank,
+                           req.req_id, act_name, meta.layer_no,
+                           db_start, db_end,
+                           std::move(sl.tensor), first_task.capture_ts_us,
+                           current_ctx_->capture_lease);
+            } else {
+                // One-request batch item.  The tensor IS the request's
+                // slice, so its segments row has dim0_offset 0:
+                //   token hooks:     [rows, ...], rows = the request's last
+                //                    (db_end - db_start) query positions
+                //                    (fewer if q_len is shorter);
+                //   attention hooks: [heads, rows, kv] (is_attn), taken whole.
+                auto segments = at::empty(
+                    {1, 4}, at::TensorOptions().dtype(at::kInt).device(at::kCPU));
+                int32_t* seg = segments.data_ptr<int32_t>();
+                seg[0] = 0;
+                seg[1] = db_start;
+                seg[2] = db_end;
+                seg[3] = req.orig_position;
+                batch_sink_(current_ctx_->model_id, shard_rank, act_name,
+                            meta.layer_no, step_seq_, last_item,
+                            std::move(sl.tensor), std::vector<std::string>{req.req_id},
+                            std::move(segments), current_ctx_->capture_lease,
+                            first_task.capture_ts_us, is_attn);
+            }
+        } catch (const std::exception& e) {
+            log_submit_failure_once(current_ctx_->model_id, req.req_id,
+                                    act_name, meta.layer_no, shard_rank,
+                                    db_start, db_end, e.what());
+            note_submit_error(e.what());
+        } catch (...) {
+            log_submit_failure_once(current_ctx_->model_id, req.req_id,
+                                    act_name, meta.layer_no, shard_rank,
+                                    db_start, db_end,
+                                    "unknown non-std exception");
+            note_submit_error("unknown non-std exception");
+        }
+    };
+    // Batch sink: hold back one slice so the hook's last delivered item can
+    // carry last_in_step.  The legacy consumer gets each slice as it is cut.
+    std::optional<Slice> pending;
     for (size_t j = 0; j < requests.size(); ++j) {
         const ring_py::RequestMeta& req = requests[j];
         at::Tensor slice;
@@ -311,23 +527,15 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
         if (should_clone) {
             slice = slice.clone();
         }
-
-        try {
-            submit_fn_(current_ctx_->model_id, shard_rank,
-                       req.req_id, act_name, meta.layer_no,
-                       db_start, db_end,
-                       std::move(slice));
-        } catch (const std::exception& e) {
-            log_submit_failure_once(current_ctx_->model_id, req.req_id,
-                                    act_name, meta.layer_no, shard_rank,
-                                    db_start, db_end, e.what());
-        } catch (...) {
-            log_submit_failure_once(current_ctx_->model_id, req.req_id,
-                                    act_name, meta.layer_no, shard_rank,
-                                    db_start, db_end,
-                                    "unknown non-std exception");
+        Slice sl{&req, db_start, db_end, std::move(slice)};
+        if (!to_batch_sink) {
+            deliver(sl, false);
+        } else {
+            if (pending) deliver(*pending, false);
+            pending = std::move(sl);
         }
     }
+    if (pending) deliver(*pending, meta.last_in_step);
 
     // Last hook in step -- free context
     if (meta.last_in_step) {

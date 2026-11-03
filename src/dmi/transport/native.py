@@ -27,11 +27,14 @@ _HOST_EXPORTS = frozenset(
 )
 _RING_EXPORTS = frozenset(
     {
+        "BatchQueue",
+        "CaptureLease",
         "ClickHouseRecordSink",
         "RecordSink",
         "ReferencePythonCaptureSink",
         "RingConfig",
         "RingEngine",
+        "SliceQueue",
         "ring_set_active_engine",
         "ring_clear_active_engine",
         "parse_hook_requests",

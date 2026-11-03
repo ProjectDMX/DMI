@@ -8,7 +8,9 @@
 #include "record_sink.h"
 #include "tensor_meta.h"
 
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace ring {
@@ -16,7 +18,7 @@ namespace ring {
 class RingEngine {
 public:
     RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
-               SubmitFn submit_fn);
+               SubmitFn submit_fn, BatchSink batch_sink = nullptr);
     RingEngine(const RingConfig& cfg, std::shared_ptr<RecordSinkLease> lease,
                RecordFailurePolicy failure_policy =
                    RecordFailurePolicy::kRaiseAtProducer);
@@ -35,6 +37,22 @@ public:
     const RecordConsumer& record_consumer() const;
     std::shared_ptr<RecordSink> record_sink() const { return record_sink_; }
     bool record_mode() const { return static_cast<bool>(record_p2p_); }
+    // Legacy rings only (nullptr on a record ring).
+    P2PThread*   p2p_thread()    { return p2p_.get(); }
+    const P2PThread* p2p_thread() const { return p2p_.get(); }
+
+    // Flush the ring, then wait until the P2P thread has processed every task
+    // the drain has handed it: every consumer call for every captured slice
+    // or batch has returned.  Returns true when delivered, false on timeout
+    // (0 = wait forever).  The caller synchronizes the producer stream first.
+    // timeout_ms == 0 waits forever; otherwise ONE deadline, taken at entry,
+    // bounds the flush and the delivery wait together.
+    bool drain_to_sink_and_wait(uint32_t timeout_ms);
+    // Same with an absolute deadline (nullopt = no deadline).  Lets a caller
+    // that already spent part of its budget (producer-stream completion)
+    // pass the remainder on.
+    bool drain_to_sink_and_wait_until(
+        std::optional<std::chrono::steady_clock::time_point> deadline);
 
     uint64_t  payload_cap() const { return cfg_.payload_ring_bytes; }
     bool      drain_step_gated() const { return cfg_.drain_step_gated; }

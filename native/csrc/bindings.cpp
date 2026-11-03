@@ -23,8 +23,12 @@ namespace py = pybind11;
 #ifndef DMI_HOST_ONLY
 #include "clickhouse_record_sink.h"
 #include "reference_python_capture_sink.h"
+#include "ring/batch_queue.h"
+#include "ring/capture_lease.h"
+#include "ring/drop_notice.h"
 #include "ring/ring_engine_py.h"
 #include "ring/ring_torch_op.h"
+#include "ring/slice_queue.h"
 #include "ring/tensor_meta.h"
 #endif
 
@@ -264,6 +268,62 @@ std::vector<ring::RecordDescriptor> CopyRecordDescriptors(
 #endif
 
 #ifndef DMI_HOST_ONLY
+// DropNoticeBuffer::Drained -> Python dict, shared by SliceQueue and
+// BatchQueue so both shed paths report the same shape:
+//   {"notices": [(source, hook, layer_no, step_seq, start_token, end_token,
+//                 nbytes, ts_us, [req_id, ...], rank[, capture_lease]), ...],
+//    "overflow": int,   # notices lost since the last poll
+//    "sticky":   bool,  # any notice lost in this window
+//    "pending":  int}   # notices still buffered (max_items truncation)
+// An empty "notices" with sticky False means nothing was lost.  rank 255 is
+// the unranked slice path; the lease is appended only when the step had one.
+py::dict drop_notices_to_py(ring_py::DropNoticeBuffer::Drained&& d) {
+  py::list notices;
+  for (auto& n : d.notices) {
+    py::list rids;
+    for (auto& r : n.req_ids) rids.append(py::str(r));
+    py::tuple notice = py::make_tuple(py::str(n.source), py::str(n.hook), n.layer_no,
+                                      n.step_seq, n.start_token, n.end_token,
+                                      n.nbytes, n.ts_us, rids, static_cast<int>(n.rank));
+    if (n.capture_lease.present())
+      notice = py::cast<py::tuple>(notice.attr("__add__")(
+          py::make_tuple(n.capture_lease.fork())));
+    notices.append(notice);
+  }
+  py::dict out;
+  out["notices"]  = notices;
+  out["overflow"] = d.overflow;
+  out["sticky"]   = d.sticky;
+  out["pending"]  = d.pending;
+  return out;
+}
+
+ring_py::HookBatchItem make_batch_item(
+    const std::string& model_id, int32_t shard_rank, const std::string& act_name,
+    int32_t layer_no, uint64_t step_seq, bool last_in_step, at::Tensor tensor,
+    std::vector<std::string> req_ids, at::Tensor segments,
+    ring_py::CaptureLease capture_lease, int64_t capture_ts_us,
+    bool is_attn = false) {
+  ring_py::HookBatchItem item;
+  item.model_id      = model_id;
+  item.shard_rank    = shard_rank;
+  item.act_name      = act_name;
+  item.layer_no      = layer_no;
+  item.node_id       = 0;   // in-process
+  item.step_seq      = step_seq;
+  item.last_in_step  = last_in_step;
+  item.is_attn       = is_attn;
+  // Logical bytes; BatchQueue::push charges the allocation the tensor keeps
+  // alive (pooled_block.h), not this length.
+  item.nbytes        = static_cast<uint64_t>(tensor.nbytes());
+  item.tensor        = std::move(tensor);
+  item.req_ids       = std::move(req_ids);
+  item.segments      = std::move(segments);
+  item.capture_lease = std::move(capture_lease);
+  item.capture_ts_us = capture_ts_us;
+  return item;
+}
+
 using HookRowsPtr = std::shared_ptr<const std::vector<ring_py::RequestMeta>>;
 
 // One hook's request layout for push_all_metas.  Two encodings:
@@ -710,6 +770,185 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // Ring offload engine
   // -------------------------------------------------------------------------
 #ifndef DMI_HOST_ONLY
+  // ---- Capture leases (capture_lease.h) -----------------------------------
+  py::class_<ring_py::CaptureLease>(m, "CaptureLease")
+      .def(py::init<>())
+      .def(py::init<uint64_t>(), py::arg("id"))
+      .def(py::init<uint64_t,
+                    const std::vector<std::tuple<std::string, int32_t, int>>&>(),
+           py::arg("id"), py::arg("ranks"))
+      .def(py::init<uint64_t, const ring_py::CaptureLease&>(),
+           py::arg("id"), py::arg("policy"))
+      .def_property_readonly("id", &ring_py::CaptureLease::id)
+      .def_property_readonly("present", &ring_py::CaptureLease::present)
+      .def_property_readonly("idle", &ring_py::CaptureLease::idle)
+      .def("same_as", &ring_py::CaptureLease::same_as, py::arg("other"))
+      .def("rank_for", &ring_py::CaptureLease::rank_for,
+           py::arg("act_name"), py::arg("layer_no"), py::arg("fallback"))
+      .def("fork", &ring_py::CaptureLease::fork);
+
+  // ---- SliceQueue: per-slice in-process consumer (slice_queue.h) ---------
+  py::class_<ring_py::SliceQueue, std::shared_ptr<ring_py::SliceQueue>>(m, "SliceQueue")
+      .def(py::init<size_t, size_t, uint64_t>(), py::arg("max_items") = 200000,
+           py::arg("drop_notice_cap") = 4096, py::arg("max_bytes") = uint64_t{0})
+      // Normally pushed by the P2P thread; exposed for tests.
+      .def("push", &ring_py::SliceQueue::push,
+           py::arg("model_id"), py::arg("shard_rank"), py::arg("req_id"),
+           py::arg("act_name"), py::arg("layer_no"), py::arg("start_token"),
+           py::arg("end_token"), py::arg("slice"),
+           py::arg("capture_lease") = ring_py::CaptureLease{},
+           py::arg("capture_ts_us") = 0,
+           py::call_guard<py::gil_scoped_release>())
+      .def("stop", &ring_py::SliceQueue::stop,
+           py::call_guard<py::gil_scoped_release>())
+      .def("wake", &ring_py::SliceQueue::wake,
+           py::call_guard<py::gil_scoped_release>())
+      .def_property_readonly("dropped", &ring_py::SliceQueue::dropped)
+      .def_property_readonly("qsize", &ring_py::SliceQueue::size)
+      .def_property_readonly("retained_bytes", &ring_py::SliceQueue::retained_bytes)
+      .def_property_readonly("max_bytes", &ring_py::SliceQueue::max_bytes)
+      .def("drain_drop_notices",
+           [](ring_py::SliceQueue& self, size_t max_items) {
+               ring_py::DropNoticeBuffer::Drained d;
+               {
+                   py::gil_scoped_release rel;
+                   d = self.drain_drop_notices(max_items);
+               }
+               return drop_notices_to_py(std::move(d));
+           },
+           py::arg("max_items") = 4096)
+      .def_property_readonly("drop_notices_pending",
+           [](const ring_py::SliceQueue& self) { return self.drop_notices().pending(); })
+      .def_property_readonly("drop_notices_recorded",
+           [](const ring_py::SliceQueue& self) { return self.drop_notices().recorded(); })
+      .def_property_readonly("drop_notices_lost",
+           [](const ring_py::SliceQueue& self) { return self.drop_notices().overflow_total(); })
+      .def_property_readonly("drop_notice_cap",
+           [](const ring_py::SliceQueue& self) { return self.drop_notices().cap(); })
+      // Wait up to timeout_ms with the GIL released; each item is
+      // (model_id, shard_rank, req_id, act_name, layer_no, start_token,
+      //  end_token, tensor[, None, capture_lease, capture_ts_us]).
+      .def("drain_slices",
+           [](ring_py::SliceQueue& self, size_t max_items, int timeout_ms) {
+               std::vector<ring_py::SliceItem> batch;
+               {
+                   py::gil_scoped_release rel;
+                   batch = self.drain(max_items, timeout_ms);
+               }
+               py::list out;
+               for (auto& it : batch) {
+                   py::tuple item = py::make_tuple(it.model_id, it.shard_rank, it.req_id,
+                                                   it.act_name, it.layer_no, it.start_token,
+                                                   it.end_token, it.slice);
+                   if (it.capture_lease.present())
+                       item = py::cast<py::tuple>(item.attr("__add__")(py::make_tuple(
+                           py::none(), it.capture_lease.fork(), it.capture_ts_us)));
+                   out.append(item);
+               }
+               return out;
+           },
+           py::arg("max_items") = 256, py::arg("timeout_ms") = 50);
+
+  // ---- BatchQueue: whole-hook batch handoff (batch_queue.h) --------------
+  py::class_<ring_py::BatchQueue, std::shared_ptr<ring_py::BatchQueue>>(m, "BatchQueue")
+      .def(py::init<uint64_t, size_t>(),
+           py::arg("max_bytes") = uint64_t{512} * 1024 * 1024,
+           py::arg("drop_notice_cap") = 4096)
+      .def("stop", &ring_py::BatchQueue::stop,
+           py::call_guard<py::gil_scoped_release>())
+      .def("wake", &ring_py::BatchQueue::wake,
+           py::call_guard<py::gil_scoped_release>())
+      .def_property_readonly("dropped", &ring_py::BatchQueue::dropped)
+      .def_property_readonly("dropped_bytes", &ring_py::BatchQueue::dropped_bytes)
+      .def_property_readonly("qsize", &ring_py::BatchQueue::size)
+      .def_property_readonly("retained_bytes", &ring_py::BatchQueue::retained_bytes)
+      .def_property_readonly("pushed", &ring_py::BatchQueue::pushed)
+      .def_property_readonly("max_bytes", &ring_py::BatchQueue::max_bytes)
+      .def("set_layer_class_map", &ring_py::BatchQueue::set_layer_class_map,
+           py::arg("entries"),
+           py::arg("default_rank") = static_cast<int>(ring_py::kRankBestEffort),
+           py::call_guard<py::gil_scoped_release>())
+      .def("set_class_eviction", &ring_py::BatchQueue::set_class_eviction,
+           py::arg("on"), py::call_guard<py::gil_scoped_release>())
+      .def("rank_for", &ring_py::BatchQueue::rank_for,
+           py::arg("act_name"), py::arg("layer_no"))
+      .def_property_readonly("dropped_by_rank", &ring_py::BatchQueue::dropped_by_rank)
+      .def_property_readonly("dropped_bytes_by_rank",
+                             &ring_py::BatchQueue::dropped_bytes_by_rank)
+      .def_property_readonly("qsize_by_rank", &ring_py::BatchQueue::qsize_by_rank)
+      .def_property_readonly("evicted", &ring_py::BatchQueue::evicted)
+      .def_property_readonly("class_eviction", &ring_py::BatchQueue::class_eviction)
+      .def_property_readonly("class_map_set", &ring_py::BatchQueue::class_map_set)
+      .def_property_readonly("class_map_size", &ring_py::BatchQueue::class_map_size)
+      .def_property_readonly("class_default_rank",
+                             &ring_py::BatchQueue::class_default_rank)
+      .def("drain_drop_notices",
+           [](ring_py::BatchQueue& self, size_t max_items) {
+               ring_py::DropNoticeBuffer::Drained d;
+               {
+                   py::gil_scoped_release rel;
+                   d = self.drain_drop_notices(max_items);
+               }
+               return drop_notices_to_py(std::move(d));
+           },
+           py::arg("max_items") = 4096)
+      .def_property_readonly("drop_notices_pending",
+           [](const ring_py::BatchQueue& self) { return self.drop_notices().pending(); })
+      .def_property_readonly("drop_notices_recorded",
+           [](const ring_py::BatchQueue& self) { return self.drop_notices().recorded(); })
+      .def_property_readonly("drop_notices_lost",
+           [](const ring_py::BatchQueue& self) { return self.drop_notices().overflow_total(); })
+      .def_property_readonly("drop_notice_cap",
+           [](const ring_py::BatchQueue& self) { return self.drop_notices().cap(); })
+      // Normally pushed by the P2P thread's batch sink; exposed for tests and
+      // benchmarks that feed prebuilt items.
+      .def("push",
+           [](ring_py::BatchQueue& self,
+              const std::string& model_id, int32_t shard_rank,
+              const std::string& act_name, int32_t layer_no,
+              uint64_t step_seq, bool last_in_step,
+              at::Tensor tensor, std::vector<std::string> req_ids,
+              at::Tensor segments, ring_py::CaptureLease capture_lease,
+              int64_t capture_ts_us) {
+               self.push(make_batch_item(model_id, shard_rank, act_name, layer_no,
+                                         step_seq, last_in_step, std::move(tensor),
+                                         std::move(req_ids), std::move(segments),
+                                         std::move(capture_lease), capture_ts_us));
+           },
+           py::arg("model_id"), py::arg("shard_rank"), py::arg("act_name"),
+           py::arg("layer_no"), py::arg("step_seq"), py::arg("last_in_step"),
+           py::arg("tensor"), py::arg("req_ids"), py::arg("segments"),
+           py::arg("capture_lease") = ring_py::CaptureLease{},
+           py::arg("capture_ts_us") = 0,
+           py::call_guard<py::gil_scoped_release>())
+      // Wait up to timeout_ms with the GIL released; each item is
+      // (model_id, shard_rank, act_name, layer_no, node_id, step_seq,
+      //  last_in_step, tensor, req_ids, segments[, capture_lease,
+      //  capture_ts_us]).
+      .def("drain_batches",
+           [](ring_py::BatchQueue& self, size_t max_items, int timeout_ms) {
+               std::vector<ring_py::HookBatchItem> batch;
+               {
+                   py::gil_scoped_release rel;
+                   batch = self.drain(max_items, timeout_ms);
+               }
+               py::list out;
+               for (auto& it : batch) {
+                   py::list rids;
+                   for (auto& r : it.req_ids) rids.append(py::str(r));
+                   py::tuple item = py::make_tuple(
+                       it.model_id, it.shard_rank, it.act_name, it.layer_no,
+                       it.node_id, it.step_seq, it.last_in_step,
+                       it.tensor, rids, it.segments);
+                   if (it.capture_lease.present())
+                       item = py::cast<py::tuple>(item.attr("__add__")(
+                           py::make_tuple(it.capture_lease.fork(), it.capture_ts_us)));
+                   out.append(item);
+               }
+               return out;
+           },
+           py::arg("max_items") = 64, py::arg("timeout_ms") = 50);
+
   py::class_<ring_py::RingConfig>(m, "RingConfig")
       .def(py::init<>())
       .def_readwrite("task_ring_entries",         &ring_py::RingConfig::task_ring_entries)
@@ -722,6 +961,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("drain_flush_byte_threshold",  &ring_py::RingConfig::drain_flush_byte_threshold)
       .def_readwrite("drain_flush_timeout_us",     &ring_py::RingConfig::drain_flush_timeout_us)
       .def_readwrite("clone_slices",              &ring_py::RingConfig::clone_slices)
+      .def_readwrite("p2p_pool_cap_bytes",        &ring_py::RingConfig::p2p_pool_cap_bytes)
+      .def_readwrite("batch_submit",              &ring_py::RingConfig::batch_submit)
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
       .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items)
       .def_readwrite("drain_policy",              &ring_py::RingConfig::drain_policy);
@@ -773,13 +1014,53 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
              ring_py::SubmitFn submit_fn;
-             if (!host_engine_obj.is_none() &&
-                 py::isinstance<dmx_host::DMXHostEngine>(host_engine_obj)) {
+             ring_py::BatchSink batch_sink;
+             if (host_engine_obj.is_none()) {
+                 // No consumer: captures are drained and dropped (null and
+                 // benchmark runs).
+             } else if (py::isinstance<ring_py::BatchQueue>(host_engine_obj)) {
+                 // Batch handoff: one item per (hook x step), pushed in pure
+                 // C++ (no GIL).  Needs cfg.batch_submit for packed steps;
+                 // a consumer drains it with BatchQueue.drain_batches().
+                 // HF batched steps (token and attention hooks) arrive as
+                 // one-request items, one per request slice (p2p_thread.h).
+                 if (!cfg.batch_submit) {
+                     throw py::value_error(
+                         "a BatchQueue consumer needs RingConfig.batch_submit = True");
+                 }
+                 auto bq = host_engine_obj.cast<std::shared_ptr<ring_py::BatchQueue>>();
+                 batch_sink = [bq](const std::string& model_id, int32_t shard_rank,
+                                   const std::string& act_name, int32_t layer_no,
+                                   uint64_t step_seq, bool last_in_step,
+                                   at::Tensor tensor, std::vector<std::string> req_ids,
+                                   at::Tensor segments, ring_py::CaptureLease capture_lease,
+                                   int64_t capture_ts_us, bool is_attn) {
+                     bq->push(make_batch_item(model_id, shard_rank, act_name, layer_no,
+                                              step_seq, last_in_step, std::move(tensor),
+                                              std::move(req_ids), std::move(segments),
+                                              std::move(capture_lease), capture_ts_us,
+                                              is_attn));
+                 };
+             } else if (py::isinstance<ring_py::SliceQueue>(host_engine_obj)) {
+                 // Per-slice queue, pushed in pure C++ (no GIL); a consumer
+                 // drains it with SliceQueue.drain_slices().
+                 auto sq = host_engine_obj.cast<std::shared_ptr<ring_py::SliceQueue>>();
+                 submit_fn = [sq](const std::string& model_id, int32_t shard_rank,
+                                  const std::string& req_id, const std::string& act_name,
+                                  int32_t layer_no, int32_t start_token, int32_t end_token,
+                                  at::Tensor slice, int64_t capture_ts_us,
+                                  ring_py::CaptureLease capture_lease) {
+                     sq->push(model_id, shard_rank, req_id, act_name, layer_no,
+                              start_token, end_token, std::move(slice),
+                              std::move(capture_lease), capture_ts_us);
+                 };
+             } else if (py::isinstance<dmx_host::DMXHostEngine>(host_engine_obj)) {
                  auto host = host_engine_obj.cast<std::shared_ptr<dmx_host::DMXHostEngine>>();
                  submit_fn = [host](const std::string& model_id, int32_t shard_rank,
                                     const std::string& req_id, const std::string& act_name,
                                     int32_t layer_no, int32_t start_token, int32_t end_token,
-                                    at::Tensor slice) {
+                                    at::Tensor slice, int64_t /*capture_ts_us*/,
+                                    ring_py::CaptureLease /*capture_lease*/) {
                      dmx_host::ClickHouseRow row;
                      row.emplace_back(model_id);
                      row.emplace_back(req_id);
@@ -792,17 +1073,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                      row.emplace_back(std::move(slice));
                      host->submit_direct(std::move(row), nbytes);
                  };
-             } else if (!host_engine_obj.is_none()) {
+             } else {
                  // An in-process consumer: any Python callable taking
                  // (model_id, shard_rank, req_id, act_name, layer_no,
-                 //  start_token, end_token, tensor).  The P2P thread calls
-                 // it without the GIL, so take it for the call.  An
-                 // exception propagates to the P2P thread's submit-failure
-                 // handling (logged once, the slice is dropped).
+                 //  start_token, end_token, tensor), plus (capture_lease,
+                 //  capture_ts_us) when the step carried a lease.  The P2P
+                 // thread calls it without the GIL, so take it for the call.
+                 // An exception reaches the P2P thread's consumer-failure
+                 // accounting (logged once, counted, slice dropped).
                  if (!PyCallable_Check(host_engine_obj.ptr())) {
                      throw py::type_error(
                          "RingEngine host_engine must be a DMXHostEngine, a "
-                         "callable consumer, or None");
+                         "BatchQueue, a SliceQueue, a callable consumer, or None");
                  }
                  auto fn = std::shared_ptr<py::object>(
                      new py::object(host_engine_obj),
@@ -814,19 +1096,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                  submit_fn = [fn](const std::string& model_id, int32_t shard_rank,
                                   const std::string& req_id, const std::string& act_name,
                                   int32_t layer_no, int32_t start_token, int32_t end_token,
-                                  at::Tensor slice) {
+                                  at::Tensor slice, int64_t capture_ts_us,
+                                  ring_py::CaptureLease capture_lease) {
                      py::gil_scoped_acquire gil;
                      try {
-                         (*fn)(model_id, shard_rank, req_id, act_name, layer_no,
-                               start_token, end_token, std::move(slice));
+                         if (capture_lease.present()) {
+                             (*fn)(model_id, shard_rank, req_id, act_name, layer_no,
+                                   start_token, end_token, std::move(slice),
+                                   capture_lease.fork(), capture_ts_us);
+                         } else {
+                             (*fn)(model_id, shard_rank, req_id, act_name, layer_no,
+                                   start_token, end_token, std::move(slice));
+                         }
                      } catch (py::error_already_set& error) {
                          std::string what = error.what();
                          throw std::runtime_error(what);
                      }
                  };
              }
-             return MakeRingEngine(
-                 std::move(cfg), std::move(submit_fn));
+             return MakeRingEngine(std::move(cfg), std::move(submit_fn),
+                                   std::move(batch_sink));
            }),
            py::arg("config"), py::arg("host_engine") = py::none())
       .def_static(
@@ -960,6 +1249,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("flush_and_wait",
            &ring_py::RingEnginePy::flush_and_wait,
            py::call_guard<py::gil_scoped_release>())
+      .def("drain_to_sink_and_wait",
+           &ring_py::RingEnginePy::drain_to_sink_and_wait,
+           py::arg("timeout_ms") = uint32_t{0},
+           py::call_guard<py::gil_scoped_release>())
+      .def("request_flush",
+           &ring_py::RingEnginePy::request_flush,
+           py::call_guard<py::gil_scoped_release>())
+      .def_property_readonly("submit_exceptions",
+           &ring_py::RingEnginePy::submit_exceptions)
+      .def_property_readonly("last_sink_error",
+           &ring_py::RingEnginePy::last_sink_error)
+      .def_property_readonly("sink_failed",
+           &ring_py::RingEnginePy::sink_failed)
+      .def("set_abort_on_sink_error",
+           &ring_py::RingEnginePy::set_abort_on_sink_error,
+           py::arg("enabled"))
       .def("push_all_metas",
            [](ring_py::RingEnginePy& self,
               py::list hook_types_py,
@@ -978,7 +1283,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               py::list dim0_offsets_py,
               py::list kv_offsets_py,
               py::list orig_positions_py,
-              py::list hook_requests_py) {
+              py::list hook_requests_py,
+              ring_py::CaptureLease capture_lease) {
                const size_t n_hooks = static_cast<size_t>(py::len(hook_types_py));
                if (py::len(hook_requests_py) &&
                    static_cast<size_t>(py::len(hook_requests_py)) != n_hooks)
@@ -986,6 +1292,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                // Build step context (heap-allocated, ownership to FIFO/p2p)
                auto owned_ctx = std::make_unique<ring_py::StepContext>();
                auto* ctx = owned_ctx.get();
+               ctx->capture_lease = std::move(capture_lease);
                ctx->model_id  = model_id;
                ctx->tp_rank   = tp_rank;
                ctx->dp_rank   = dp_rank;
@@ -1053,7 +1360,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("dim0_offsets"),
            py::arg("kv_offsets") = py::list(),
            py::arg("orig_positions") = py::list(),
-           py::arg("hook_requests") = py::list())
+           py::arg("hook_requests") = py::list(),
+           py::arg("capture_lease") = ring_py::CaptureLease{})
       .def_static("supports_hook_request_arrays", []() { return true; })
       .def("set_gather_host_mirror",
            &ring_py::RingEnginePy::set_gather_host_mirror,
