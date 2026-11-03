@@ -12,6 +12,7 @@
 #include "ring/ring_debug.h"
 #include "ring/record_stall_budget.h"
 #include "ring/toggle_registry.h"
+#include "ring/toggle_device.h"
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
 #include <algorithm>
 #include <atomic>
@@ -176,6 +177,27 @@ struct RingEnginePy::Impl {
     // Runtime CUDA-graph node toggling: all state and graph operations live
     // in the registry; the engine methods delegate.
     ToggleRegistry   toggle;
+
+    // Host mirror of the per-HookPoint row tables (set_gather_host_mirror).
+    // gather_dev_base is the arming word: written last, cleared first.
+    std::atomic<uint64_t> gather_dev_base{0};
+    uint64_t              gather_host_base{0};
+    uint64_t              gather_row_bytes{0};
+    uint64_t              gather_rows{0};
+    std::atomic<uint64_t> gather_host_skips{0};
+    std::atomic<uint64_t> head_launches{0};
+
+    // True when the mirrored row at `table` holds the disabled sentinel.
+    // A pointer outside the mirror is never treated as disabled.
+    bool mirrored_row_disabled(uint64_t table) const {
+        const uint64_t base = gather_dev_base.load(std::memory_order_acquire);
+        if (base == 0 || table < base) return false;
+        const uint64_t off = table - base;
+        return off % gather_row_bytes == 0
+            && off / gather_row_bytes < gather_rows
+            && *reinterpret_cast<const volatile int64_t*>(
+                   gather_host_base + off) == -1;
+    }
 
     // Step-gated drain: ring records reserved since the last allow_flush_step()
     // (the current step's gap).  Written by the reserving thread only.
@@ -981,6 +1003,185 @@ at::Tensor RingEnginePy::payload_tensor() const {
 // reserve will still succeed because the actual ring state has at least
 // as much room as we computed.
 // ---------------------------------------------------------------------------
+
+namespace {
+
+bool stream_is_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusActive;
+    return !(cudaStreamIsCapturing(stream, &status) == cudaSuccess &&
+             status == cudaStreamCaptureStatusNone);
+}
+
+}  // namespace
+
+void RingEnginePy::hook_no_notify_gather(uint64_t d_ptr, uint64_t nbytes_upper,
+                                         uint64_t seg_table_dev_ptr,
+                                         int64_t seg_table_numel,
+                                         uint64_t row_bytes,
+                                         uint32_t hook_type,
+                                         uint64_t stream_handle)
+{
+    refuse_on_record_ring(impl_->record_mode, "legacy gather producer");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    impl_->current_hook_idx++;
+    // A disabled row on an uncaptured launch: the kernel's first read is the
+    // row's n, uploaded on this stream from the pinned row read here, and -1
+    // makes it return with no reservation, task or payload, so not launching
+    // is the same observation.  A capture always launches: the graph bakes
+    // the node and re-reads the device row at every replay.
+    if (impl_->mirrored_row_disabled(seg_table_dev_ptr) &&
+        !stream_is_capturing(stream)) {
+        impl_->gather_host_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+#if DMX_HAS_DEVICE_GRAPH_UPDATE
+    // Device-side toggling: a capture outside the toggle capture window (the
+    // graphs the host does not toggle, e.g. partial-model segment graphs)
+    // launches the producer as a device-updatable node, preceded once per
+    // captured forward by the planner node.  Graphs inside the window keep
+    // host toggling, where SetEnabled calls are rare (set changes only).
+    if (impl_->toggle.device_armed() && !impl_->toggle.capture_enabled()) {
+        cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+        unsigned long long cid = 0;
+        cudaGraph_t g = nullptr;
+        const cudaGraphNode_t* deps = nullptr;
+        size_t nd = 0;
+        if (dmx_capture_info(stream, &st, &cid, &g, &deps, &nd) == cudaSuccess
+                && st == cudaStreamCaptureStatusActive && g != nullptr) {
+            bool fresh = false;
+            const int slot = impl_->toggle.device_slot(
+                reinterpret_cast<uint64_t>(g),
+                reinterpret_cast<const int64_t*>(seg_table_dev_ptr), &fresh);
+            if (slot >= 0) {
+                if (fresh)
+                    ring::launch_toggle_planner(impl_->toggle.device_pool(),
+                                                slot, stream);
+                const cudaError_t le = ring::launch_producer_gather_device_updatable(
+                    impl_->engine.ring_state(),
+                    reinterpret_cast<const uint8_t*>(d_ptr), nbytes_upper,
+                    reinterpret_cast<const int64_t*>(seg_table_dev_ptr),
+                    seg_table_numel, row_bytes, hook_type, stream);
+                if (le != cudaSuccess) {
+                    throw std::runtime_error(
+                        std::string("device-updatable producer launch failed: ") +
+                        cudaGetErrorString(le));
+                }
+                if (dmx_capture_info(stream, &st, &cid, &g, &deps, &nd) != cudaSuccess
+                        || nd < 1) {
+                    impl_->toggle.note_anomaly();
+                    return;
+                }
+                cudaGraphNode_t node = deps[nd - 1];
+                cudaKernelNodeAttrValue value = {};
+                cudaGraphDeviceNode_t dev = nullptr;
+                if (cudaGraphKernelNodeGetAttribute(
+                        node, cudaKernelNodeAttributeDeviceUpdatableKernelNode,
+                        &value) == cudaSuccess &&
+                    value.deviceUpdatableKernelNode.deviceUpdatable)
+                    dev = value.deviceUpdatableKernelNode.devNode;
+                impl_->toggle.register_device_entry(
+                    slot, reinterpret_cast<uint64_t>(g),
+                    reinterpret_cast<uint64_t>(node),
+                    reinterpret_cast<const int64_t*>(seg_table_dev_ptr), dev);
+                return;
+            }
+            // Pool exhausted: launch normally; the node stays enabled and
+            // early-exits on a -1 row, but activation reports the anomaly.
+            impl_->toggle.note_anomaly();
+        }
+    }
+#endif
+    ring::launch_producer_gather(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr), nbytes_upper,
+        reinterpret_cast<const int64_t*>(seg_table_dev_ptr),
+        seg_table_numel, row_bytes, hook_type, stream);
+}
+
+void RingEnginePy::hook_no_notify_head(uint64_t d_ptr, uint64_t nbytes_upper,
+                                       uint64_t seg_table_dev_ptr,
+                                       int64_t seg_table_numel,
+                                       uint32_t hidden, uint32_t src_elem_bytes,
+                                       uint64_t arena_dev_ptr, uint32_t K,
+                                       uint32_t hook_type,
+                                       uint64_t stream_handle)
+{
+    refuse_on_record_ring(impl_->record_mode, "legacy head producer");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    impl_->current_hook_idx++;
+    if (impl_->mirrored_row_disabled(seg_table_dev_ptr) &&
+        !stream_is_capturing(stream)) {
+        impl_->gather_host_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    impl_->head_launches.fetch_add(1, std::memory_order_relaxed);
+    ring::launch_producer_head(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr), nbytes_upper,
+        reinterpret_cast<const int64_t*>(seg_table_dev_ptr), seg_table_numel,
+        hidden, src_elem_bytes,
+        reinterpret_cast<const float*>(arena_dev_ptr), K, hook_type, stream);
+}
+
+void RingEnginePy::hook_no_notify_fused(uint64_t d_ptr, uint64_t nbytes_upper,
+                                        uint32_t hidden, uint32_t src_elem_bytes,
+                                        uint64_t gather_table_dev_ptr,
+                                        int64_t gather_table_numel,
+                                        uint64_t head_table_dev_ptr,
+                                        int64_t head_table_numel,
+                                        uint64_t arena_dev_ptr, uint32_t K,
+                                        uint32_t weight_bf16,
+                                        uint64_t acc_dev_ptr, uint64_t acc_rows,
+                                        uint32_t hook_type,
+                                        uint64_t stream_handle)
+{
+    refuse_on_record_ring(impl_->record_mode, "legacy fused producer");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    impl_->current_hook_idx++;
+    // Skip an uncaptured launch only when every present part is disabled.
+    auto disabled = [&](uint64_t table) {
+        return table == 0 || impl_->mirrored_row_disabled(table);
+    };
+    if (disabled(gather_table_dev_ptr) && disabled(head_table_dev_ptr) &&
+        !stream_is_capturing(stream)) {
+        impl_->gather_host_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    impl_->head_launches.fetch_add(1, std::memory_order_relaxed);
+    ring::launch_producer_fused(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr), nbytes_upper, hidden,
+        src_elem_bytes,
+        reinterpret_cast<const int64_t*>(gather_table_dev_ptr), gather_table_numel,
+        reinterpret_cast<const int64_t*>(head_table_dev_ptr), head_table_numel,
+        reinterpret_cast<const int32_t*>(arena_dev_ptr), K, weight_bf16,
+        reinterpret_cast<float*>(acc_dev_ptr), acc_rows, hook_type, stream);
+}
+
+uint64_t RingEnginePy::head_launches() const {
+    return impl_->head_launches.load(std::memory_order_relaxed);
+}
+
+void RingEnginePy::set_gather_host_mirror(uint64_t dev_base, uint64_t host_base,
+                                          uint64_t row_bytes, uint64_t rows)
+{
+    if (rows != 0 && (dev_base == 0 || host_base == 0 ||
+                      row_bytes < sizeof(int64_t) ||
+                      row_bytes % sizeof(int64_t) != 0)) {
+        throw std::invalid_argument(
+            "gather host mirror needs base pointers and whole int64 rows");
+    }
+    // Disarm first so a reader never pairs old and new fields.
+    impl_->gather_dev_base.store(0, std::memory_order_release);
+    impl_->gather_rows = rows;
+    impl_->gather_row_bytes = row_bytes;
+    impl_->gather_host_base = host_base;
+    impl_->gather_dev_base.store(rows ? dev_base : 0, std::memory_order_release);
+}
+
+uint64_t RingEnginePy::gather_host_skips() const {
+    return impl_->gather_host_skips.load(std::memory_order_relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // Runtime CUDA-graph node toggling -- thin delegates to ToggleRegistry.  The

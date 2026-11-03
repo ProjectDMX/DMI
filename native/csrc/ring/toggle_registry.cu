@@ -41,7 +41,16 @@ void ToggleRegistry::register_node(uint64_t graph, int hook_type, int layer_no, 
     std::lock_guard<std::mutex> lk(mu_);
     RegEntry re{hook_type, layer_no, reinterpret_cast<cudaGraphNode_t>(node)};
     re.device = dev_nodes_.count(re.node) > 0;
-    reg_nodes_[reinterpret_cast<cudaGraph_t>(graph)].push_back(re);
+    auto& entries = reg_nodes_[reinterpret_cast<cudaGraph_t>(graph)];
+    if (!entries.empty() && entries.back().node == re.node &&
+        entries.back().alt_hook_type < 0 &&
+        !(entries.back().hook_type == hook_type &&
+          entries.back().layer_no == layer_no)) {
+        entries.back().alt_hook_type = hook_type;   // fused producer's second key
+        entries.back().alt_layer_no  = layer_no;
+    } else {
+        entries.push_back(re);
+    }
     registered_hooks_.insert({hook_type, layer_no});
     ++version_;
 }
@@ -188,7 +197,10 @@ bool ToggleRegistry::uniform() const {
     std::set<std::pair<int,int>> ref;
     for (const auto& kv : reg_nodes_) {
         std::set<std::pair<int,int>> s;
-        for (const auto& e : kv.second) s.insert({e.hook_type, e.layer_no});
+        for (const auto& e : kv.second) {
+            s.insert({e.hook_type, e.layer_no});
+            if (e.alt_hook_type >= 0) s.insert({e.alt_hook_type, e.alt_layer_no});
+        }
         if (!have_ref) { ref = std::move(s); have_ref = true; }
         else if (s != ref) return false;
     }

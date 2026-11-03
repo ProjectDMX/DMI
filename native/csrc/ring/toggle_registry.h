@@ -35,6 +35,8 @@ public:
     void set_capture(bool enabled);
     bool capture_enabled() const;
     // Called from the producer op during capture (single kernel just enqueued).
+    // A second, different key recorded for the node just registered (a fused
+    // producer) is attached to that node instead of adding an entry.
     void register_node(uint64_t graph, int hook_type, int layer_no, uint64_t node);
     // Called when a capture-time recording could not be validated (non-kernel
     // tail, unreadable capture state, unsupported producer) -> fail closed.
@@ -115,6 +117,10 @@ private:
         // the next apply sets the node unconditionally.
         bool state_known{true};
         bool device{false};        // toggled by the in-graph planner, never by the host
+        // A fused producer node carries two keys (rows + heads); it is
+        // enabled iff either key is enabled.  -1 = no second key.
+        int alt_hook_type{-1};
+        int alt_layer_no{-1};
     };
     cudaError_t upload_device_graph_locked(cudaGraph_t g, cudaGraphExec_t exec);
     // The apply loops skip a node only when its exec state is known to match.
@@ -122,7 +128,9 @@ private:
         return e.state_known && on == e.last_enabled;
     }
     bool entry_on(const RegEntry& e) const {
-        return enabled_hooks_.count({e.hook_type, e.layer_no}) > 0;
+        return enabled_hooks_.count({e.hook_type, e.layer_no}) > 0
+            || (e.alt_hook_type >= 0 &&
+                enabled_hooks_.count({e.alt_hook_type, e.alt_layer_no}) > 0);
     }
     std::unordered_map<cudaGraph_t, std::vector<RegEntry>> reg_nodes_;  // per captured graph
     std::unordered_map<cudaGraph_t, cudaGraphExec_t>       reg_exec_;   // graph -> exec

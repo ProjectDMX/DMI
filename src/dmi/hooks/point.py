@@ -53,6 +53,18 @@ def _nvtx_range(message: str):
         yield
 
 
+def _source_rows(x: Any) -> int:
+    """Physical source rows of a contiguous HookPoint tensor: the product of
+    every dimension before hidden (1 for a 1-D ``[hidden]`` tensor).  The
+    native producers derive the same count as nbytes / (hidden x element
+    size)."""
+    shape = tuple(int(d) for d in x.shape)
+    rows = 1
+    for d in shape[:-1]:
+        rows *= d
+    return rows
+
+
 @dataclass
 class LensHandle:
     """Dataclass that holds information about a PyTorch hook."""
@@ -147,6 +159,41 @@ class HookPoint(nn.Module):
         # Framework adapters must honor this contract.
         self._strip_tensor: Optional[torch.Tensor] = None
         self._strip_row_bytes: int = 0
+
+        # Gather mode: when set, takes precedence over strip mode.  The
+        # producer copies the row runs listed in this per-HookPoint row table
+        # (dmi.hook_rows.encode_row_table layout), packed, re-reading the
+        # VALUES each replay under the same stable-address contract as
+        # _strip_tensor; _strip_row_bytes is the row stride.  A table whose
+        # first word is -1 disables the producer for the step.
+        # Armed by dmi.hook_rows.configure_hook_gather for one attachment:
+        # install_ring_hooks / uninstall_ring_hooks clear it.
+        self._gather_table: Optional[torch.Tensor] = None
+
+        # In-graph projection heads.  Set by the integration
+        # (dmi.hook_rows.configure_hook_heads, never by install_ring_hooks)
+        # for one attachment; install_ring_hooks / uninstall_ring_hooks
+        # clear them.  K fp32 scores per row selected by _head_table, under
+        # their own spec and toggle key (_head_hook_type, _head_hook_id).
+        # Dispatch (forward):
+        #   row spec + gather table + heads -> ring::producer_fused, the rows
+        #                                      and the heads in one node;
+        #   row spec (static / prefix / chunked) + heads
+        #                                   -> the row producer, then a
+        #                                      head-only producer_fused node;
+        #   heads only (no row spec)        -> the head-only node.
+        # Either way the row task is published before the head task: the
+        # spec (metadata) order.  _head_arena is the node's int32 weight
+        # arena, _head_acc the shared fp32 [rows, 16] multi-layer
+        # accumulator, and _head_wbf16 the arena's weight dtype (a launch
+        # constant).
+        self._head_hook_type: Optional[int] = None
+        self._head_hook_id: Optional[int] = None
+        self._head_table: Optional[torch.Tensor] = None
+        self._head_arena: Optional[torch.Tensor] = None
+        self._head_acc: Optional[torch.Tensor] = None
+        self._head_slots: int = 0
+        self._head_wbf16: int = 1
 
     def add_perma_hook(self, hook: HookFunction, dir: Literal["fwd", "bwd"] = "fwd") -> None:
         self.add_hook(hook, dir=dir, is_permanent=True)
@@ -268,7 +315,9 @@ class HookPoint(nn.Module):
         if transport is not None and not transport.capture_step:
             return x
 
-        if self._ring_hook_type is None or not x.is_cuda:
+        row_on = self._ring_hook_type is not None
+        head_on = self._head_hook_type is not None
+        if not (row_on or head_on) or not x.is_cuda:
             return x
 
         x_cont = x.contiguous()
@@ -285,83 +334,163 @@ class HookPoint(nn.Module):
         # never changes); torch.compile traces only the live branch.
         strip_t = self._strip_tensor
         strip_rb = self._strip_row_bytes
+        gather_t = self._gather_table if row_on else None
         ring_payload = self._ring_payload
 
         from ..transport import ring as _rt
         transport = _rt._active_transport
-        if transport is not None and transport.force_eager:
-            # Node toggle: the eager safety net fires producers outside any
-            # graph, where cudaGraphNodeSetEnabled cannot gate them.  On a
-            # gated step that fell back to eager (a step larger than the
-            # ring), a disabled hook must be skipped here, or it fires while
-            # metadata and reservation counted only the enabled subset.
-            # This branch is never captured or compiled, so a host check is
-            # safe; toggle_gate_active keeps the stock eager path untouched.
-            if (getattr(transport, "toggle_gate_active", False)
-                    and getattr(transport, "_gated_step", True)
-                    and not transport._ring_engine.is_hook_enabled(
-                        self._ring_hook_type, self._ring_hook_id)):
-                return x_cont
+        if (transport is not None and transport.force_eager
+                and transport._ring_engine is not None):
+            # The eager safety net publishes exactly what the fast path
+            # publishes, in the same order: the row task (when this
+            # HookPoint has a row spec), then the head task.
             engine = transport._ring_engine
-            if engine is not None:
-                nbytes = x_cont.nbytes
-                transport_bytes = align_up_py(nbytes, 16)
-                if strip_t is not None:
-                    # CPU-direct bypasses ring/staging accounting. Flush older
-                    # ring tasks first so the shared metadata FIFO stays in
-                    # producer order. The legacy consumer applies its normal
-                    # CPU-side request slicing to the full tensor.
-                    engine.flush_and_wait()
-                    transport.submit_cpu_direct(
-                        x_cont.cpu(),
-                        self._ring_hook_type, self._ring_hook_id)
-                    return x_cont
-                # The ring's real per-step ceiling is min(payload, staging),
-                # not payload alone. The drain assembles each flush batch per
-                # WHOLE entry and breaks when the entry does not fit staging
-                # (drain_thread.cpp), so a tensor larger than staging that is
-                # admitted here is never drained: the capture is lost and its
-                # payload reservation is never released, permanently shrinking
-                # ring capacity, while flush_and_wait() still returns success.
-                # Same ceiling the native prepare_step/reserve_record use, and
-                # the one RingCapacities.effective_bytes publishes. Both caps
-                # are engine-lifetime constants queried over pybind, so the
-                # min is cached on the transport and shared by every hook --
-                # querying the pair per hook would repeat it for the whole
-                # active set on the first eager forward.
-                # A free task entry is needed too: a step with more hooks
-                # than task entries lands here with the payload ring nearly
-                # empty, and reserving past task_cap makes a producer
-                # overwrite an unread slot. A flush frees both.
-                effective_cap = transport.effective_cap
-                if (transport_bytes <= min(engine.available_capacity(),
-                                           effective_cap)
-                        and engine.available_task_slots() > 0):
-                    engine.reserve_one(nbytes)
-                    dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
-                                      self._ring_hook_type, self._ring_hook_id)
-                elif transport_bytes <= effective_cap:
-                    engine.flush_and_wait()
-                    engine.reserve_one(nbytes)
-                    dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
-                                      self._ring_hook_type, self._ring_hook_id)
-                else:
-                    # Larger than the ring's effective capacity (payload OR
-                    # staging) -- bypass via cpu_direct.  Flush first so submit_cpu_direct consumes
-                    # the FIFO meta for THIS hook (prior ring entries finish
-                    # first; this hook's pre-pushed meta becomes the head).
-                    engine.flush_and_wait()
-                    transport.submit_cpu_direct(
-                        x_cont.cpu(),
-                        self._ring_hook_type, self._ring_hook_id)
-                return x_cont
+            if row_on:
+                self._eager_row(transport, engine, ring_payload, x_cont,
+                                strip_t, strip_rb, gather_t)
+            if head_on:
+                self._eager_head(transport, engine, ring_payload, x_cont)
+            return x_cont
 
         # Fast path: torch.compile-serializable, CUDA-graph captureable.
         # C++ ring_producer_* impls no-op when g_active_engine is null
         # (monitoring inactive); otherwise launch the producer kernel.
-        dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
-                          self._ring_hook_type, self._ring_hook_id)
+        if head_on and gather_t is not None:
+            # One node for the rows and the heads; each part is gated by its
+            # own table row.
+            torch.ops.ring.producer_fused(
+                ring_payload, x_cont, gather_t, strip_rb, self._head_table,
+                self._head_arena, self._head_acc, self._head_slots,
+                self._head_wbf16, self._ring_hook_type, self._ring_hook_id,
+                self._head_hook_type)
+            return x_cont
+        if row_on:
+            dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
+                              self._ring_hook_type, self._ring_hook_id, gather_t)
+        if head_on:
+            self._launch_head_only(ring_payload, x_cont)
         return x_cont
+
+    def _launch_head_only(self, ring_payload, x_cont):
+        """The head part alone: a producer_fused node without a row table,
+        recorded and toggled under the head key only, so the row producer
+        and the heads keep independent toggle states."""
+        torch.ops.ring.producer_fused(
+            ring_payload, x_cont, None, 0, self._head_table,
+            self._head_arena, self._head_acc, self._head_slots,
+            self._head_wbf16, self._head_hook_type, self._head_hook_id,
+            self._head_hook_type)
+
+    def _eager_row(self, transport, engine, ring_payload, x_cont,
+                   strip_t, strip_rb, gather_t):
+        """Eager safety net for the row producer (never captured)."""
+        # Node toggle: the eager safety net fires producers outside any
+        # graph, where cudaGraphNodeSetEnabled cannot gate them.  On a
+        # gated step that fell back to eager (a step larger than the
+        # ring), a disabled hook must be skipped here, or it fires while
+        # metadata and reservation counted only the enabled subset.
+        # This branch is never captured or compiled, so a host check is
+        # safe; toggle_gate_active keeps the stock eager path untouched.
+        if (getattr(transport, "toggle_gate_active", False)
+                and (getattr(transport, "_gated_step", True)
+                     or getattr(transport, "_prefill_table_gate", False))
+                and not engine.is_hook_enabled(
+                    self._ring_hook_type, self._ring_hook_id)):
+            return
+        nbytes = x_cont.nbytes
+        transport_bytes = align_up_py(nbytes, 16)
+        # Gather mode reserves the full tensor here: on an eager step
+        # the integration writes the full-row table, so the producer
+        # copies exactly nbytes and the reservation matches.
+        if strip_t is not None and gather_t is None:
+            # CPU-direct bypasses ring/staging accounting. Flush older
+            # ring tasks first so the shared metadata FIFO stays in
+            # producer order. The legacy consumer applies its normal
+            # CPU-side request slicing to the full tensor.
+            engine.flush_and_wait()
+            transport.submit_cpu_direct(
+                x_cont.cpu(),
+                self._ring_hook_type, self._ring_hook_id)
+            return
+        # The ring's real per-step ceiling is min(payload, staging),
+        # not payload alone. The drain assembles each flush batch per
+        # WHOLE entry and breaks when the entry does not fit staging
+        # (drain_thread.cpp), so a tensor larger than staging that is
+        # admitted here is never drained: the capture is lost and its
+        # payload reservation is never released, permanently shrinking
+        # ring capacity, while flush_and_wait() still returns success.
+        # Same ceiling the native prepare_step/reserve_record use, and
+        # the one RingCapacities.effective_bytes publishes. Both caps
+        # are engine-lifetime constants queried over pybind, so the
+        # min is cached on the transport and shared by every hook --
+        # querying the pair per hook would repeat it for the whole
+        # active set on the first eager forward.
+        # A free task entry is needed too: a step with more hooks
+        # than task entries lands here with the payload ring nearly
+        # empty, and reserving past task_cap makes a producer
+        # overwrite an unread slot. A flush frees both.
+        effective_cap = transport.effective_cap
+        if (transport_bytes <= min(engine.available_capacity(),
+                                   effective_cap)
+                and engine.available_task_slots() > 0):
+            engine.reserve_one(nbytes)
+            dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
+                              self._ring_hook_type, self._ring_hook_id,
+                              gather_t)
+        elif transport_bytes <= effective_cap:
+            engine.flush_and_wait()
+            engine.reserve_one(nbytes)
+            dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
+                              self._ring_hook_type, self._ring_hook_id,
+                              gather_t)
+        else:
+            # Larger than the ring's effective capacity (payload OR
+            # staging) -- bypass via cpu_direct.  Flush first so submit_cpu_direct consumes
+            # the FIFO meta for THIS hook (prior ring entries finish
+            # first; this hook's pre-pushed meta becomes the head).
+            engine.flush_and_wait()
+            transport.submit_cpu_direct(
+                x_cont.cpu(),
+                self._ring_hook_type, self._ring_hook_id)
+
+    def _eager_head(self, transport, engine, ring_payload, x_cont):
+        """Eager safety net for the head part (never captured).
+
+        The same gate and reservation order as the row producer: a disabled
+        head reserves nothing; otherwise the integration wrote the full-row
+        head table on eager steps, so the heads write rows x K x 4 bytes.
+
+        ``rows`` is every physical source row: the product of all dimensions
+        before hidden, as the native launcher derives it (nbytes / (hidden x
+        element size) of the contiguous source) and as the step planner
+        budgets the head spec's ``[..., K]`` shape.  A batched ``[B, S, H]``
+        HookPoint therefore has B x S rows, not B.
+        """
+        if engine is None:
+            return
+        if (getattr(transport, "toggle_gate_active", False)
+                and (getattr(transport, "_gated_step", True)
+                     or getattr(transport, "_prefill_table_gate", False))
+                and not engine.is_hook_enabled(self._head_hook_type,
+                                               self._head_hook_id)):
+            return
+        rows = _source_rows(x_cont)
+        nbytes = rows * int(self._head_slots) * 4
+        transport_bytes = align_up_py(nbytes, 16)
+        # As for the rows: an entry larger than min(payload, staging) is never
+        # drained and would wedge the ring.  Heads have no CPU-direct path
+        # (the scores exist only on the GPU), so refuse before reserving.
+        if transport_bytes > transport.effective_cap:
+            raise RuntimeError(
+                f"in-graph head output ({transport_bytes} bytes for "
+                f"{rows} rows x {int(self._head_slots)} slots) "
+                f"exceeds the ring's effective capacity "
+                f"({transport.effective_cap} bytes)")
+        if (transport_bytes > engine.available_capacity()
+                or engine.available_task_slots() == 0):
+            engine.flush_and_wait()
+        engine.reserve_one(nbytes)
+        self._launch_head_only(ring_payload, x_cont)
 
     def layer(self):
         # Returns the layer index if the name has the form 'blocks.{layer}.{...}'

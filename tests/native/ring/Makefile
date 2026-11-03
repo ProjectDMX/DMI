@@ -68,10 +68,14 @@ TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer \
            $(BUILD)/test_ring_engine $(BUILD)/test_null_mode \
            $(BUILD)/test_record_consumer \
            $(BUILD)/test_clickhouse_record_sink \
-           $(BUILD)/test_toggle_registry
+           $(BUILD)/test_toggle_registry \
+           $(BUILD)/test_producer_equivalence \
+           $(BUILD)/test_inline_head \
+           $(BUILD)/test_fused_head
 
 .PHONY: all test_rings test_producer test_ring_engine test_null_mode \
         test_record_consumer test_clickhouse_record_sink test_toggle_registry \
+        test_producer_equivalence test_inline_head test_fused_head \
         run clean FORCE \
         bench_producer_grid
 
@@ -100,6 +104,17 @@ $(BUILD)/test_ring_engine: test_ring_engine.cu $(PRODUCER_CU) $(DRAIN_SRC) \
 
 $(BUILD)/test_toggle_registry: test_toggle_registry.cu $(TOGGLE_REGISTRY_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) $(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
+
+# Row-table producers against independent host models.  The head tests take
+# NVCC_EXTRA=-DDMI_TEST_MUTATE_* for mutation checks (each must FAIL).
+$(BUILD)/test_producer_equivalence: test_producer_equivalence.cu $(PRODUCER_CU) $(TOGGLE_REGISTRY_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
+	$(CUDA_NVCC) $(NVCC_FLAGS) $(NVCC_EXTRA) $(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
+
+$(BUILD)/test_inline_head: test_inline_head.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
+	$(CUDA_NVCC) $(NVCC_FLAGS) $(NVCC_EXTRA) $(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
+
+$(BUILD)/test_fused_head: test_fused_head.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
+	$(CUDA_NVCC) $(NVCC_FLAGS) $(NVCC_EXTRA) $(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
 
 $(BUILD)/test_null_mode: test_null_mode.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) $(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
@@ -135,6 +150,15 @@ test_clickhouse_record_sink: $(BUILD)/test_clickhouse_record_sink
 test_toggle_registry: $(BUILD)/test_toggle_registry
 	$(BUILD)/test_toggle_registry
 
+test_producer_equivalence: $(BUILD)/test_producer_equivalence
+	$(BUILD)/test_producer_equivalence
+
+test_inline_head: $(BUILD)/test_inline_head
+	$(BUILD)/test_inline_head
+
+test_fused_head: $(BUILD)/test_fused_head
+	$(BUILD)/test_fused_head
+
 # Manual microbenchmark; not part of `all` or `run`.
 $(BUILD)/bench_producer_grid: bench_producer_grid.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) bench_producer_grid.cu -o $@
@@ -150,6 +174,9 @@ run: all
 	$(BUILD)/test_record_consumer
 	$(BUILD)/test_clickhouse_record_sink
 	$(BUILD)/test_toggle_registry
+	$(BUILD)/test_producer_equivalence
+	$(BUILD)/test_inline_head
+	$(BUILD)/test_fused_head
 
 clean:
 	rm -rf $(BUILD)

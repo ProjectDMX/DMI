@@ -267,6 +267,20 @@ def test_ungated_steps_use_the_full_active_set():
     assert transport.gated_step_requires_registry() is True
 
 
+def test_table_gate_makes_every_step_follow_the_toggle():
+    specs = _specs()
+    transport = _transport(FakeToggleEngine(_keys(specs)), specs)
+    transport.set_active_hooks_lazy([(HOOK_TYPE_RESID_PRE, 0)])
+    transport.set_gated_step(False)
+    transport.set_prefill_table_gate(True)
+    assert _keys(transport.specs_for_step()) == [(HOOK_TYPE_RESID_PRE, 0)]
+    assert transport.gated_step_requires_registry() is False
+    transport.set_gated_step(True)
+    assert transport.gated_step_requires_registry() is False
+    transport.set_prefill_table_gate(False)
+    assert transport.gated_step_requires_registry() is True
+
+
 def test_clear_resets_registry_and_gate_together():
     specs = _specs()
     engine = FakeToggleEngine(_keys(specs))

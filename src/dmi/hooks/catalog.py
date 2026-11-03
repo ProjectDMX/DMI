@@ -15,6 +15,7 @@ GROUP_ATTN, GROUP_MLP, GROUP_OTHER = 0, 1, 2
 SHAPE_HIDDEN, SHAPE_QKV_Q, SHAPE_QKV_KV, SHAPE_QKV_Z = 0, 1, 2, 3
 SHAPE_ATTN_WT, SHAPE_MLP_POST, SHAPE_TOKEN_IDS, SHAPE_LOGITS = 4, 5, 6, 7
 SHAPE_ROUTER_LOGITS, SHAPE_TOPK_IDS, SHAPE_TOPK_WEIGHTS = 8, 9, 10
+SHAPE_HEAD_SCORES = 11
 
 # Pipeline-parallel placement.
 PP_ANY, PP_FIRST, PP_LAST = 0, 1, 2
@@ -45,6 +46,8 @@ HOOK_DEFS: tuple[tuple[int, str, str, bool, int, bool, int, int], ...] = (
     (21, "mlp.hook_router_logits", "router_logits", True, GROUP_OTHER, False, SHAPE_ROUTER_LOGITS, PP_ANY),
     (22, "mlp.hook_topk_ids", "topk_ids", True, GROUP_OTHER, False, SHAPE_TOPK_IDS, PP_ANY),
     (23, "mlp.hook_topk_weights", "topk_weights", True, GROUP_OTHER, False, SHAPE_TOPK_WEIGHTS, PP_ANY),
+    (24, "hook_resid_pre_head", "resid_pre_head", True, GROUP_OTHER, False, SHAPE_HEAD_SCORES, PP_ANY),
+    (25, "hook_final_ln_head", "final_ln_head", False, GROUP_OTHER, False, SHAPE_HEAD_SCORES, PP_LAST),
 )
 
 
@@ -64,6 +67,7 @@ __all__ = [
     "SHAPE_ROUTER_LOGITS",
     "SHAPE_TOPK_IDS",
     "SHAPE_TOPK_WEIGHTS",
+    "SHAPE_HEAD_SCORES",
     "PP_ANY",
     "PP_FIRST",
     "PP_LAST",

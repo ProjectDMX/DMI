@@ -161,6 +161,61 @@ public:
                                  uint32_t hook_type,
                                  uint64_t stream_handle);
 
+    // Gather: copy the row runs listed in a per-step row table, packed (see
+    // producer.cuh for the table contract).  Used by ring::producer_gather.
+    // Outside stream capture, a launch whose table row holds the disabled
+    // sentinel (-1) in the registered host mirror is skipped (the kernel
+    // would return on the same value).  Under capture in device-toggle mode
+    // and outside the toggle capture window, the producer is captured as a
+    // device-updatable node gated by the in-graph planner.  Every
+    // *_table_numel is the table's int64 element count (table.numel(), a
+    // launch constant); the kernels bound their segment reads by it.
+    void hook_no_notify_gather(uint64_t d_ptr, uint64_t nbytes_upper,
+                               uint64_t seg_table_dev_ptr,
+                               int64_t seg_table_numel,
+                               uint64_t row_bytes,
+                               uint32_t hook_type,
+                               uint64_t stream_handle);
+
+    // In-graph linear heads: K fp32 scores per selected row (producer.cuh,
+    // launch_producer_head).  The same table contract and eager skip as
+    // hook_no_notify_gather.
+    void hook_no_notify_head(uint64_t d_ptr, uint64_t nbytes_upper,
+                             uint64_t seg_table_dev_ptr,
+                             int64_t seg_table_numel,
+                             uint32_t hidden, uint32_t src_elem_bytes,
+                             uint64_t arena_dev_ptr, uint32_t K,
+                             uint32_t hook_type,
+                             uint64_t stream_handle);
+
+    // A HookPoint's row producer and its heads as ONE node
+    // (launch_producer_fused).  Either table may be 0 (part absent).
+    // Outside capture the launch is skipped when every present part's
+    // mirrored row is the disabled sentinel.
+    void hook_no_notify_fused(uint64_t d_ptr, uint64_t nbytes_upper,
+                              uint32_t hidden, uint32_t src_elem_bytes,
+                              uint64_t gather_table_dev_ptr,
+                              int64_t gather_table_numel,
+                              uint64_t head_table_dev_ptr,
+                              int64_t head_table_numel,
+                              uint64_t arena_dev_ptr, uint32_t K,
+                              uint32_t weight_bf16,
+                              uint64_t acc_dev_ptr, uint64_t acc_rows,
+                              uint32_t hook_type,
+                              uint64_t stream_handle);
+    // Head and fused launches issued (diagnostic).
+    uint64_t head_launches() const;
+
+    // Host mirror of the per-HookPoint row tables: `rows` device rows of
+    // `row_bytes` bytes at dev_base, each uploaded from the pinned row at the
+    // same offset from host_base.  The caller rewrites a pinned row only
+    // after its previous upload completed, and uploads every rewrite on the
+    // producer stream before the forward.  rows = 0 clears the mirror.
+    void set_gather_host_mirror(uint64_t dev_base, uint64_t host_base,
+                                uint64_t row_bytes, uint64_t rows);
+    // Uncaptured launches skipped because their mirrored row was disabled.
+    uint64_t gather_host_skips() const;
+
     // Additive schema-driven producers.  These methods are reachable only
     // through the separately registered ring::record_producer* operations.
     void record_no_notify(uint64_t d_ptr, uint64_t nbytes,
