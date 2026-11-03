@@ -16,6 +16,7 @@
 #include "ring_config.h"
 #include "pinned_staging.h"
 #include "drain_task.h"
+#include "pipeline_telemetry.h"
 
 #include <cuda_runtime.h>
 #include <atomic>
@@ -85,6 +86,8 @@ public:
 
     bool is_running() const { return running_.load(std::memory_order_relaxed); }
 
+    const DrainTelemetry& telemetry() const { return telemetry_; }
+
     // Cumulative count of DrainTasks pushed to the P2P queue.  Paired with
     // P2PThread::tasks_processed() for a barrier through the consumer.
     uint64_t tasks_enqueued() const {
@@ -110,6 +113,7 @@ public:
     void rethrow_drain_failure();
 
 private:
+    DrainTelemetry  telemetry_;
     RingState&      ring_;
     PinnedStaging&  staging_;
     RingConfig      cfg_;

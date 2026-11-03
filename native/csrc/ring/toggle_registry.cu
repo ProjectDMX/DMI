@@ -281,7 +281,8 @@ int ToggleRegistry::ensure_current(uint64_t graph) {
     // fatal).
     auto ev = pre_apply_sync_ ? replay_event_.find(g) : replay_event_.end();
     if (ev != replay_event_.end() && ev->second) {
-        cudaError_t se = cudaEventSynchronize(ev->second);
+        cudaError_t se = replay_wait_.measure(
+            [&] { return cudaEventSynchronize(ev->second); });
         if (se != cudaSuccess) return static_cast<int>(se);
     }
 

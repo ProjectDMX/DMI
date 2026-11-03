@@ -31,7 +31,8 @@ HEADERS := csrc/dmx_host_utils.h \
            csrc/ring/toggle_device.h csrc/ring/toggle_registry.h \
            csrc/ring/capture_lease.h csrc/ring/drop_notice.h \
            csrc/ring/slice_queue.h csrc/ring/batch_queue.h \
-           csrc/ring/buffer_pool.h csrc/ring/pooled_block.h
+           csrc/ring/buffer_pool.h csrc/ring/pooled_block.h \
+           csrc/ring/host_wait_counter.h csrc/ring/pipeline_telemetry.h
 BUILD_DIR := build
 HOST_BUILD_DIR := $(BUILD_DIR)/host
 OBJS := $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))

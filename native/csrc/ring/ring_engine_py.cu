@@ -220,6 +220,10 @@ struct RingEnginePy::Impl {
     std::atomic<uint64_t> gather_host_skips{0};
     std::atomic<uint64_t> head_launches{0};
 
+    // prepare_step telemetry (get_stats).
+    std::atomic<uint64_t> prepare_ok{0}, prepare_flushed{0}, prepare_oversized{0};
+    HostWaitCounter       prepare_sync, prepare_drain;
+
     // True when the mirrored row at `table` holds the disabled sentinel.
     // A pointer outside the mirror is never treated as disabled.
     bool mirrored_row_disabled(uint64_t table) const {
@@ -719,8 +723,9 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     // net starts firing.
     if (step_total_bytes > effective_cap || num_hooks > tcap) {
         cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
-        cudaStreamSynchronize(ms);
-        drain.force_flush_and_wait();
+        impl_->prepare_sync.measure([&] { return cudaStreamSynchronize(ms); });
+        impl_->prepare_drain.measure([&] { drain.force_flush_and_wait(); });
+        impl_->prepare_oversized.fetch_add(1, std::memory_order_relaxed);
         return STEP_OVERSIZED;
     }
 
@@ -730,15 +735,17 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
 
     if (step_total_bytes <= payload_avail && num_hooks <= task_avail) {
         if (reserve) drain.reserve(step_total_bytes, num_hooks);
+        impl_->prepare_ok.fetch_add(1, std::memory_order_relaxed);
         return STEP_RING_OK;  // fast path -- no CUDA or thread interaction
     }
 
     // Either payload or task ring full from prior steps.  Sync main
     // stream so all producer kernels finish writing, then flush.
     cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
-    cudaStreamSynchronize(ms);
-    drain.force_flush_and_wait();
+    impl_->prepare_sync.measure([&] { return cudaStreamSynchronize(ms); });
+    impl_->prepare_drain.measure([&] { drain.force_flush_and_wait(); });
     if (reserve) drain.reserve(step_total_bytes, num_hooks);
+    impl_->prepare_flushed.fetch_add(1, std::memory_order_relaxed);
     return STEP_RING_FLUSHED;
 }
 
@@ -1354,6 +1361,49 @@ void RingEnginePy::_test_force_apply_error(int code) {
 
 bool RingEnginePy::_test_applied_current(uint64_t graph) const {
     return impl_->toggle.applied_current(graph);
+}
+
+RingFlushStats RingEnginePy::get_stats() const {
+    refuse_on_record_ring(impl_->record_mode, "legacy ring telemetry");
+    RingFlushStats st{};
+    auto& drain = impl_->engine.drain_thread();
+    st.cpu_payload_head           = drain.cpu_payload_head();
+    st.cpu_payload_tail_committed = drain.cpu_payload_tail_committed();
+    st.cpu_task_head              = drain.cpu_task_head();
+    st.cpu_task_tail_committed    = drain.cpu_task_tail_committed();
+    st.prepare_ok_calls        = impl_->prepare_ok.load(std::memory_order_relaxed);
+    st.prepare_flushed_calls   = impl_->prepare_flushed.load(std::memory_order_relaxed);
+    st.prepare_oversized_calls = impl_->prepare_oversized.load(std::memory_order_relaxed);
+    const auto sync = impl_->prepare_sync.snapshot();
+    st.prepare_sync_calls = sync.calls;
+    st.prepare_sync_ns = sync.ns;
+    st.prepare_sync_errors = sync.errors;
+    const auto flush = impl_->prepare_drain.snapshot();
+    st.prepare_drain_calls = flush.calls;
+    st.prepare_drain_ns = flush.ns;
+    st.prepare_drain_errors = flush.errors;
+    const auto toggle = impl_->toggle.replay_wait_stats();
+    st.toggle_wait_calls = toggle.calls;
+    st.toggle_wait_ns = toggle.ns;
+    st.toggle_wait_errors = toggle.errors;
+    const auto& pipeline = drain.telemetry();
+    const auto staging = pipeline.staging_wait.snapshot();
+    st.staging_wait_calls = staging.calls;
+    st.staging_wait_ns = staging.ns;
+    st.staging_wait_errors = staging.errors;
+    st.ready_commit_tasks = pipeline.ready_commit_tasks.load(std::memory_order_relaxed);
+    st.ready_commit_us = pipeline.ready_commit_us.load(std::memory_order_relaxed);
+    st.ready_commit_invalid = pipeline.ready_commit_invalid.load(std::memory_order_relaxed);
+    st.d2h_copy_errors = pipeline.d2h_copy_errors.load(std::memory_order_relaxed);
+    st.d2h_sync_errors = pipeline.d2h_sync_errors.load(std::memory_order_relaxed);
+    if (const auto* p2p = impl_->engine.p2p_thread()) {
+        const auto& copy = p2p->copy_telemetry();
+        const auto elapsed = copy.elapsed.snapshot();
+        st.pageable_copy_calls = elapsed.calls;
+        st.pageable_copy_ns = elapsed.ns;
+        st.pageable_copy_bytes = copy.bytes.load(std::memory_order_relaxed);
+    }
+    return st;
 }
 
 bool RingEnginePy::request_flush() {

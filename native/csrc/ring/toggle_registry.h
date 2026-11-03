@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include "host_wait_counter.h"
 #include "toggle_device.h"
 
 #include <cstdint>
@@ -72,6 +73,9 @@ public:
     // pre_apply_sync_).  Off by default.
     void set_pre_apply_sync(bool enabled);
     bool pre_apply_sync() const;
+    // Host time spent in the optional pre-apply wait (cumulative; clear()
+    // does not reset it).
+    HostWaitSnapshot replay_wait_stats() const { return replay_wait_.snapshot(); }
     void clear();
 
     // -- device-side toggle (toggle_device.h) --------------------------------
@@ -178,6 +182,7 @@ private:
     std::set<cudaGraphNode_t>                              dev_nodes_;
     std::set<cudaGraphExec_t>                              dev_uploaded_;
     mutable std::mutex                                     mu_;
+    HostWaitCounter                                        replay_wait_;
 };
 
 }  // namespace ring_py

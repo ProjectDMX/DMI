@@ -9,6 +9,7 @@
 #include "drain_thread.h"
 #include "drain_task.h"
 #include "ring_config.h"
+#include "pipeline_telemetry.h"
 #include "record_consumer.h"
 #include "tensor_meta.h"
 
@@ -119,7 +120,10 @@ public:
     bool wait_until_processed_until(uint64_t target,
                                     std::chrono::steady_clock::time_point deadline);
 
+    const PageableCopyTelemetry& copy_telemetry() const { return copy_telemetry_; }
+
 private:
+    PageableCopyTelemetry    copy_telemetry_;
     DrainThread&             drain_;
     ring_py::TensorMetaFifo& fifo_;
     RingConfig               cfg_;

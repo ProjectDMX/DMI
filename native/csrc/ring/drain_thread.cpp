@@ -416,7 +416,8 @@ void DrainThread::do_full_flush() {
         }
         {
             std::unique_lock<std::mutex> lk(staging_mu_);
-            staging_cv_.wait(lk, [&] { return staging_.free_bytes() >= flush_bytes; });
+            telemetry_.wait_for_space(staging_cv_, lk,
+                [&] { return staging_.free_bytes() >= flush_bytes; });
         }
         enqueue_d2h(flush_bytes);
         sync_stream();
@@ -465,7 +466,8 @@ void DrainThread::flush_allowed() {
         }
         {
             std::unique_lock<std::mutex> lk(staging_mu_);
-            staging_cv_.wait(lk, [&] { return staging_.free_bytes() >= flush_bytes; });
+            telemetry_.wait_for_space(staging_cv_, lk,
+                [&] { return staging_.free_bytes() >= flush_bytes; });
         }
         enqueue_d2h(flush_bytes);
         sync_stream();
@@ -597,7 +599,7 @@ void DrainThread::loop() {
             try {
                 {
                     std::unique_lock<std::mutex> lk(staging_mu_);
-                    staging_cv_.wait(lk, [&] {
+                    telemetry_.wait_for_space(staging_cv_, lk, [&] {
                         return staging_.free_bytes() >= flush_bytes;
                     });
                 }
@@ -749,8 +751,10 @@ void DrainThread::flush_state_update(uint64_t flush_count, uint64_t flush_bytes)
 }
 
 void DrainThread::sync_stream() {
-    throw_cuda_failure("cudaStreamSynchronize",
-                       cudaStreamSynchronize(stream_));
+    const cudaError_t synced = cudaStreamSynchronize(stream_);
+    if (synced != cudaSuccess)
+        telemetry_.d2h_sync_errors.fetch_add(1, std::memory_order_relaxed);
+    throw_cuda_failure("cudaStreamSynchronize", synced);
 }
 
 // ---------------------------------------------------------------------------
@@ -776,6 +780,8 @@ void DrainThread::enqueue_d2h(uint64_t flush_bytes) {
         cudaError_t err = cudaMemcpyAsync(staging_.base() + stg_cursor,
                         ring_.payload_buf + gpu_cursor,
                         chunk, cudaMemcpyDeviceToHost, stream_);
+        if (err != cudaSuccess)
+            telemetry_.d2h_copy_errors.fetch_add(1, std::memory_order_relaxed);
         throw_cuda_failure("cudaMemcpyAsync", err);
         RING_DBG("[enqueue_d2h] chunk=%d enqueued OK\n", chunk_idx);
 
@@ -793,6 +799,9 @@ void DrainThread::enqueue_d2h(uint64_t flush_bytes) {
 void DrainThread::submit_to_p2p(uint64_t flush_count, uint64_t flush_bytes) {
     uint64_t cumulative = 0;
     const uint64_t staging_batch_start = staging_.head();
+    // Called after the batch's D2H copy completed: the commit instant of
+    // every task in it.
+    const int64_t committed_us = steady_us(std::chrono::steady_clock::now());
 
     for (uint64_t i = 0; i < flush_count; ++i) {
         const uint64_t actual_bytes = scanned_[i];
@@ -803,6 +812,7 @@ void DrainThread::submit_to_p2p(uint64_t flush_count, uint64_t flush_bytes) {
         task.tensor_total_bytes = actual_bytes;
         task.alloc_bytes        = alloc;
         task.capture_ts_us      = scanned_ready_us_[i];
+        telemetry_.record_commit(task.capture_ts_us, committed_us);
 
         if (data_len > 0) {
             uint64_t staging_logical = staging_batch_start + cumulative;
