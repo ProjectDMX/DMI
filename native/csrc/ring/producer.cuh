@@ -28,6 +28,62 @@
 
 namespace ring {
 
+// Grid geometry for the D2D producers: one block per
+// PRODUCER_BYTES_PER_BLOCK of the bytes the launch may copy (the
+// capture-time upper bound for the prefix and chunked producers), capped at
+// PRODUCER_MAX_BLOCKS.  Host-only code (and CPU unit tests) can use these
+// helpers without a CUDA compiler.
+//
+// 16 KiB per block is four uint4 stores per thread at 256 threads; 8, 16 and
+// 32 KiB per block measured within 0.5 us of each other, and 16 KiB keeps a
+// graph captured for many rows cheap when a replay copies only a few.
+//
+// PRODUCER_MAX_BLOCKS is a bounded heuristic cap, not a residency
+// guarantee: 264 is sized for about two resident 256-thread blocks per SM on
+// 128/132-SM parts.  On smaller GPUs, or when other kernels occupy SMs, a
+// capped grid can still take more than one wave.  Correctness never depends
+// on the grid fitting in one wave: the kernels stride over the bytes they
+// actually copy, so a grid sized by the upper bound stays correct when a
+// replay copies fewer bytes, and surplus blocks only join the arrival count.
+static constexpr uint64_t PRODUCER_BYTES_PER_BLOCK = 16 * 1024;
+static constexpr uint32_t PRODUCER_MAX_BLOCKS      = 264;
+
+#if defined(__CUDACC__)
+#define RING_PRODUCER_HD __host__ __device__
+#else
+#define RING_PRODUCER_HD
+#endif
+
+// Overflow-free ceiling division: nbytes + PRODUCER_BYTES_PER_BLOCK - 1
+// would wrap for byte counts near UINT64_MAX.
+RING_PRODUCER_HD inline uint32_t producer_grid_blocks(uint64_t nbytes) {
+    if (nbytes <= PRODUCER_BYTES_PER_BLOCK) return 1;
+    const uint64_t blocks = (nbytes - 1) / PRODUCER_BYTES_PER_BLOCK + 1;
+    return blocks > PRODUCER_MAX_BLOCKS
+        ? PRODUCER_MAX_BLOCKS
+        : static_cast<uint32_t>(blocks);
+}
+
+// Grid for the chunked producers, which partition blocks evenly across
+// `nchunks` chunks and therefore need a multiple of `nchunks` blocks.  The
+// proportional grid is rounded up to that multiple while it stays within
+// PRODUCER_MAX_BLOCKS; once rounding up would pass the cap, the largest
+// multiple of `nchunks` not above the cap is used instead.  Only when
+// `nchunks` itself exceeds the cap does the grid exceed it (one block per
+// chunk is the minimum the partition needs).  `nchunks == 0` is rejected by
+// the launchers; it maps to the unchunked grid here.
+RING_PRODUCER_HD inline uint32_t producer_chunked_grid_blocks(
+    uint64_t nbytes_upper, uint32_t nchunks) {
+    const uint32_t raw = producer_grid_blocks(nbytes_upper);
+    if (nchunks <= 1) return raw;
+    if (nchunks >= PRODUCER_MAX_BLOCKS || raw <= nchunks) return nchunks;
+    const uint32_t rounded_up = ((raw - 1) / nchunks + 1) * nchunks;
+    if (rounded_up <= PRODUCER_MAX_BLOCKS) return rounded_up;
+    return (PRODUCER_MAX_BLOCKS / nchunks) * nchunks;
+}
+
+#undef RING_PRODUCER_HD
+
 // Upper bound on K (chunk count) for shared-memory sizing in the
 // chunked kernel and host-side argument validation.
 static constexpr uint32_t PRODUCER_MAX_K = 64;
@@ -42,17 +98,6 @@ static constexpr uint32_t PRODUCER_MAX_K = 64;
 namespace ring {
 
 static constexpr uint32_t PRODUCER_BLOCK_DIM = 256;
-
-// Size-tier thresholds for grid selection (bytes).
-static constexpr uint64_t TIER1_THRESHOLD =   64 * 1024;       //  64 KB
-static constexpr uint64_t TIER2_THRESHOLD =  4 * 1024 * 1024;  //   4 MB
-static constexpr uint64_t TIER3_THRESHOLD = 32 * 1024 * 1024;  //  32 MB
-
-// Block counts per tier.
-static constexpr uint32_t TIER0_BLOCKS =  1;  // <= 64 KB
-static constexpr uint32_t TIER1_BLOCKS =  4;  // <= 4 MB
-static constexpr uint32_t TIER2_BLOCKS = 16;  // <= 32 MB
-static constexpr uint32_t TIER3_BLOCKS = 64;  // > 32 MB
 
 // Record-only row packers use one block per logical output row and cap the
 // grid so a conservative upper bound cannot create an unbounded launch.

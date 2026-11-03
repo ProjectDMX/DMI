@@ -656,13 +656,6 @@ __global__ void record_producer_segmented_pack_kernel(
 // Host launchers
 // ---------------------------------------------------------------------------
 
-static inline uint32_t pick_tier_blocks(uint64_t nbytes) {
-    if      (nbytes <= TIER1_THRESHOLD) return TIER0_BLOCKS;
-    else if (nbytes <= TIER2_THRESHOLD) return TIER1_BLOCKS;
-    else if (nbytes <= TIER3_THRESHOLD) return TIER2_BLOCKS;
-    else                                return TIER3_BLOCKS;
-}
-
 void launch_producer_static(
     const RingState& ring,
     const uint8_t*   d_src,
@@ -670,7 +663,7 @@ void launch_producer_static(
     uint32_t         hook_type,
     cudaStream_t     stream)
 {
-    const uint32_t n_blocks = pick_tier_blocks(nbytes);
+    const uint32_t n_blocks = producer_grid_blocks(nbytes);
     producer_static_kernel<<<n_blocks, PRODUCER_BLOCK_DIM, 0, stream>>>(
         ring, d_src, nbytes, hook_type);
 }
@@ -684,7 +677,7 @@ void launch_producer_prefix(
     uint32_t         hook_type,
     cudaStream_t     stream)
 {
-    const uint32_t n_blocks = pick_tier_blocks(nbytes_upper);
+    const uint32_t n_blocks = producer_grid_blocks(nbytes_upper);
     producer_prefix_kernel<<<n_blocks, PRODUCER_BLOCK_DIM, 0, stream>>>(
         ring, d_src, nbytes_upper, row_count_dev_ptr, row_bytes, hook_type);
 }
@@ -698,11 +691,8 @@ void launch_producer_chunked(
     uint32_t         hook_type,
     cudaStream_t     stream)
 {
-    uint32_t n_blocks = pick_tier_blocks(nbytes_upper);
-    // Round up so n_blocks % K == 0 (clean block-to-chunk partition).
-    if (n_blocks < K) n_blocks = K;
-    const uint32_t r = n_blocks % K;
-    if (r != 0) n_blocks += (K - r);
+    // A multiple of K (clean block-to-chunk partition) within the cap.
+    const uint32_t n_blocks = producer_chunked_grid_blocks(nbytes_upper, K);
     producer_chunked_kernel<<<n_blocks, PRODUCER_BLOCK_DIM, 0, stream>>>(
         ring, d_src, nbytes_upper, chunk_bytes_dev_ptr, K, hook_type);
 }
@@ -714,7 +704,7 @@ void launch_record_producer_static(
     const int32_t*   emit_gate,
     int32_t          emit_value,
     cudaStream_t     stream) {
-    const uint32_t blocks = pick_tier_blocks(nbytes);
+    const uint32_t blocks = producer_grid_blocks(nbytes);
     record_producer_static_kernel<<<blocks, PRODUCER_BLOCK_DIM, 0, stream>>>(
         ring, d_src, nbytes, emit_gate, emit_value);
 }
@@ -732,7 +722,7 @@ void launch_record_producer_prefix(
         throw std::invalid_argument(
             "record prefix producer requires positive row bytes");
     }
-    const uint32_t blocks = pick_tier_blocks(nbytes_upper);
+    const uint32_t blocks = producer_grid_blocks(nbytes_upper);
     record_producer_prefix_kernel<<<blocks, PRODUCER_BLOCK_DIM, 0, stream>>>(
         ring, d_src, nbytes_upper, row_count_dev_ptr, row_bytes,
         emit_gate, emit_value);
@@ -752,10 +742,8 @@ void launch_record_producer_chunked(
         throw std::invalid_argument(
             "record chunked producer requires a valid evenly divided chunk count");
     }
-    uint32_t blocks = pick_tier_blocks(nbytes_upper);
-    if (blocks < chunk_count) blocks = chunk_count;
-    const uint32_t remainder = blocks % chunk_count;
-    if (remainder != 0) blocks += chunk_count - remainder;
+    const uint32_t blocks =
+        producer_chunked_grid_blocks(nbytes_upper, chunk_count);
     record_producer_chunked_kernel<<<blocks, PRODUCER_BLOCK_DIM, 0, stream>>>(
         ring, d_src, nbytes_upper, chunk_bytes_dev_ptr, chunk_count,
         emit_gate, emit_value);

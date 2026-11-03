@@ -69,7 +69,8 @@ TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer \
            $(BUILD)/test_clickhouse_record_sink
 
 .PHONY: all test_rings test_producer test_ring_engine test_null_mode \
-        test_record_consumer test_clickhouse_record_sink run clean FORCE
+        test_record_consumer test_clickhouse_record_sink run clean FORCE \
+        bench_producer_grid
 
 all: $(TARGETS)
 
@@ -124,6 +125,13 @@ test_record_consumer: $(BUILD)/test_record_consumer
 
 test_clickhouse_record_sink: $(BUILD)/test_clickhouse_record_sink
 	$(BUILD)/test_clickhouse_record_sink
+
+# Manual microbenchmark; not part of `all` or `run`.
+$(BUILD)/bench_producer_grid: bench_producer_grid.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
+	$(CUDA_NVCC) $(NVCC_FLAGS) bench_producer_grid.cu -o $@
+
+bench_producer_grid: $(BUILD)/bench_producer_grid
+	$(BUILD)/bench_producer_grid
 
 run: all
 	$(BUILD)/test_rings
