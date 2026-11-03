@@ -174,12 +174,13 @@ struct StorageServiceConfig {
   // are owed like the service's own. Live siblings -- another rank or job on this
   // node, a predecessor still closing -- are left alone, and are not owed.
   bool adopt_sibling_spools = false;
-  // While a pass found a live sibling, the loop passes over the siblings
-  // again this often, so one whose owner dies later -- a predecessor that
-  // was still inside close() when this service started, a rank that
-  // crashes while this one runs -- is adopted then, not at the next
-  // restart on the node. A live sibling costs one non-blocking lock probe
-  // per pass. 0 never looks again after the first pass.
+  // The loop passes over the siblings again this often, so one whose
+  // owner dies later -- a predecessor that was still inside close() when
+  // this service started, a rank that crashes while this one runs, or one
+  // that claimed its directory after the last pass and died -- is adopted
+  // then, not at the next restart on the node. A pass lists the parent
+  // directory and costs one non-blocking lock probe per live sibling.
+  // 0 never looks again after the first pass.
   uint64_t adoption_recheck_interval_ns = 30'000'000'000ull;
   // How long one cycle may spend adopting before it lets go of the cycle --
   // to the service's own uploads, stop() -- and carries on in the next.
@@ -579,13 +580,12 @@ class CaptureStorageService {
   bool reconcile_owed_ = false;
   // Adoption's state, guarded by cycle_mutex_: whether a look at the
   // siblings is due (from start() on), the dead ones the last look found,
-  // the one being adopted, whether the last look found a live one and when
-  // it ran (the loop looks again every adoption_recheck_interval_ns).
+  // the one being adopted, and when the last look ran (the loop looks
+  // again every adoption_recheck_interval_ns).
   bool adoption_scan_owed_ = false;
   std::deque<std::string> adoption_queue_;
   std::unique_ptr<Adoption> adopting_;
   std::set<std::string> blocked_siblings_;
-  bool live_siblings_ = false;
   uint64_t last_adoption_scan_ns_ = 0;
   // flush() calls in progress. A cycle adopting lets go of the cycle at
   // its next step while one is, so a flush never waits out a slice.
