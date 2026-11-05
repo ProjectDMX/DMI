@@ -940,6 +940,7 @@ class MonitoringEngine:
 
         ring_engine.init()
         ring_engine.start()
+        _log_ring_footprint(ring_engine)
 
         transport = _rt.RingTransport(ring_engine)
         if model_shape is not None:
@@ -1135,6 +1136,28 @@ class MonitoringEngine:
 
 # ---------------------------------------------------------------------------
 # Backend loader
+
+
+def _log_ring_footprint(ring_engine: Any) -> None:
+    """Log the device and pinned host memory a legacy ring holds.
+
+    The payload ring is allocated when the ring is built.  A serving
+    framework that sizes its KV cache from the free device memory it
+    profiles afterwards loses KV capacity byte for byte, which shows up as
+    lower throughput with no transport involvement; the log line makes that
+    visible.
+    """
+    try:
+        payload = int(ring_engine.payload_cap())
+        staging = int(ring_engine.staging_cap())
+        tasks = int(ring_engine.task_cap())
+    except Exception:  # pragma: no cover - partial native builds
+        return
+    _LOG.info(
+        "DMI legacy ring: %.1f MiB device payload ring, %.1f MiB pinned host "
+        "staging, %d task entries. Device memory allocated before a serving "
+        "framework profiles free memory reduces its KV cache by the same "
+        "amount.", payload / 2**20, staging / 2**20, tasks)
 
 
 class RingWithoutConsumerWarning(UserWarning):

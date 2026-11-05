@@ -949,6 +949,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            },
            py::arg("max_items") = 64, py::arg("timeout_ms") = 50);
 
+  // ---- RingFlushStats: host-only telemetry snapshot ----------------------
+  py::class_<ring_py::RingFlushStats>(m, "RingFlushStats")
+      .def_readonly("cpu_payload_head", &ring_py::RingFlushStats::cpu_payload_head)
+      .def_readonly("cpu_payload_tail_committed", &ring_py::RingFlushStats::cpu_payload_tail_committed)
+      .def_readonly("cpu_task_head", &ring_py::RingFlushStats::cpu_task_head)
+      .def_readonly("cpu_task_tail_committed", &ring_py::RingFlushStats::cpu_task_tail_committed)
+      .def_readonly("prepare_ok_calls", &ring_py::RingFlushStats::prepare_ok_calls)
+      .def_readonly("prepare_flushed_calls", &ring_py::RingFlushStats::prepare_flushed_calls)
+      .def_readonly("prepare_oversized_calls", &ring_py::RingFlushStats::prepare_oversized_calls)
+      .def_readonly("prepare_sync_calls", &ring_py::RingFlushStats::prepare_sync_calls)
+      .def_readonly("prepare_sync_ns", &ring_py::RingFlushStats::prepare_sync_ns)
+      .def_readonly("prepare_sync_errors", &ring_py::RingFlushStats::prepare_sync_errors)
+      .def_readonly("prepare_drain_calls", &ring_py::RingFlushStats::prepare_drain_calls)
+      .def_readonly("prepare_drain_ns", &ring_py::RingFlushStats::prepare_drain_ns)
+      .def_readonly("prepare_drain_errors", &ring_py::RingFlushStats::prepare_drain_errors)
+      .def_readonly("toggle_wait_calls", &ring_py::RingFlushStats::toggle_wait_calls)
+      .def_readonly("toggle_wait_ns", &ring_py::RingFlushStats::toggle_wait_ns)
+      .def_readonly("toggle_wait_errors", &ring_py::RingFlushStats::toggle_wait_errors)
+      .def_readonly("staging_wait_calls", &ring_py::RingFlushStats::staging_wait_calls)
+      .def_readonly("staging_wait_ns", &ring_py::RingFlushStats::staging_wait_ns)
+      .def_readonly("staging_wait_errors", &ring_py::RingFlushStats::staging_wait_errors)
+      .def_readonly("ready_commit_tasks", &ring_py::RingFlushStats::ready_commit_tasks)
+      .def_readonly("ready_commit_us", &ring_py::RingFlushStats::ready_commit_us)
+      .def_readonly("ready_commit_invalid", &ring_py::RingFlushStats::ready_commit_invalid)
+      .def_readonly("d2h_copy_errors", &ring_py::RingFlushStats::d2h_copy_errors)
+      .def_readonly("d2h_sync_errors", &ring_py::RingFlushStats::d2h_sync_errors)
+      .def_readonly("pageable_copy_calls", &ring_py::RingFlushStats::pageable_copy_calls)
+      .def_readonly("pageable_copy_ns", &ring_py::RingFlushStats::pageable_copy_ns)
+      .def_readonly("pageable_copy_bytes", &ring_py::RingFlushStats::pageable_copy_bytes);
+
   py::class_<ring_py::RingConfig>(m, "RingConfig")
       .def(py::init<>())
       .def_readwrite("task_ring_entries",         &ring_py::RingConfig::task_ring_entries)
@@ -1255,6 +1285,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("request_flush",
            &ring_py::RingEnginePy::request_flush,
+           py::call_guard<py::gil_scoped_release>())
+      .def("get_stats", &ring_py::RingEnginePy::get_stats,
            py::call_guard<py::gil_scoped_release>())
       .def_property_readonly("submit_exceptions",
            &ring_py::RingEnginePy::submit_exceptions)

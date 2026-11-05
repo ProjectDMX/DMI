@@ -104,6 +104,36 @@ struct RecordCaptureStatus {
     uint64_t max_step_wait_ns = 0;
 };
 
+// Cumulative, host-only counters of the waits and copies the legacy ring
+// already performs (get_stats()).  Reading them does no CUDA work.  Each
+// field is monotonic on its own; a snapshot is not one atomic transaction.
+//   cpu_*_head / *_tail_committed  reservation heads and drain tails
+//   prepare_{ok,flushed,oversized}_calls  prepare_step outcomes
+//   prepare_sync_*   stream synchronizations inside prepare_step
+//   prepare_drain_*  forced flushes inside prepare_step
+//   toggle_wait_*    node-toggle pre-apply waits (set_toggle_pre_apply_sync)
+//   staging_wait_*   drain waits for pinned staging space
+//   ready_commit_*   per task: first seen published -> committed after D2H
+//   d2h_*_errors     failed D2H copies / synchronizations
+//   pageable_copy_*  staging -> pageable copies in the P2P thread
+// *_ns are nanoseconds and ready_commit_us microseconds of host time.
+struct RingFlushStats {
+    uint64_t cpu_payload_head{0};
+    uint64_t cpu_payload_tail_committed{0};
+    uint64_t cpu_task_head{0};
+    uint64_t cpu_task_tail_committed{0};
+    uint64_t prepare_ok_calls{0};
+    uint64_t prepare_flushed_calls{0};
+    uint64_t prepare_oversized_calls{0};
+    uint64_t prepare_sync_calls{0}, prepare_sync_ns{0}, prepare_sync_errors{0};
+    uint64_t prepare_drain_calls{0}, prepare_drain_ns{0}, prepare_drain_errors{0};
+    uint64_t toggle_wait_calls{0}, toggle_wait_ns{0}, toggle_wait_errors{0};
+    uint64_t staging_wait_calls{0}, staging_wait_ns{0}, staging_wait_errors{0};
+    uint64_t ready_commit_tasks{0}, ready_commit_us{0}, ready_commit_invalid{0};
+    uint64_t d2h_copy_errors{0}, d2h_sync_errors{0};
+    uint64_t pageable_copy_calls{0}, pageable_copy_ns{0}, pageable_copy_bytes{0};
+};
+
 // Called by the p2p thread for each per-request tensor slice; see
 // ring/p2p_thread.h for capture_ts_us and capture_lease.
 using SubmitFn = std::function<void(
@@ -413,6 +443,9 @@ public:
     // the latest message kept, instead of vanishing.  With
     // abort-on-sink-error armed, sink_failed() turns true at the first one
     // and prepare_step() raises it.
+    // Host-only telemetry snapshot (see RingFlushStats).  Legacy rings.
+    RingFlushStats get_stats() const;
+
     uint64_t    submit_exceptions() const;
     std::string last_sink_error() const;
     void        set_abort_on_sink_error(bool enabled);

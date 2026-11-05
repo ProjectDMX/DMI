@@ -244,12 +244,8 @@ void P2PThread::process(std::vector<DrainTask>& tasks) {
         }
         uint8_t* dst = tensor.data_ptr<uint8_t>();
 
-        if (task.data_len1 > 0) {
-            std::memcpy(dst, task.data_ptr1, task.data_len1);
-        }
-        if (task.data_len2 > 0) {
-            std::memcpy(dst + task.data_len1, task.data_ptr2, task.data_len2);
-        }
+        copy_telemetry_.copy(dst, task.data_ptr1, task.data_len1,
+                             task.data_ptr2, task.data_len2);
 
         // Release staging space
         if (task.alloc_bytes > 0) {
