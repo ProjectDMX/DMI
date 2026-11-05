@@ -10,6 +10,7 @@
 #pragma once
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -53,7 +54,11 @@ enum HookType : int {
     HOOK_TYPE_ROUTER_LOGITS= 21,
     HOOK_TYPE_TOPK_IDS     = 22,
     HOOK_TYPE_TOPK_WEIGHTS = 23,
-    HOOK_TYPE_COUNT        = 24,
+    // In-graph linear projection heads: K fp32 scores per selected row of
+    // the HookPoint named by the act_name prefix (producer_head/_fused).
+    HOOK_TYPE_RESID_PRE_HEAD = 24,
+    HOOK_TYPE_FINAL_LN_HEAD  = 25,
+    HOOK_TYPE_COUNT        = 26,
 };
 
 // Hook group — which sub-block produces this tensor.
@@ -71,10 +76,12 @@ enum HookGroup : int { GROUP_ATTN = 0, GROUP_MLP = 1, GROUP_OTHER = 2 };
 //   SHAPE_ROUTER_LOGITS : [batch, q_len, num_experts]
 //   SHAPE_TOPK_IDS      : [batch, q_len, top_k]
 //   SHAPE_TOPK_WEIGHTS  : [batch, q_len, top_k]
+//   SHAPE_HEAD_SCORES   : [batch, q_len, head_slots]  (fp32 projection heads)
 enum ShapeClass : int {
     SHAPE_HIDDEN = 0, SHAPE_QKV_Q = 1, SHAPE_QKV_KV = 2, SHAPE_QKV_Z = 3,
     SHAPE_ATTN_WT = 4, SHAPE_MLP_POST = 5, SHAPE_TOKEN_IDS = 6, SHAPE_LOGITS = 7,
     SHAPE_ROUTER_LOGITS = 8, SHAPE_TOPK_IDS = 9, SHAPE_TOPK_WEIGHTS = 10,
+    SHAPE_HEAD_SCORES = 11,
 };
 
 // Pipeline-parallel stage placement.
@@ -116,6 +123,8 @@ static constexpr HookDef HOOK_DEFS[] = {
     {HOOK_TYPE_ROUTER_LOGITS,"mlp.hook_router_logits",  "router_logits",true,  GROUP_OTHER, false, SHAPE_ROUTER_LOGITS, PP_ANY },
     {HOOK_TYPE_TOPK_IDS,    "mlp.hook_topk_ids",        "topk_ids",     true,  GROUP_OTHER, false, SHAPE_TOPK_IDS, PP_ANY },
     {HOOK_TYPE_TOPK_WEIGHTS,"mlp.hook_topk_weights",    "topk_weights", true,  GROUP_OTHER, false, SHAPE_TOPK_WEIGHTS, PP_ANY },
+    {HOOK_TYPE_RESID_PRE_HEAD,"hook_resid_pre_head",    "resid_pre_head", true, GROUP_OTHER, false, SHAPE_HEAD_SCORES, PP_ANY },
+    {HOOK_TYPE_FINAL_LN_HEAD, "hook_final_ln_head",     "final_ln_head", false, GROUP_OTHER, false, SHAPE_HEAD_SCORES, PP_LAST},
 };
 static constexpr int HOOK_DEFS_COUNT = sizeof(HOOK_DEFS) / sizeof(HOOK_DEFS[0]);
 
@@ -180,6 +189,11 @@ struct RequestMeta {
     int32_t     end_token   = 0;
     int64_t     dim0_offset = 0;   // HF: batch_idx, vLLM: token offset
     int32_t     kv_offset   = 0;   // attn kv-dim start (HF dynamic cache: pad_len, else 0)
+    // Position of this request in the step's UNFILTERED request list.
+    // Position-indexed hooks (final_logits: row j of [num_all_reqs, vocab])
+    // index the tensor by it, not by the request's index in the (possibly
+    // filtered) request list.  -1 = the list is unfiltered: use the index.
+    int32_t     orig_position = -1;
 };
 
 // Per-step shared context.  Heap-allocated by push_step caller.
@@ -211,6 +225,12 @@ struct TensorMeta {
     int                      dtype        = 0;   // at::ScalarType integer value
     bool                     last_in_step = false;
     uint8_t                  flags        = 0;   // META_FLAG_* bitmask
+    // Optional request layout of an independently gathered hook.  The step
+    // keeps one StepContext for the whole forward, zero-row hooks included.
+    // nullptr inherits the step's request list; a non-null empty vector
+    // selects no request.  Identical layouts share one immutable vector
+    // within a submitted step.
+    std::shared_ptr<const std::vector<RequestMeta>> requests;
 };
 
 // Thread-safe dual FIFO for TensorMeta + StepContext.

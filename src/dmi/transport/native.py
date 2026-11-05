@@ -34,6 +34,7 @@ _RING_EXPORTS = frozenset(
         "RingEngine",
         "ring_set_active_engine",
         "ring_clear_active_engine",
+        "parse_hook_requests",
     }
 )
 _NATIVE_EXPORTS = _HOST_EXPORTS | _RING_EXPORTS

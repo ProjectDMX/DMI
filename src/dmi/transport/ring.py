@@ -78,6 +78,32 @@ try:
     ) -> None:
         return None
 
+    @torch.library.register_fake("ring::producer_gather")
+    def _ring_producer_gather_fake(
+        ring_payload: torch.Tensor, tensor: torch.Tensor,
+        seg_table: torch.Tensor, row_bytes: int,
+        hook_type: int, hook_id: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("ring::producer_head")
+    def _ring_producer_head_fake(
+        ring_payload: torch.Tensor, tensor: torch.Tensor,
+        seg_table: torch.Tensor, arena: torch.Tensor, K: int,
+        hook_type: int, hook_id: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("ring::producer_fused")
+    def _ring_producer_fused_fake(
+        ring_payload: torch.Tensor, tensor: torch.Tensor,
+        gather_table: Optional[torch.Tensor], row_bytes: int,
+        head_table: Optional[torch.Tensor],
+        arena: torch.Tensor, acc: torch.Tensor, K: int, weight_bf16: int,
+        hook_type: int, hook_id: int, head_hook_type: int,
+    ) -> None:
+        return None
+
     @torch.library.register_fake("ring::record_producer")
     def _record_producer_fake(
         ring_payload: torch.Tensor,
@@ -222,6 +248,11 @@ class RingTransport:
         self._current_token_ranges: Optional[List[Tuple[int, int]]] = None
         self._current_dim0_offsets: Optional[List[int]] = None
         self._current_kv_offsets: Optional[List[int]] = None
+        self._current_orig_positions: Optional[List[int]] = None
+        # Per-HookPoint request-row plans (dmi.hook_rows) for this step,
+        # keyed by (hook_type, layer_no); None = every hook uses the step
+        # layout.
+        self._current_hook_rows: Optional[dict] = None
 
         # When True: meta pushes are skipped so the FIFO stays empty.
         # Producer kernel still fires (for CUDA graph capture) but as no-ops.
@@ -265,6 +296,11 @@ class RingTransport:
         # the full active set fires).  Default True so a caller that only
         # replays toggled graphs keeps gating.
         self._gated_step: bool = True
+        # Opt-in integration guarantee: every producer reads a per-HookPoint
+        # row table whose disabled marker (-1) gates eager and partial-graph
+        # execution as well as toggled graphs.  The per-step spec set then
+        # follows the toggle on every step.
+        self._prefill_table_gate: bool = False
 
         # Hook selection preset name (e.g. "full", "hidden-states", "logits").
         # Set by the active adapter before hook installation.
@@ -300,6 +336,8 @@ class RingTransport:
         ep_rank: int = 0,
         pp_rank: int = 0,
         flattened: bool = False,
+        orig_positions: Optional[List[int]] = None,
+        hook_rows: Optional[dict] = None,
     ) -> None:
         """Called before each forward pass to provide per-step batch metadata.
 
@@ -315,6 +353,14 @@ class RingTransport:
             Static-cache batched / packed: 0 (real keys at the start).
             None = auto-generate zeros.
         flattened: False = batched [batch, q_len, ...], True = packed [total_tokens, ...].
+        orig_positions: each request's index in the step's UNFILTERED
+            request list, when the integration filtered the lists.
+            Position-indexed hooks (final_logits) select rows by it.
+            None = unfiltered.
+        hook_rows: per-HookPoint request-row plans (``dmi.hook_rows``)
+            keyed by ``(hook_type, layer_no)``.  A hook with a plan
+            publishes ``row_count`` rows and its own request layout; others
+            use the step layout.
         """
         self._current_model_id = model_id
         self._current_tp_rank = tp_rank
@@ -332,6 +378,8 @@ class RingTransport:
             kv_offsets if kv_offsets is not None
             else [0] * len(req_ids)
         )
+        self._current_orig_positions = orig_positions
+        self._current_hook_rows = hook_rows
 
     def set_model_cfg(self, cfg: ModelShapeConfig) -> None:
         """Set the model shape config for analytical shape computation."""
@@ -355,7 +403,8 @@ class RingTransport:
         publication THIS step: ``effective_specs`` on a gated step, the full
         active set on an ungated (eager or prefill) step.  Identical when the
         toggle is inactive."""
-        if getattr(self, "_gated_step", True):
+        if (getattr(self, "_gated_step", True)
+                or getattr(self, "_prefill_table_gate", False)):
             return self.effective_specs
         return self._active_specs
 
@@ -368,10 +417,23 @@ class RingTransport:
         active set fires)."""
         self._gated_step = bool(gated)
 
+    def set_prefill_table_gate(self, enabled: bool) -> None:
+        """Declare (or withdraw) the per-HookPoint table-gate guarantee.
+
+        An integration enables this only after every installed producer
+        reads its own row table (``dmi.hook_rows.configure_hook_gather``):
+        a disabled table row (``-1``) then gates eager and partial-graph
+        producers too, so the per-step spec set follows the toggle on every
+        step."""
+        self._prefill_table_gate = bool(enabled)
+
     def gated_step_requires_registry(self) -> bool:
         """True when this step's producers must all be toggle-managed, i.e.
-        a graph excluded from the registry must not replay."""
-        return bool(getattr(self, "_gated_step", True))
+        a graph excluded from the registry must not replay.  With the
+        per-HookPoint table gate armed, the -1 table rows gate such graphs'
+        producers, so they may replay on any step."""
+        return (bool(getattr(self, "_gated_step", True))
+                and not getattr(self, "_prefill_table_gate", False))
 
     def _toggle_ctrl(self) -> "NodeToggleController":
         if self._toggle is None:
@@ -447,10 +509,14 @@ class RingTransport:
         flags = []
         # The per-step spec set: the metadata published here, the device
         # node state and the capacity reservation stay in lockstep.
+        hook_rows = getattr(self, "_current_hook_rows", None) or {}
         for spec in self.specs_for_step():
             spec_q_len = (actual_q_len if actual_q_len is not None
                           and spec.dim0_is_actual_tokens
                           else q_len)
+            rows = hook_rows.get((spec.hook_type, spec.layer_no))
+            if rows is not None:
+                spec_q_len = rows.row_count
             shape = compute_hook_shape(
                 spec.hook_type, self._model_cfg, batch, spec_q_len, kv_dim,
                 logits_to_keep=logits_to_keep,
@@ -470,6 +536,14 @@ class RingTransport:
             flags.append(1 if spec.allow_token_cnt_mismatch else 0)
 
         if hook_types:
+            extra = {}
+            orig_positions = getattr(self, "_current_orig_positions", None)
+            if orig_positions is not None:
+                extra["orig_positions"] = list(orig_positions)
+            if hook_rows:
+                extra["hook_requests"] = self._hook_request_layouts(
+                    hook_types, layer_nos, hook_rows)
+            # One submission keeps one step context for the whole forward.
             self._ring_engine.push_all_metas(
                 hook_types, layer_nos, shapes, dtypes, flags,
                 self._current_model_id,
@@ -482,7 +556,36 @@ class RingTransport:
                 list(self._current_token_ranges),
                 list(self._current_dim0_offsets),
                 list(self._current_kv_offsets) if self._current_kv_offsets else [],
+                **extra,
             )
+
+    def _hook_request_layouts(self, hook_types, layer_nos, hook_rows):
+        """Per-hook request layouts for push_all_metas, in metadata order.
+
+        Equal plans (the same object) share one layout object, which the
+        native side parses once per step.  Array-backed plans hand over
+        int64 arrays instead of one Python tuple per row.
+        """
+        arrays = getattr(self, "_hook_request_arrays", None)
+        if arrays is None:
+            probe = getattr(self._ring_engine, "supports_hook_request_arrays", None)
+            arrays = self._hook_request_arrays = bool(probe is not None and probe())
+        layouts = []
+        shared = {}
+        for key in zip(hook_types, layer_nos):
+            rows = hook_rows.get(key)
+            if rows is None:
+                layouts.append(None)
+                continue
+            identity = id(rows)
+            if identity not in shared:
+                build = getattr(rows, "layout_arrays" if arrays else "layout", None)
+                shared[identity] = build() if build is not None else [
+                    (rid, tr[0], tr[1], off, 0, pos)
+                    for rid, tr, off, pos in zip(rows.req_ids, rows.token_ranges,
+                                                 rows.offsets, rows.orig_positions)]
+            layouts.append(shared[identity])
+        return layouts
 
     def submit_cpu_direct(self, cpu_tensor: torch.Tensor,
                           hook_type: int, hook_id: int) -> None:

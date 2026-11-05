@@ -251,7 +251,9 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
     int32_t shard_rank = resolve_shard_rank(meta.hook_type, *current_ctx_);
     bool is_attn = ring_py::is_attn_weight_matrix(meta.hook_type);
 
-    const auto& requests = current_ctx_->requests;
+    // An independently gathered hook carries its own request layout; every
+    // other hook uses the step's.
+    const auto& requests = meta.requests ? *meta.requests : current_ctx_->requests;
     bool should_clone = cfg_.clone_slices && requests.size() > 1;
 
     for (size_t j = 0; j < requests.size(); ++j) {
@@ -267,10 +269,15 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
             if (meta.hook_type == ring_py::HOOK_TYPE_FINAL_LOGITS) {
                 // Contract: vLLM compute_logits returns exactly one logit
                 // per request, flattened to [num_reqs, vocab].  The meta
-                // shape matches this (logits_to_keep=num_reqs passed from
-                // execute_model).  We index by request position j (not
-                // the token-based dim0_offset) and extract one row.
-                slice = slice_flattened(tensor, /*dim0_offset=*/j,
+                // shape matches this (logits_to_keep counts every request
+                // of the step, even when the request list was filtered).
+                // Index by the request's position in the unfiltered step
+                // (orig_position; the list index j when unfiltered), never
+                // by the token-based dim0_offset, and extract one row.
+                const int64_t row = (req.orig_position >= 0)
+                                        ? static_cast<int64_t>(req.orig_position)
+                                        : static_cast<int64_t>(j);
+                slice = slice_flattened(tensor, /*dim0_offset=*/row,
                                         /*start=*/0, /*end=*/1);
             } else {
                 slice = slice_flattened(tensor, req.dim0_offset,

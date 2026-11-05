@@ -44,7 +44,7 @@ _DECODER_NODES: tuple[ArchitectureNode, ...] = (
         id="residual",
         label="Residual stream",
         scope=SCOPE_LAYER,
-        hooks=("resid_pre", "ln1", "resid_mid", "ln2"),
+        hooks=("resid_pre", "ln1", "resid_mid", "ln2", "resid_pre_head"),
     ),
     ArchitectureNode(
         id="attention",
@@ -68,7 +68,7 @@ _DECODER_NODES: tuple[ArchitectureNode, ...] = (
         id="output",
         label="Final norm & logits",
         scope=SCOPE_GLOBAL,
-        hooks=("resid_final", "final_ln", "final_logits"),
+        hooks=("resid_final", "final_ln", "final_logits", "final_ln_head"),
     ),
 )
 

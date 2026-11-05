@@ -22,6 +22,7 @@ from .catalog import (
     PP_FIRST,
     PP_LAST,
     SHAPE_ATTN_WT,
+    SHAPE_HEAD_SCORES,
     SHAPE_HIDDEN,
     SHAPE_LOGITS,
     SHAPE_MLP_POST,
@@ -109,6 +110,18 @@ PP_FIRST_ONLY: frozenset = frozenset(
 PP_LAST_ONLY: frozenset = frozenset(
     _id for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _pp == PP_LAST
 )
+# In-graph projection head score rows (fp32 [rows, head_slots]).
+HEAD_TYPES: frozenset = frozenset(
+    _id for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS
+    if _sc == SHAPE_HEAD_SCORES
+)
+# Head hook type -> hook type of the HookPoint whose rows it scores.
+HEAD_SOURCE_TYPE: Dict[int, int] = {
+    _id: _id_by_short[_short[:-len("_head")]]
+    for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS
+    if _sc == SHAPE_HEAD_SCORES and _short.endswith("_head")
+    and _short[:-len("_head")] in _id_by_short
+}
 
 def hook_row_basis(hook_type: int) -> HookRowBasis:
     """Return the canonical row basis derived from `_HOOK_DEFS.shape_class`.
@@ -181,6 +194,7 @@ class ModelShapeConfig:
     top_k:        int = 0  # topk_ids / topk_weights final dim
     tp_size:      int = 1  # tensor parallel world size
     tp_rank:      int = 0  # this rank's TP index
+    head_slots:   int = 0  # K score slots per in-graph head node (0 = none)
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +251,9 @@ def compute_hook_shape(
 
     if hook_type in _HIDDEN_DIM_TYPES:
         return b + [q_len, cfg.hidden_dim]
+    if hook_type in HEAD_TYPES:
+        k = getattr(cfg, "head_slots", 0)
+        return (b + [q_len, k]) if k > 0 else []
     # The HOOK_TYPE_* names are bound by the globals() loop over
     # _HOOK_DEFS above, which static analysis cannot follow: hence the
     # F821 suppressions, one per line rather than one for the file, so the
@@ -297,6 +314,8 @@ _HOOK_TYPE_EXPORTS = tuple(
 )
 
 __all__ = [
+    "HEAD_SOURCE_TYPE",
+    "HEAD_TYPES",
     "HookRowBasis",
     "HookSpec",
     "ModelShapeConfig",

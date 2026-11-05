@@ -56,10 +56,18 @@ class StepContext:
     # adapter driver: a schedule with capture_prefill=False drops prefill
     # steps, capture_decode=False drops decode steps. None captures as before.
     phase:           Optional[str] = None
+    # Each request's index in the step's unfiltered request list, when the
+    # adapter filtered req_ids/token_ranges (see RingTransport); None =
+    # unfiltered.
+    orig_positions:  Optional[List[int]] = None
+    # Per-HookPoint request-row plans (dmi.hook_rows) keyed by
+    # (hook_type, layer_no).  A planned hook reserves and publishes its
+    # plan's row_count rows; None = every hook uses the step layout.
+    hook_rows:       Optional[dict] = None
 
     def transport_kwargs(self) -> dict:
         """Return kwargs accepted by ``RingTransport.set_step_context``."""
-        return dict(
+        kwargs = dict(
             model_id=self.model_id,
             req_ids=self.req_ids,
             token_ranges=self.token_ranges,
@@ -71,6 +79,11 @@ class StepContext:
             pp_rank=self.pp_rank,
             flattened=self.flattened,
         )
+        if self.orig_positions is not None:
+            kwargs["orig_positions"] = self.orig_positions
+        if self.hook_rows is not None:
+            kwargs["hook_rows"] = self.hook_rows
+        return kwargs
 
 
 __all__ = ["StepContext"]

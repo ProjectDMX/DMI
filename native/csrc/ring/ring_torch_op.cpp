@@ -21,7 +21,16 @@ static std::atomic<uint64_t> g_host_calls[HOST_HOOK_MAX] = {};
 // Producer kernels launched by the ring producer ops, eager or captured.  The
 // CUDA-graph replay guard compares it across a capture to tell a graph that
 // captured producers from one that did not (dmi.node_toggle).
+// Every producer op (static, prefix, chunked, gather, head, fused) counts
+// each kernel it launches through count_producer_launch(), once per launch: a
+// fused rows+heads node is one launch.  An op that launches without counting
+// would make a capture holding only that op look producer-free, so its graph
+// would skip the device-toggle upload and the replay guard.
 static std::atomic<uint64_t> g_producer_launches{0};
+
+static inline void count_producer_launch() {
+    g_producer_launches.fetch_add(1, std::memory_order_relaxed);
+}
 
 uint64_t ring_producer_launch_count() {
     return g_producer_launches.load(std::memory_order_relaxed);
@@ -157,7 +166,7 @@ void ring_producer_impl(
             static_cast<uint64_t>(tensor.nbytes()),
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
-        g_producer_launches.fetch_add(1, std::memory_order_relaxed);
+        count_producer_launch();
         dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
                                 static_cast<int>(hook_id), /*supported=*/true);
     }
@@ -184,7 +193,7 @@ void ring_producer_prefix_impl(
             static_cast<uint64_t>(row_bytes),
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
-        g_producer_launches.fetch_add(1, std::memory_order_relaxed);
+        count_producer_launch();
         dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
                                 static_cast<int>(hook_id), /*supported=*/true);
     }
@@ -212,11 +221,196 @@ void ring_producer_chunked_impl(
             K,
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
-        g_producer_launches.fetch_add(1, std::memory_order_relaxed);
+        count_producer_launch();
         // Not toggle-managed: fail closed if captured inside the window.
         dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
                                 static_cast<int>(hook_id), /*supported=*/false);
     }
+}
+
+// A producer row table ([n, src0, len0, ...] int64) as the kernels read it:
+// on the HookPoint tensor's device, contiguous, and holding at least its
+// segment count.  A wrong table is a caller bug: refuse it rather than skip
+// the producer, which would leave its reserved task unpublished.  The count
+// word itself is never read here (that would be a host sync per launch and
+// would bake a capture-time value into graphs); the kernels receive
+// table.numel() and bound the segments they read by the table's storage
+// (row_table.h, row_table_segment_count).
+static void check_row_table(const at::Tensor& table, const at::Tensor& tensor,
+                            const char* op) {
+    TORCH_CHECK(table.is_cuda() && table.device() == tensor.device(),
+                op, ": row table must be on the HookPoint tensor's device");
+    TORCH_CHECK(table.scalar_type() == at::kLong && table.is_contiguous(),
+                op, ": row table must be contiguous int64");
+    TORCH_CHECK(table.numel() >= 1, op, ": row table must hold a segment count");
+}
+
+// ring::producer_gather(ring_payload, x, seg_table, row_bytes, hook_type,
+//                       hook_id)
+//   Copies the row runs listed in seg_table (producer.cuh table contract),
+//   packed.  A single kernel launch, so it records its node like prefix.
+void ring_producer_gather_impl(
+    const at::Tensor& /*ring_payload*/,
+    const at::Tensor& tensor,
+    const at::Tensor& seg_table,
+    int64_t row_bytes,
+    int64_t hook_type, int64_t hook_id)
+{
+    if (!g_active_engine) { return; }
+    if (hook_type >= 0 && hook_type < HOST_HOOK_MAX)
+        g_host_calls[hook_type].fetch_add(1);
+
+    if (tensor.is_cuda() && tensor.is_contiguous() && seg_table.defined()) {
+        check_row_table(seg_table, tensor, "ring::producer_gather");
+        TORCH_CHECK(row_bytes > 0,
+                    "ring::producer_gather: row_bytes must be positive");
+        auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
+        g_active_engine->hook_no_notify_gather(
+            reinterpret_cast<uint64_t>(tensor.data_ptr()),
+            static_cast<uint64_t>(tensor.nbytes()),
+            reinterpret_cast<uint64_t>(seg_table.data_ptr()),
+            static_cast<int64_t>(seg_table.numel()),
+            static_cast<uint64_t>(row_bytes),
+            static_cast<uint32_t>(hook_type),
+            reinterpret_cast<uint64_t>(stream.stream()));
+        count_producer_launch();
+        // Without this, a gather producer captured under the toggle would
+        // fire unregistered: disabling its key could not disable its node
+        // while metadata and reservation exclude it.
+        dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
+                                static_cast<int>(hook_id), /*supported=*/true);
+    }
+}
+
+// ring::producer_head(ring_payload, x, seg_table, arena, K, hook_type, hook_id)
+//   In-graph linear heads at one HookPoint: K fp32 scores w_k . x[row] + b_k
+//   for each row seg_table selects, from the stable fp32 arena (K x hidden
+//   weights, K biases, split scratch).  Recorded as its own toggle node under
+//   (hook_type, hook_id), independent of the HookPoint's row producer.
+void ring_producer_head_impl(
+    const at::Tensor& /*ring_payload*/,
+    const at::Tensor& tensor,
+    const at::Tensor& seg_table,
+    const at::Tensor& arena,
+    int64_t K,
+    int64_t hook_type, int64_t hook_id)
+{
+    if (!g_active_engine) { return; }
+    if (hook_type >= 0 && hook_type < HOST_HOOK_MAX)
+        g_host_calls[hook_type].fetch_add(1);
+    if (!(tensor.is_cuda() && tensor.is_contiguous() && tensor.dim() >= 1)) return;
+    TORCH_CHECK(seg_table.defined(), "ring::producer_head: a row table is required");
+    check_row_table(seg_table, tensor, "ring::producer_head");
+    TORCH_CHECK(arena.defined() && arena.is_cuda() && arena.device() == tensor.device()
+                && arena.is_contiguous() && arena.scalar_type() == at::kFloat,
+                "ring::producer_head: arena must be contiguous fp32 on the "
+                "HookPoint tensor's device");
+    const auto st = tensor.scalar_type();
+    TORCH_CHECK(st == at::kBFloat16 || st == at::kFloat,
+                "ring::producer_head supports bf16 and fp32 HookPoints only");
+    TORCH_CHECK(K >= 1 && K <= static_cast<int64_t>(ring::HEAD_MAX_SLOTS),
+                "ring::producer_head: K must be in [1, HEAD_MAX_SLOTS]");
+    const int64_t hidden = tensor.size(tensor.dim() - 1);
+    TORCH_CHECK(arena.numel() == static_cast<int64_t>(ring::head_arena_floats(
+                    static_cast<uint32_t>(K), static_cast<uint32_t>(hidden))),
+                "ring::producer_head: arena must hold K*hidden weights, K "
+                "biases and the split scratch (head_arena_floats)");
+    auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
+    g_active_engine->hook_no_notify_head(
+        reinterpret_cast<uint64_t>(tensor.data_ptr()),
+        static_cast<uint64_t>(tensor.nbytes()),
+        reinterpret_cast<uint64_t>(seg_table.data_ptr()),
+        static_cast<int64_t>(seg_table.numel()),
+        static_cast<uint32_t>(hidden),
+        static_cast<uint32_t>(tensor.element_size()),
+        reinterpret_cast<uint64_t>(arena.data_ptr()),
+        static_cast<uint32_t>(K),
+        static_cast<uint32_t>(hook_type),
+        reinterpret_cast<uint64_t>(stream.stream()));
+    count_producer_launch();
+    dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
+                            static_cast<int>(hook_id), /*supported=*/true);
+}
+
+// ring::producer_fused(ring_payload, x, gather_table?, row_bytes, head_table?,
+//                      arena, acc, K, weight_bf16, hook_type, hook_id,
+//                      head_hook_type)
+//   The HookPoint's row producer AND its heads in ONE node.  Each present
+//   part has its own table and its own toggle key: (hook_type, hook_id) for
+//   the rows, (head_hook_type, hook_id) for the heads.  Both keys are
+//   registered to the same captured node, which is enabled iff either key
+//   is; each part early-exits on its own -1 row, so "metadata pushed <=>
+//   task published" still holds per key.
+//   arena: int32 [head_node_words(K, hidden, weight_bf16)];
+//   acc:   fp32 [acc_rows, HEAD_MAX_ACC], shared by all nodes.
+void ring_producer_fused_impl(
+    const at::Tensor& /*ring_payload*/,
+    const at::Tensor& tensor,
+    const c10::optional<at::Tensor>& gather_table,
+    int64_t row_bytes,
+    const c10::optional<at::Tensor>& head_table,
+    const at::Tensor& arena,
+    const at::Tensor& acc,
+    int64_t K, int64_t weight_bf16,
+    int64_t hook_type, int64_t hook_id, int64_t head_hook_type)
+{
+    if (!g_active_engine) { return; }
+    if (hook_type >= 0 && hook_type < HOST_HOOK_MAX)
+        g_host_calls[hook_type].fetch_add(1);
+    const bool g = gather_table.has_value() && gather_table->defined();
+    const bool h = head_table.has_value() && head_table->defined();
+    if (!(tensor.is_cuda() && tensor.is_contiguous() && tensor.dim() >= 1)) return;
+    if (!g && !h) return;
+    const auto st = tensor.scalar_type();
+    TORCH_CHECK(st == at::kBFloat16 || st == at::kFloat,
+                "ring::producer_fused supports bf16 and fp32 HookPoints only");
+    const int64_t hidden = tensor.size(tensor.dim() - 1);
+    if (g) {
+        check_row_table(*gather_table, tensor, "ring::producer_fused (rows)");
+        TORCH_CHECK(row_bytes == hidden * static_cast<int64_t>(tensor.element_size()),
+                    "ring::producer_fused: row_bytes must equal hidden * element size");
+        TORCH_CHECK(row_bytes % 16 == 0,
+                    "ring::producer_fused: rows must be 16-byte multiples");
+    }
+    if (h) {
+        check_row_table(*head_table, tensor, "ring::producer_fused (heads)");
+        TORCH_CHECK(K >= 1 && K <= static_cast<int64_t>(ring::HEAD_MAX_SLOTS),
+                    "ring::producer_fused: K must be in [1, HEAD_MAX_SLOTS]");
+        TORCH_CHECK(arena.defined() && arena.is_cuda()
+                    && arena.device() == tensor.device() && arena.is_contiguous()
+                    && arena.scalar_type() == at::kInt
+                    && arena.numel() == static_cast<int64_t>(ring::head_node_words(
+                           static_cast<uint32_t>(K), static_cast<uint32_t>(hidden),
+                           weight_bf16 != 0)),
+                    "ring::producer_fused: arena must be int32 "
+                    "[head_node_words(K, hidden, weight_bf16)]");
+        TORCH_CHECK(acc.defined() && acc.is_cuda() && acc.device() == tensor.device()
+                    && acc.is_contiguous()
+                    && acc.scalar_type() == at::kFloat && acc.dim() == 2
+                    && acc.size(1) == static_cast<int64_t>(ring::HEAD_MAX_ACC),
+                    "ring::producer_fused: acc must be fp32 [rows, HEAD_MAX_ACC]");
+    }
+    auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
+    g_active_engine->hook_no_notify_fused(
+        reinterpret_cast<uint64_t>(tensor.data_ptr()),
+        static_cast<uint64_t>(tensor.nbytes()),
+        static_cast<uint32_t>(hidden),
+        static_cast<uint32_t>(tensor.element_size()),
+        g ? reinterpret_cast<uint64_t>(gather_table->data_ptr()) : 0,
+        g ? static_cast<int64_t>(gather_table->numel()) : 0,
+        h ? reinterpret_cast<uint64_t>(head_table->data_ptr()) : 0,
+        h ? static_cast<int64_t>(head_table->numel()) : 0,
+        h ? reinterpret_cast<uint64_t>(arena.data_ptr()) : 0,
+        static_cast<uint32_t>(K), static_cast<uint32_t>(weight_bf16 != 0),
+        h ? reinterpret_cast<uint64_t>(acc.data_ptr()) : 0,
+        h ? static_cast<uint64_t>(acc.size(0)) : 0,
+        static_cast<uint32_t>(hook_type),
+        reinterpret_cast<uint64_t>(stream.stream()));
+    count_producer_launch();   // one node for both parts
+    if (g) dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
+                                   static_cast<int>(hook_id), /*supported=*/true);
+    if (h) dmx_record_capture_node(stream.stream(), static_cast<int>(head_hook_type),
+                                   static_cast<int>(hook_id), /*supported=*/true);
 }
 
 namespace {
@@ -419,6 +613,16 @@ TORCH_LIBRARY(ring, m) {
           "int hook_type, int hook_id) -> ()");
     m.def("producer_chunked(Tensor(a!) ring_payload, Tensor x, "
           "Tensor chunk_bytes, int hook_type, int hook_id) -> ()");
+    m.def("producer_gather(Tensor(a!) ring_payload, Tensor x, "
+          "Tensor seg_table, int row_bytes, "
+          "int hook_type, int hook_id) -> ()");
+    m.def("producer_head(Tensor(a!) ring_payload, Tensor x, "
+          "Tensor seg_table, Tensor arena, int K, "
+          "int hook_type, int hook_id) -> ()");
+    m.def("producer_fused(Tensor(a!) ring_payload, Tensor x, "
+          "Tensor? gather_table, int row_bytes, Tensor? head_table, "
+          "Tensor arena, Tensor acc, int K, int weight_bf16, "
+          "int hook_type, int hook_id, int head_hook_type) -> ()");
     m.def("record_producer(Tensor(a!) ring_payload, Tensor x, "
           "Tensor? emit_gate=None, int emit_value=0) -> ()");
     m.def("record_producer_prefix(Tensor(a!) ring_payload, Tensor x, "
@@ -438,6 +642,9 @@ TORCH_LIBRARY_IMPL(ring, CUDA, m) {
     m.impl("producer",         ring_producer_impl);
     m.impl("producer_prefix",  ring_producer_prefix_impl);
     m.impl("producer_chunked", ring_producer_chunked_impl);
+    m.impl("producer_gather",  ring_producer_gather_impl);
+    m.impl("producer_head",    ring_producer_head_impl);
+    m.impl("producer_fused",   ring_producer_fused_impl);
     m.impl("record_producer", ring_record_producer_impl);
     m.impl("record_producer_prefix", ring_record_producer_prefix_impl);
     m.impl("record_producer_chunked", ring_record_producer_chunked_impl);

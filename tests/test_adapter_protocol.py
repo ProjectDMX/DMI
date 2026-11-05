@@ -494,3 +494,21 @@ def test_plan_step_needs_no_transport():
     ctx = dataclasses.replace(_make_ctx(), q_len=2, batch=0, flattened=True)
     plan = BackendAdapter.plan_step(adaptor, ctx)
     assert (plan.total_bytes, plan.hook_count, plan.needs_eager) == (64, 1, False)
+
+
+def test_replace_active_specs_keeps_the_transport_in_sync():
+    from types import SimpleNamespace
+
+    adaptor = _make_adaptor(0)
+    engine = adaptor.engine
+    hook_a, hook_b = object(), object()
+    first = [SimpleNamespace(module=hook_a, hook_type=0, layer_no=0),
+             SimpleNamespace(module=hook_b, hook_type=0, layer_no=1)]
+    adaptor.active_specs = list(first)
+    head = SimpleNamespace(module=hook_a, hook_type=24, layer_no=0)
+    adaptor.replace_active_specs([first[0], head, first[1]])
+    assert adaptor.active_specs == [first[0], head, first[1]]
+    assert engine._ring_transport._active_specs is adaptor.active_specs
+    with pytest.raises(ValueError, match="installed HookPoints"):
+        adaptor.replace_active_specs([SimpleNamespace(module=object(), hook_type=0, layer_no=2)])
+    assert engine._ring_transport._active_specs is adaptor.active_specs

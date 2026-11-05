@@ -487,6 +487,22 @@ class BackendAdapter(abc.ABC):
     def close(self) -> None:
         self.engine.close()
 
+    def replace_active_specs(self, specs: List[HookSpec]) -> None:
+        """Replace the attached spec list, keeping the transport in sync.
+
+        For integrations that add specs over HookPoints already installed by
+        ``attach_model`` -- the in-graph head spec of a HookPoint
+        (``dmi.hook_rows.configure_hook_heads``) is inserted right after the
+        HookPoint's own spec, because the fused node launches the heads after
+        the rows and metadata order must equal launch order.  Every spec must
+        name a HookPoint of the current list; call before graph capture."""
+        installed = {id(spec.module) for spec in self.active_specs}
+        specs = list(specs)
+        if any(id(spec.module) not in installed for spec in specs):
+            raise ValueError("replacement specs must name installed HookPoints")
+        self.active_specs = specs
+        self.transport._active_specs = specs
+
     def plan_step(self, ctx: StepContext) -> StepPlan:
         """Build a side-effect-free reservation plan for one step.
 
@@ -517,6 +533,7 @@ class BackendAdapter(abc.ABC):
         transport = getattr(self, "transport", None)
         if getattr(transport, "toggle_gate_active", False) is True:
             specs = transport.specs_for_step()
+        hook_rows = getattr(ctx, "hook_rows", None) or {}
         for spec in specs:
             # When the adapter has populated actual_q_len AND the spec is
             # prefix-strip-eligible, size the byte budget for the unpadded
@@ -525,6 +542,10 @@ class BackendAdapter(abc.ABC):
             spec_q_len = (ctx.actual_q_len if ctx.actual_q_len is not None
                           and spec.dim0_is_actual_tokens
                           else ctx.q_len)
+            # A hook with a request-row plan writes exactly its plan's rows.
+            rows = hook_rows.get((spec.hook_type, spec.layer_no))
+            if rows is not None:
+                spec_q_len = rows.row_count
             shape = compute_hook_shape(
                 spec.hook_type, self.model_cfg,
                 ctx.batch, spec_q_len, ctx.kv_dim,

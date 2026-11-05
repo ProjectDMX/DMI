@@ -1,7 +1,8 @@
 // CPU-only stand-in for the CUDA runtime API used by the host half of
-// ring/toggle_registry.cu.  No CUDA library is linked or initialized: each
-// call records what a real exec would hold so tests can compare the
-// registry's view with the exec's actual node state.
+// ring/toggle_registry.cu and by ring/ring_torch_op.cpp's producer ops.  No
+// CUDA library is linked or initialized: each call records what a real exec
+// would hold so tests can compare the registry's view with the exec's actual
+// node state.
 #pragma once
 #include <cstdint>
 #include <cstdlib>
@@ -17,6 +18,12 @@ using cudaStream_t = void*;
 using cudaEvent_t = void*;
 using cudaStreamCaptureStatus = int;
 constexpr int cudaSuccess = 0;
+constexpr int cudaErrorUnknown = 999;
+constexpr cudaStreamCaptureStatus cudaStreamCaptureStatusNone = 0;
+constexpr cudaStreamCaptureStatus cudaStreamCaptureStatusActive = 1;
+using cudaGraphNodeType = int;
+constexpr cudaGraphNodeType cudaGraphNodeTypeKernel = 0;
+constexpr cudaGraphNodeType cudaGraphNodeTypeMemcpy = 1;
 constexpr unsigned cudaStreamNonBlocking = 1;
 constexpr unsigned cudaEventDisableTiming = 2;
 
@@ -41,9 +48,30 @@ inline int cudaGraphNodeSetEnabled(cudaGraphExec_t ex, cudaGraphNode_t node,
                   reinterpret_cast<uint64_t>(node)}] = on != 0;
     return 0;
 }
-inline int cudaStreamGetCaptureInfo(cudaStream_t, cudaStreamCaptureStatus*,
-                                    unsigned long long*, cudaGraph_t*,
-                                    const cudaGraphNode_t**, size_t*) {
+// Stream capture as the producer ops observe it.  fake_capture_graph != null
+// means "the stream is capturing into that graph"; every query then reports
+// one tail dependency, a fresh kernel node (fake_tail_type says otherwise).
+inline cudaGraph_t fake_capture_graph = nullptr;
+inline cudaGraphNodeType fake_tail_type = cudaGraphNodeTypeKernel;
+inline uintptr_t fake_next_node = 0x1000;
+inline cudaGraphNode_t fake_tail_node = nullptr;
+inline int cudaStreamGetCaptureInfo(cudaStream_t, cudaStreamCaptureStatus* st,
+                                    unsigned long long* id, cudaGraph_t* g,
+                                    const cudaGraphNode_t** deps, size_t* nd) {
+    if (fake_capture_graph == nullptr) {
+        if (st) *st = cudaStreamCaptureStatusNone;
+        return 0;
+    }
+    fake_tail_node = reinterpret_cast<cudaGraphNode_t>(fake_next_node++);
+    if (st) *st = cudaStreamCaptureStatusActive;
+    if (id) *id = 1;
+    if (g) *g = fake_capture_graph;
+    if (deps) *deps = &fake_tail_node;
+    if (nd) *nd = 1;
+    return 0;
+}
+inline int cudaGraphNodeGetType(cudaGraphNode_t, cudaGraphNodeType* type) {
+    *type = fake_tail_type;
     return 0;
 }
 inline int cudaMallocManaged(void** p, size_t n) {

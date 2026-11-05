@@ -6,8 +6,12 @@
 #include <torch/extension.h>
 #endif
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <chrono>
+#include <climits>
+#include <memory>
+#include <unordered_map>
 #include <cmath>
 #include <limits>
 #include <type_traits>
@@ -256,6 +260,83 @@ std::vector<ring::RecordDescriptor> CopyRecordDescriptors(
     descriptors.push_back(CopyRecordDescriptor(descriptor_py, schema));
   }
   return descriptors;
+}
+#endif
+
+#ifndef DMI_HOST_ONLY
+using HookRowsPtr = std::shared_ptr<const std::vector<ring_py::RequestMeta>>;
+
+// One hook's request layout for push_all_metas.  Two encodings:
+//   * a list of (req_id, start, end, dim0_offset, kv_offset, orig_position)
+//     tuples;
+//   * a tuple of five int64 arrays (index into the step's request list,
+//     start, end, dim0_offset, orig_position), which avoids building one
+//     Python tuple per row.
+HookRowsPtr parse_hook_rows(py::handle rows_obj,
+                            const std::vector<ring_py::RequestMeta>& requests) {
+  auto parsed = std::make_shared<std::vector<ring_py::RequestMeta>>();
+  if (py::isinstance<py::tuple>(rows_obj)) {
+    auto fields = py::reinterpret_borrow<py::tuple>(rows_obj);
+    if (py::len(fields) != 5)
+      throw py::value_error("hook request arrays need five fields");
+    using I64 = py::array_t<int64_t, py::array::c_style | py::array::forcecast>;
+    I64 idx = fields[0].cast<I64>(), lo = fields[1].cast<I64>();
+    I64 hi = fields[2].cast<I64>(), off = fields[3].cast<I64>();
+    I64 pos = fields[4].cast<I64>();
+    if (idx.ndim() != 1 || lo.ndim() != 1 || hi.ndim() != 1 ||
+        off.ndim() != 1 || pos.ndim() != 1)
+      throw py::value_error("hook request arrays must be one-dimensional");
+    const py::ssize_t n = idx.shape(0);
+    if (lo.shape(0) != n || hi.shape(0) != n || off.shape(0) != n ||
+        pos.shape(0) != n)
+      throw py::value_error("hook request arrays differ in length");
+    auto pi = idx.unchecked<1>();
+    auto pl = lo.unchecked<1>();
+    auto ph = hi.unchecked<1>();
+    auto po = off.unchecked<1>();
+    auto pp = pos.unchecked<1>();
+    const int64_t n_req = static_cast<int64_t>(requests.size());
+    auto int32_field = [](int64_t v) {
+      if (v < INT32_MIN || v > INT32_MAX)
+        throw py::value_error("hook request field exceeds int32");
+      return static_cast<int32_t>(v);
+    };
+    parsed->reserve(static_cast<size_t>(n));
+    for (py::ssize_t i = 0; i < n; ++i) {
+      const int64_t r = pi(i);
+      if (r < 0 || r >= n_req)
+        throw py::value_error("hook request index outside the step's requests");
+      ring_py::RequestMeta rm;
+      rm.req_id = requests[static_cast<size_t>(r)].req_id;
+      rm.start_token = int32_field(pl(i));
+      rm.end_token = int32_field(ph(i));
+      rm.dim0_offset = po(i);
+      rm.kv_offset = 0;
+      rm.orig_position = int32_field(pp(i));
+      if (rm.end_token < rm.start_token || rm.dim0_offset < 0)
+        throw py::value_error("invalid hook request range or offset");
+      parsed->push_back(std::move(rm));
+    }
+    return parsed;
+  }
+  auto rows = rows_obj.cast<py::list>();
+  parsed->reserve(py::len(rows));
+  for (auto row : rows) {
+    auto fields = row.cast<py::tuple>();
+    if (py::len(fields) != 6)
+      throw py::value_error("hook request row needs six fields");
+    ring_py::RequestMeta rm;
+    rm.req_id = fields[0].cast<std::string>();
+    rm.start_token = fields[1].cast<int32_t>();
+    rm.end_token = fields[2].cast<int32_t>();
+    rm.dim0_offset = fields[3].cast<int64_t>();
+    rm.kv_offset = fields[4].cast<int32_t>();
+    rm.orig_position = fields[5].cast<int32_t>();
+    if (rm.end_token < rm.start_token || rm.dim0_offset < 0)
+      throw py::value_error("invalid hook request range or offset");
+    parsed->push_back(std::move(rm));
+  }
+  return parsed;
 }
 #endif
 
@@ -895,9 +976,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               py::list req_ids_py,
               py::list token_ranges_py,
               py::list dim0_offsets_py,
-              py::list kv_offsets_py) {
+              py::list kv_offsets_py,
+              py::list orig_positions_py,
+              py::list hook_requests_py) {
+               const size_t n_hooks = static_cast<size_t>(py::len(hook_types_py));
+               if (py::len(hook_requests_py) &&
+                   static_cast<size_t>(py::len(hook_requests_py)) != n_hooks)
+                   throw py::value_error("hook_requests must have one entry per hook");
                // Build step context (heap-allocated, ownership to FIFO/p2p)
-               auto* ctx = new ring_py::StepContext();
+               auto owned_ctx = std::make_unique<ring_py::StepContext>();
+               auto* ctx = owned_ctx.get();
                ctx->model_id  = model_id;
                ctx->tp_rank   = tp_rank;
                ctx->dp_rank   = dp_rank;
@@ -914,12 +1002,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                    rm.dim0_offset = py::cast<int64_t>(dim0_offsets_py[i]);
                    if (i < static_cast<size_t>(py::len(kv_offsets_py)))
                        rm.kv_offset = py::cast<int32_t>(kv_offsets_py[i]);
+                   // Only when the integration filtered the request list
+                   // (empty list = unfiltered; -1 = use the list index).
+                   if (i < static_cast<size_t>(py::len(orig_positions_py)))
+                       rm.orig_position = py::cast<int32_t>(orig_positions_py[i]);
                    ctx->requests.push_back(std::move(rm));
                }
                // Build per-hook metas
                size_t n = static_cast<size_t>(py::len(hook_types_py));
                std::vector<ring_py::TensorMeta> metas;
                metas.reserve(n);
+               // Equal per-hook layouts are passed as the same Python object:
+               // parse each once while the arguments keep it alive, and never
+               // retain Python objects in the FIFO.
+               std::unordered_map<PyObject*, HookRowsPtr> layouts;
                for (size_t i = 0; i < n; ++i) {
                    ring_py::TensorMeta meta;
                    meta.hook_type    = py::cast<int>(hook_types_py[i]);
@@ -930,11 +1026,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                    py::list shape    = shapes_py[i].cast<py::list>();
                    for (auto d : shape)
                        meta.shape.push_back(py::cast<int64_t>(d));
+                   if (py::len(hook_requests_py) && !hook_requests_py[i].is_none()) {
+                       py::handle rows = hook_requests_py[i];
+                       auto found = layouts.find(rows.ptr());
+                       if (found != layouts.end()) {
+                           meta.requests = found->second;
+                       } else {
+                           auto parsed = parse_hook_rows(rows, ctx->requests);
+                           meta.requests = parsed;
+                           layouts.emplace(rows.ptr(), std::move(parsed));
+                       }
+                   }
                    metas.push_back(std::move(meta));
                }
                // Release GIL, push context + metas in single lock
                py::gil_scoped_release release;
-               self.push_step(ctx, metas);
+               self.push_step(owned_ctx.release(), metas);
            },
            py::arg("hook_types"), py::arg("layer_nos"),
            py::arg("shapes"), py::arg("dtypes"), py::arg("flags"),
@@ -944,7 +1051,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("flattened"),
            py::arg("req_ids"), py::arg("token_ranges"),
            py::arg("dim0_offsets"),
-           py::arg("kv_offsets") = py::list())
+           py::arg("kv_offsets") = py::list(),
+           py::arg("orig_positions") = py::list(),
+           py::arg("hook_requests") = py::list())
+      .def_static("supports_hook_request_arrays", []() { return true; })
+      .def("set_gather_host_mirror",
+           &ring_py::RingEnginePy::set_gather_host_mirror,
+           py::arg("dev_base"), py::arg("host_base"), py::arg("row_bytes"),
+           py::arg("rows"))
+      .def("gather_host_skips", &ring_py::RingEnginePy::gather_host_skips)
+      .def("head_launches", &ring_py::RingEnginePy::head_launches)
       .def("set_null_mode",
            &ring_py::RingEnginePy::set_null_mode,
            py::arg("enabled"),
@@ -1021,5 +1137,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("ring_clear_active_engine",
         []() { ring_set_active_engine(nullptr); });
+
+  // CPU-only view of push_all_metas' per-hook layout parsing: returns the
+  // parsed (req_id, start, end, dim0_offset, kv_offset, orig_position) rows.
+  m.def("parse_hook_requests",
+        [](py::list req_ids_py, py::handle rows) {
+          std::vector<ring_py::RequestMeta> requests;
+          requests.reserve(py::len(req_ids_py));
+          for (auto rid : req_ids_py) {
+            ring_py::RequestMeta rm;
+            rm.req_id = rid.cast<std::string>();
+            requests.push_back(std::move(rm));
+          }
+          py::list out;
+          const HookRowsPtr parsed = parse_hook_rows(rows, requests);
+          for (const auto& rm : *parsed) {
+            out.append(py::make_tuple(rm.req_id, rm.start_token, rm.end_token,
+                                      rm.dim0_offset, rm.kv_offset,
+                                      rm.orig_position));
+          }
+          return out;
+        },
+        py::arg("req_ids"), py::arg("rows"));
 #endif
 }
