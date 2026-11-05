@@ -52,6 +52,10 @@ public:
 // executable; the extension supplies their real definitions.
 void ring_diag_reset_host_counters() {}
 void ring_diag_print_host_counters() {}
+void ring_set_toggle_capture(bool) {}
+// The producer-launch counter lives with the producer ops in
+// ring_torch_op.cpp, which this executable does not link.
+uint64_t ring_producer_launch_count() { return 0; }
 
 #define CUDA_CHECK(expr)                                                    \
     do {                                                                    \

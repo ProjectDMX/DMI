@@ -331,6 +331,59 @@ def test_force_eager_cleared_on_normal_step_after_overflow():
     assert a.transport.force_eager is False
 
 
+@pytest.mark.parametrize("needs_eager", [False, True])
+def test_strict_fallback_rejection_precedes_metadata_and_adaptation(needs_eager):
+    """allow_eager_fallback=False: a step that needs the eager safety net
+    raises before anything is published.  An eager-only plan is refused
+    before the reservation; an oversized step after prepare_step (which
+    reserves nothing for it) but before metadata and the fallback hooks."""
+    a = _make_adaptor(prepare_result=2, step_plan=(1024, 3, needs_eager))
+    a.allow_eager_fallback = False
+    with pytest.raises(RuntimeError, match="capture eager fallback forbidden"):
+        a.before_forward(None)
+    assert a.engine._ring_engine.prepare_step_calls == (
+        [] if needs_eager else [(1024, 3)])
+    assert a.transport.set_step_context_calls == []
+    assert a.transport.pre_push_all_metas_calls == []
+    assert a.adapt_for_cpu_direct_calls == []
+    assert a.on_capacity_exceeded_calls == []
+    # The step was never armed.
+    assert a.transport.capture_step is False
+    counts = a.capture_dispatch_state()
+    assert counts["allow_eager_fallback"] is False
+    assert counts["rejected_eager_steps"] == 1
+    assert counts["forced_eager_steps"] == 0
+    assert counts["oversized_steps"] == int(not needs_eager)
+    assert counts["eager_required_steps"] == int(needs_eager)
+
+
+def test_dispatch_counts_track_fallback_when_allowed():
+    a = _make_adaptor(prepare_result=2)
+    a.before_forward(None)
+    counts = a.capture_dispatch_state()
+    assert counts["allow_eager_fallback"] is True
+    assert counts["prepared_steps"] == 1
+    assert counts["oversized_steps"] == 1
+    assert counts["forced_eager_steps"] == 1
+    assert counts["rejected_eager_steps"] == 0
+
+
+def test_allow_eager_fallback_must_be_a_bool():
+    engine = FakeEngine()
+    with pytest.raises(ValueError, match="must be a bool"):
+        StubAdapterStrict(engine, "m", _make_ctx(), allow_eager_fallback=1)
+    adapter = StubAdapterStrict(engine, "m", _make_ctx(),
+                                allow_eager_fallback=False)
+    assert adapter.allow_eager_fallback is False
+
+
+class StubAdapterStrict(StubAdapter):
+    def __init__(self, engine, model_id, ctx, *, allow_eager_fallback):
+        BackendAdapter.__init__(self, engine, model_id,
+                                allow_eager_fallback=allow_eager_fallback)
+        self._ctx = ctx
+
+
 def test_n_hooks_zero_skips_prepare_step():
     """When _compute_step_plan returns (0, 0, False), prepare_step is
     skipped but set_step_context + pre_push_all_metas still run."""
@@ -424,3 +477,20 @@ def test_resolve_hook_selection_refuses_an_unknown_token_and_an_empty_selection(
     # The refusal propagates through the attach-path entry point.
     with pytest.raises(ValueError, match="Unknown hook selection"):
         selection.select_hook_specs([], "nope")
+
+
+def test_plan_step_needs_no_transport():
+    """Integrations build adapters field by field in their own tests; the
+    plan reads the toggle only through a transport that exists."""
+    import torch
+    from dmi.hooks.specs import HOOK_TYPE_RESID_PRE, HookSpec, ModelShapeConfig
+
+    adaptor = StubAdapter.__new__(StubAdapter)
+    adaptor.model_cfg = ModelShapeConfig(hidden_dim=8, num_heads=2, num_kv_heads=2,
+                                         head_dim=4, dtype=torch.float32)
+    adaptor.active_specs = [HookSpec(hook_type=HOOK_TYPE_RESID_PRE, module=None,
+                                     layer_no=0)]
+    adaptor._spec_needs_eager = lambda spec: False
+    ctx = dataclasses.replace(_make_ctx(), q_len=2, batch=0, flattened=True)
+    plan = BackendAdapter.plan_step(adaptor, ctx)
+    assert (plan.total_bytes, plan.hook_count, plan.needs_eager) == (64, 1, False)

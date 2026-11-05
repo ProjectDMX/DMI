@@ -62,14 +62,17 @@ RECORD_CONSUMER_SRC := ../../../native/csrc/ring/record_consumer.cpp
 CLICKHOUSE_RECORD_SINK_SRC := ../../../native/csrc/clickhouse_record_sink.cpp
 RING_ENGINE_CU := ../../../native/csrc/ring/ring_engine.cu
 RING_ENGINE_PY_CU := ../../../native/csrc/ring/ring_engine_py.cu
+TOGGLE_REGISTRY_CU := ../../../native/csrc/ring/toggle_registry.cu
 
 TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer \
            $(BUILD)/test_ring_engine $(BUILD)/test_null_mode \
            $(BUILD)/test_record_consumer \
-           $(BUILD)/test_clickhouse_record_sink
+           $(BUILD)/test_clickhouse_record_sink \
+           $(BUILD)/test_toggle_registry
 
 .PHONY: all test_rings test_producer test_ring_engine test_null_mode \
-        test_record_consumer test_clickhouse_record_sink run clean FORCE \
+        test_record_consumer test_clickhouse_record_sink test_toggle_registry \
+        run clean FORCE \
         bench_producer_grid
 
 all: $(TARGETS)
@@ -90,10 +93,13 @@ $(BUILD)/test_producer: test_producer.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $
 
 $(BUILD)/test_ring_engine: test_ring_engine.cu $(PRODUCER_CU) $(DRAIN_SRC) \
 		$(P2P_SRC) $(RECORD_CONSUMER_SRC) $(RING_ENGINE_CU) \
-		$(RING_ENGINE_PY_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
+		$(RING_ENGINE_PY_CU) $(TOGGLE_REGISTRY_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) $(TORCH_INCLUDE_FLAGS) $(TORCH_LIB_FLAGS) \
 		$(filter-out $(CUDA_CONFIG_STAMP),$^) $(TORCH_RPATH_FLAGS) \
 		-ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -lpthread -o $@
+
+$(BUILD)/test_toggle_registry: test_toggle_registry.cu $(TOGGLE_REGISTRY_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
+	$(CUDA_NVCC) $(NVCC_FLAGS) $(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
 
 $(BUILD)/test_null_mode: test_null_mode.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) $(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
@@ -126,6 +132,9 @@ test_record_consumer: $(BUILD)/test_record_consumer
 test_clickhouse_record_sink: $(BUILD)/test_clickhouse_record_sink
 	$(BUILD)/test_clickhouse_record_sink
 
+test_toggle_registry: $(BUILD)/test_toggle_registry
+	$(BUILD)/test_toggle_registry
+
 # Manual microbenchmark; not part of `all` or `run`.
 $(BUILD)/bench_producer_grid: bench_producer_grid.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) bench_producer_grid.cu -o $@
@@ -140,6 +149,7 @@ run: all
 	$(BUILD)/test_null_mode
 	$(BUILD)/test_record_consumer
 	$(BUILD)/test_clickhouse_record_sink
+	$(BUILD)/test_toggle_registry
 
 clean:
 	rm -rf $(BUILD)
