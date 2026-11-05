@@ -644,6 +644,208 @@ static void test_record_device_gate_rejects_without_publication() {
     CUDA_CHECK(cudaFree(device));
 }
 
+static void test_grid_geometry() {
+    banner("producer grid is proportional to bytes and capped");
+    constexpr uint64_t per_block = ring::PRODUCER_BYTES_PER_BLOCK;
+    EXPECT(ring::producer_grid_blocks(0) == 1);
+    EXPECT(ring::producer_grid_blocks(1) == 1);
+    EXPECT(ring::producer_grid_blocks(per_block) == 1);
+    EXPECT(ring::producer_grid_blocks(per_block + 1) == 2);
+    // A 1.125 MiB hook (e.g. 144 rows of 8 KiB): 72 blocks, previously 4.
+    EXPECT(ring::producer_grid_blocks(72 * per_block) == 72);
+    EXPECT(ring::producer_grid_blocks(
+               ring::PRODUCER_MAX_BLOCKS * per_block) ==
+           ring::PRODUCER_MAX_BLOCKS);
+    EXPECT(ring::producer_grid_blocks(
+               ring::PRODUCER_MAX_BLOCKS * per_block + 1) ==
+           ring::PRODUCER_MAX_BLOCKS);
+    EXPECT(ring::producer_grid_blocks(uint64_t(1) << 40) ==
+           ring::PRODUCER_MAX_BLOCKS);
+    // No wrap near the top of the range (a naive ceiling division wraps to 0).
+    EXPECT(ring::producer_grid_blocks(UINT64_MAX) == ring::PRODUCER_MAX_BLOCKS);
+    EXPECT(ring::producer_grid_blocks(UINT64_MAX - per_block + 2) ==
+           ring::PRODUCER_MAX_BLOCKS);
+    // Monotone in the byte count.
+    uint32_t previous = 0;
+    bool monotone = true;
+    for (uint64_t bytes = 0; bytes < 300 * per_block; bytes += 4093) {
+        const uint32_t blocks = ring::producer_grid_blocks(bytes);
+        monotone = monotone && blocks >= previous;
+        previous = blocks;
+    }
+    EXPECT(monotone);
+
+    // Chunked grids are a multiple of the chunk count and stay within the
+    // cap whenever the chunk count does (64 * 5 = 320 would pass 264).
+    EXPECT(ring::producer_chunked_grid_blocks(0, 3) == 3);
+    EXPECT(ring::producer_chunked_grid_blocks(4 * per_block, 64) == 64);
+    EXPECT(ring::producer_chunked_grid_blocks(70 * per_block, 64) == 128);
+    EXPECT(ring::producer_chunked_grid_blocks(
+               ring::PRODUCER_MAX_BLOCKS * per_block, 64) == 256);
+    EXPECT(ring::producer_chunked_grid_blocks(uint64_t(1) << 40, 64) == 256);
+    EXPECT(ring::producer_chunked_grid_blocks(uint64_t(1) << 40, 3) == 264);
+    EXPECT(ring::producer_chunked_grid_blocks(uint64_t(1) << 40, 1) ==
+           ring::PRODUCER_MAX_BLOCKS);
+    for (uint32_t k = 1; k <= ring::PRODUCER_MAX_K; ++k) {
+        for (uint64_t bytes : {uint64_t(0), 5 * per_block + 1,
+                               uint64_t(1) << 40}) {
+            const uint32_t blocks = ring::producer_chunked_grid_blocks(bytes, k);
+            EXPECT(blocks % k == 0);
+            EXPECT(blocks >= k);
+            EXPECT(blocks <= ring::PRODUCER_MAX_BLOCKS);
+        }
+    }
+}
+
+// Sizes chosen to land on 1 block, a partial last block, a mid-size grid,
+// exactly the cap, and past the cap (grid-stride beyond one pass).
+static const uint64_t kWideGridSizes[] = {
+    333,
+    3 * ring::PRODUCER_BYTES_PER_BLOCK + 5,
+    72 * ring::PRODUCER_BYTES_PER_BLOCK,
+    uint64_t(ring::PRODUCER_MAX_BLOCKS) * ring::PRODUCER_BYTES_PER_BLOCK,
+    uint64_t(ring::PRODUCER_MAX_BLOCKS) * ring::PRODUCER_BYTES_PER_BLOCK * 3 + 4097,
+};
+
+static void test_wide_grid_static_and_wrap() {
+    banner("static producer copies exactly on wide grids, with and without wrap");
+    constexpr uint64_t payload_bytes = 16ull * 1024 * 1024;
+    for (uint64_t size : kWideGridSizes) {
+        for (bool wrap : {false, true}) {
+            ring::AllocatedRing allocated(make_config(payload_bytes));
+            allocated.init();
+            ring::RingState& state = allocated.state();
+            // Start 1 KiB + 16 before the end so the copy crosses the wrap.
+            const uint64_t start = wrap ? payload_bytes - 1040 : 0;
+            *state.payload_head = start;
+            const std::vector<uint8_t> source =
+                pattern(size, static_cast<uint8_t>(size));
+            uint8_t* device = upload(source);
+            ring::launch_producer_static(state, device, size, 0);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            expect_publication(state, 0, size);
+            EXPECT(*state.task_head == 1);
+            EXPECT(*state.payload_head ==
+                   start + ring::align_up(size, ring::PAYLOAD_ALIGN));
+            EXPECT(*state.actual_bytes_counter == size);
+            EXPECT(read_payload(state, start, size) == source);
+            CUDA_CHECK(cudaFree(device));
+        }
+    }
+}
+
+static void test_wide_grid_prefix_selects_fewer_rows() {
+    banner("prefix grid sized by the upper bound copies only the selected rows");
+    constexpr uint64_t row_bytes = 8192;
+    constexpr uint64_t upper_rows = 512;   // 4 MiB upper bound -> capped grid
+    const std::vector<uint8_t> source = pattern(upper_rows * row_bytes, 41);
+    uint8_t* device = upload(source);
+    for (int64_t rows : {int64_t(0), int64_t(1), int64_t(3), int64_t(37),
+                         int64_t(upper_rows)}) {
+        ring::AllocatedRing allocated(make_config(8ull * 1024 * 1024));
+        allocated.init();
+        ring::RingState& state = allocated.state();
+        int64_t* row_count = upload_counts({rows});
+        ring::launch_producer_prefix(state, device, source.size(), row_count,
+                                     row_bytes, 1);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        const uint64_t expected_bytes = static_cast<uint64_t>(rows) * row_bytes;
+        expect_publication(state, 0, expected_bytes);
+        EXPECT(*state.payload_head ==
+               ring::align_up(expected_bytes, ring::PAYLOAD_ALIGN));
+        EXPECT(*state.actual_bytes_counter == expected_bytes);
+        const std::vector<uint8_t> expected(source.begin(),
+                                            source.begin() + expected_bytes);
+        EXPECT(read_payload(state, 0, expected_bytes) == expected);
+        CUDA_CHECK(cudaFree(row_count));
+    }
+    CUDA_CHECK(cudaFree(device));
+}
+
+static void test_wide_grid_chunked_partition() {
+    banner("chunked producer keeps a block-per-chunk partition on wide grids");
+    // 3 chunks of 2 MiB: 384 proportional blocks, capped at 264 (already a
+    // multiple of 3).
+    constexpr uint32_t chunks = 3;
+    constexpr uint64_t chunk_input_bytes = 2ull * 1024 * 1024;
+    const std::vector<int64_t> counts = {
+        static_cast<int64_t>(chunk_input_bytes),
+        5,
+        static_cast<int64_t>(chunk_input_bytes / 2 + 3)};
+    const std::vector<uint8_t> source = pattern(chunks * chunk_input_bytes, 77);
+    std::vector<uint8_t> expected;
+    for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+        const auto begin = source.begin() + chunk * chunk_input_bytes;
+        expected.insert(expected.end(), begin, begin + counts[chunk]);
+    }
+    for (bool record : {false, true}) {
+        ring::AllocatedRing allocated(make_config(8ull * 1024 * 1024));
+        allocated.init();
+        ring::RingState& state = allocated.state();
+        uint8_t* device = upload(source);
+        int64_t* device_counts = upload_counts(counts);
+        if (record) {
+            ring::launch_record_producer_chunked(
+                state, device, source.size(), device_counts, chunks,
+                nullptr, 0);
+        } else {
+            ring::launch_producer_chunked(state, device, source.size(),
+                                          device_counts, chunks, 2);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        expect_publication(state, 0, expected.size());
+        EXPECT(*state.actual_bytes_counter == expected.size());
+        EXPECT(read_payload(state, 0, expected.size()) == expected);
+        CUDA_CHECK(cudaFree(device_counts));
+        CUDA_CHECK(cudaFree(device));
+    }
+}
+
+static void test_mixed_grid_launches_share_arrival_counter() {
+    banner("back-to-back launches of different grid sizes publish in order");
+    constexpr uint64_t payload_bytes = 16ull * 1024 * 1024;
+    ring::AllocatedRing allocated(make_config(payload_bytes));
+    allocated.init();
+    ring::RingState& state = allocated.state();
+    // 1 block, capped grid, 7 blocks, 1 block, 72 blocks: the shared
+    // last-block-arrives counter must reset between grids of any size.
+    const std::vector<uint64_t> sizes = {
+        100,
+        uint64_t(ring::PRODUCER_MAX_BLOCKS) * ring::PRODUCER_BYTES_PER_BLOCK + 33,
+        7 * ring::PRODUCER_BYTES_PER_BLOCK,
+        16,
+        72 * ring::PRODUCER_BYTES_PER_BLOCK - 1,
+    };
+    std::vector<std::vector<uint8_t>> sources;
+    std::vector<uint8_t*> devices;
+    for (uint64_t i = 0; i < sizes.size(); ++i) {
+        sources.push_back(pattern(sizes[i], static_cast<uint8_t>(90 + i)));
+        devices.push_back(upload(sources.back()));
+        if (i % 2 == 0) {
+            ring::launch_producer_static(state, devices.back(), sizes[i], 0);
+        } else {
+            ring::launch_record_producer_static(state, devices.back(),
+                                                sizes[i], nullptr, 0);
+        }
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    uint64_t expected_head = 0;
+    uint64_t expected_actual = 0;
+    for (uint64_t sequence = 0; sequence < sizes.size(); ++sequence) {
+        expect_publication(state, sequence, sizes[sequence]);
+        EXPECT(read_payload(state, expected_head, sizes[sequence]) ==
+               sources[sequence]);
+        expected_head += ring::align_up(sizes[sequence], ring::PAYLOAD_ALIGN);
+        expected_actual += sizes[sequence];
+    }
+    EXPECT(*state.task_head == sizes.size());
+    EXPECT(*state.payload_head == expected_head);
+    EXPECT(*state.actual_bytes_counter == expected_actual);
+    for (uint8_t* device : devices) {
+        CUDA_CHECK(cudaFree(device));
+    }
+}
+
 int main() {
     setbuf(stdout, nullptr);
     ring::set_ring_null_mode(false);
@@ -662,6 +864,11 @@ int main() {
     test_record_sequence_and_segmented_pack();
     test_record_device_gate_rejects_without_publication();
     test_all_producers_handle_unaligned_addresses();
+    test_grid_geometry();
+    test_wide_grid_static_and_wrap();
+    test_wide_grid_prefix_selects_fewer_rows();
+    test_wide_grid_chunked_partition();
+    test_mixed_grid_launches_share_arrival_counter();
 
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
