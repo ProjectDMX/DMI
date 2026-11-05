@@ -22,6 +22,13 @@
 namespace ring {
 
 namespace {
+int64_t steady_us(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        t.time_since_epoch()).count();
+}
+}  // namespace
+
+namespace {
 
 static inline bool publication_try_acquire(
     const uint64_t* slot, uint64_t& acquired_word) {
@@ -113,6 +120,18 @@ void DrainThread::notify() {
         notified_ = true;
     }
     cv_.notify_one();
+}
+
+bool DrainThread::request_flush() {
+    if (!is_running()) return false;
+    {
+        std::lock_guard<std::mutex> lk(mgmt_mu_);
+        if (cpu_task_head_ <= cpu_task_tail_ ||
+            cpu_task_head_ <= async_flush_until_task_) return false;
+        async_flush_until_task_ = cpu_task_head_;
+    }
+    notify();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +380,8 @@ void DrainThread::submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes
     DrainTask task{};
     task.tensor_total_bytes = tensor_bytes;
     task.cpu_paged_tensor   = std::move(cpu_tensor);
+    // Already in host memory when handed over: host-visible as of now.
+    task.capture_ts_us      = steady_us(std::chrono::steady_clock::now());
 
     {
         std::lock_guard<std::mutex> lk(queue_mu_);
@@ -370,6 +391,7 @@ void DrainThread::submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes
         std::lock_guard<std::mutex> lk(pop_mu_);
         can_pop_count_ += 1;
     }
+    tasks_enqueued_.fetch_add(1, std::memory_order_release);
     pop_cv_.notify_one();
 }
 
@@ -641,13 +663,15 @@ void DrainThread::scan_ready() {
 
         account_record_task(visible_head_, actual_bytes);
 
+        const auto now = std::chrono::steady_clock::now();
         scanned_.push_back(actual_bytes);
+        scanned_ready_us_.push_back(steady_us(now));
         pending_entries_++;
         pending_bytes_ += align_up(actual_bytes, PAYLOAD_ALIGN);
         visible_head_++;
 
         if (!has_complete_time_) {
-            first_complete_time_ = std::chrono::steady_clock::now();
+            first_complete_time_ = now;
             has_complete_time_ = true;
         }
     }
@@ -696,6 +720,7 @@ bool DrainThread::should_flush() const {
 
     if (fe >= task_cap) return true;
     if (fb >= payload_cap) return true;
+    if (async_flush_until_task_ > cpu_task_tail_) return true;
     if (fc.task_ratio > 0.0f &&
         fe >= static_cast<uint64_t>(fc.task_ratio * task_cap)) return true;
     if (fc.payload_ratio > 0.0f &&
@@ -777,6 +802,7 @@ void DrainThread::submit_to_p2p(uint64_t flush_count, uint64_t flush_bytes) {
         DrainTask task{};
         task.tensor_total_bytes = actual_bytes;
         task.alloc_bytes        = alloc;
+        task.capture_ts_us      = scanned_ready_us_[i];
 
         if (data_len > 0) {
             uint64_t staging_logical = staging_batch_start + cumulative;
@@ -803,6 +829,7 @@ void DrainThread::submit_to_p2p(uint64_t flush_count, uint64_t flush_bytes) {
             std::lock_guard<std::mutex> lk(pop_mu_);
             can_pop_count_ += 1;
         }
+        tasks_enqueued_.fetch_add(1, std::memory_order_release);
         pop_cv_.notify_one();
     }
 
@@ -816,6 +843,7 @@ void DrainThread::submit_to_p2p(uint64_t flush_count, uint64_t flush_bytes) {
 void DrainThread::trim_scanned(uint64_t flush_count, uint64_t flush_bytes) {
     for (uint64_t i = 0; i < flush_count; ++i) {
         scanned_.pop_front();
+        scanned_ready_us_.pop_front();
     }
     pending_entries_ -= flush_count;
     pending_bytes_   -= flush_bytes;

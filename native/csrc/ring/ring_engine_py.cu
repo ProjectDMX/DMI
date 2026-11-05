@@ -152,6 +152,39 @@ uint64_t legacy_ring_room(uint64_t cap, uint64_t head, uint64_t tail) {
     return outstanding >= cap ? 0 : cap - outstanding;
 }
 
+// Wait for the work queued on `stream` so far, or until `deadline`.  Records
+// a timing-free event and polls it with a short, growing sleep instead of an
+// unbounded cudaStreamSynchronize.  Returns false on timeout (the stream's
+// work is still pending), and when the event API fails: completion cannot be
+// proven then, which the caller reports as not delivered.
+bool wait_stream_until(cudaStream_t stream,
+                       std::chrono::steady_clock::time_point deadline) {
+    cudaEvent_t ev = nullptr;
+    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    bool done = false;
+    if (cudaEventRecord(ev, stream) == cudaSuccess) {
+        auto backoff = std::chrono::microseconds(20);
+        while (true) {
+            const cudaError_t q = cudaEventQuery(ev);
+            if (q == cudaSuccess) { done = true; break; }
+            if (q != cudaErrorNotReady) { cudaGetLastError(); break; }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) break;
+            const auto left = std::chrono::duration_cast<std::chrono::microseconds>(
+                deadline - now);
+            std::this_thread::sleep_for(std::min(backoff, left));
+            backoff = std::min(backoff * 2, std::chrono::microseconds(1000));
+        }
+    } else {
+        cudaGetLastError();
+    }
+    cudaEventDestroy(ev);
+    return done;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -225,8 +258,8 @@ struct RingEnginePy::Impl {
     mutable std::mutex           step_failure_mu;
     std::exception_ptr           step_failure;
 
-    Impl(ring::RingConfig cfg, SubmitFn sf)
-        : engine(std::move(cfg), fifo, std::move(sf))
+    Impl(ring::RingConfig cfg, SubmitFn sf, BatchSink bs = nullptr)
+        : engine(std::move(cfg), fifo, std::move(sf), std::move(bs))
     {
         const auto& state = engine.ring_state();
         int dev_idx = 0;
@@ -395,6 +428,8 @@ static ring::RingConfig convert(const RingConfig& c) {
     r.drain_flush.byte_threshold  = c.drain_flush_byte_threshold;
     r.drain_flush.timeout_us      = c.drain_flush_timeout_us;
     r.clone_slices                = c.clone_slices;
+    r.p2p_pool_cap_bytes          = c.p2p_pool_cap_bytes;
+    r.batch_submit                = c.batch_submit;
     r.insert_queue_max_bytes      = c.insert_queue_max_bytes;
     r.insert_queue_max_items      = c.insert_queue_max_items;
     if (c.drain_policy == "step_gated") {
@@ -408,12 +443,14 @@ static ring::RingConfig convert(const RingConfig& c) {
 }
 
 // ---------------------------------------------------------------------------
-RingEnginePy::RingEnginePy(RingConfig cfg, SubmitFn submit_fn) {
+RingEnginePy::RingEnginePy(RingConfig cfg, SubmitFn submit_fn,
+                           BatchSink batch_sink) {
     if (cfg.drain_policy == "step_gated") {
         throw std::invalid_argument(
             "drain_policy 'step_gated' requires a record ring");
     }
-    impl_ = std::make_unique<Impl>(convert(cfg), std::move(submit_fn));
+    impl_ = std::make_unique<Impl>(convert(cfg), std::move(submit_fn),
+                                   std::move(batch_sink));
 }
 
 RingEnginePy::RingEnginePy(
@@ -632,6 +669,11 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
 {
     // Record rings reserve through reserve_record.
     refuse_on_record_ring(impl_->record_mode, "legacy step reservation");
+    if (sink_failed()) {
+        throw std::runtime_error(
+            "ring consumer failed (abort-on-sink-error is armed): " +
+            last_sink_error());
+    }
     impl_->current_hook_idx = 0;
     if (step_total_bytes % ring::PAYLOAD_ALIGN != 0) {
         throw std::invalid_argument(
@@ -1312,6 +1354,46 @@ void RingEnginePy::_test_force_apply_error(int code) {
 
 bool RingEnginePy::_test_applied_current(uint64_t graph) const {
     return impl_->toggle.applied_current(graph);
+}
+
+bool RingEnginePy::request_flush() {
+    return impl_->engine.drain_thread().request_flush();
+}
+
+bool RingEnginePy::drain_to_sink_and_wait(uint32_t timeout_ms) {
+    refuse_on_record_ring(impl_->record_mode, "legacy delivery barrier");
+    cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
+    if (timeout_ms == 0) {
+        // No timeout: wait for the producer stream, the flush and delivery.
+        cudaStreamSynchronize(ms);
+        return impl_->engine.drain_to_sink_and_wait_until(std::nullopt);
+    }
+    // A finite timeout bounds the WHOLE barrier: one deadline, taken here,
+    // covers producer-stream completion, the flush and the delivery wait.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    if (!wait_stream_until(ms, deadline)) return false;
+    return impl_->engine.drain_to_sink_and_wait_until(deadline);
+}
+
+uint64_t RingEnginePy::submit_exceptions() const {
+    const auto* p2p = impl_->engine.p2p_thread();
+    return p2p ? p2p->submit_exceptions() : 0;
+}
+
+std::string RingEnginePy::last_sink_error() const {
+    const auto* p2p = impl_->engine.p2p_thread();
+    return p2p ? p2p->last_error() : std::string{};
+}
+
+void RingEnginePy::set_abort_on_sink_error(bool enabled) {
+    auto* p2p = impl_->engine.p2p_thread();
+    if (p2p) p2p->set_abort_on_sink_error(enabled);
+}
+
+bool RingEnginePy::sink_failed() const {
+    const auto* p2p = impl_->engine.p2p_thread();
+    return p2p && p2p->sink_failed();
 }
 
 uint64_t RingEnginePy::available_capacity() const {

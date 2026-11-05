@@ -59,7 +59,7 @@ namespace ring_py {
 
 struct RingEnginePy::Impl {};
 
-RingEnginePy::RingEnginePy(RingConfig, SubmitFn) : impl_(new Impl) {}
+RingEnginePy::RingEnginePy(RingConfig, SubmitFn, BatchSink) : impl_(new Impl) {}
 RingEnginePy::~RingEnginePy() = default;
 
 void RingEnginePy::hook_no_notify(uint64_t, uint64_t, uint32_t, uint64_t) {

@@ -20,6 +20,13 @@ struct DrainTask {
     // CPU-direct path: tensor already in pageable CPU memory.
     // When defined(), skip staging copy in p2p thread.
     at::Tensor cpu_paged_tensor;
+
+    // steady_clock microseconds when the drain thread first saw this task's
+    // publication on the host: the capture exists and is host-visible.
+    // Stamped before the flush wait and the D2H copy, so a consumer's
+    // (now - capture_ts_us) includes the drain-flush latency the drain_flush
+    // settings control.  0 = unstamped.
+    int64_t capture_ts_us = 0;
 };
 
 }  // namespace ring

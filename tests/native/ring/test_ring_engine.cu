@@ -1,6 +1,7 @@
 // CUDA integration tests for producer -> drain -> pinned-staging delivery.
 
 #include "ring/drain_thread.h"
+#include "ring/p2p_thread.h"
 #include "ring/pinned_staging.h"
 #include "ring/producer.cuh"
 #include "ring/ring_alloc.h"
@@ -326,7 +327,7 @@ static void check_eager_delivery_past_the_task_ring(uint32_t task_slots) {
         cfg,
         [&](const std::string&, int32_t, const std::string&,
             const std::string& act_name, int32_t layer_no, int32_t, int32_t,
-            at::Tensor slice) {
+            at::Tensor slice, int64_t, ring_py::CaptureLease) {
             const uint8_t* data = slice.data_ptr<uint8_t>();
             Delivery delivery{act_name, layer_no, slice.sizes().vec(),
                               std::vector<uint8_t>(data, data + slice.nbytes())};
@@ -471,6 +472,31 @@ static void test_record_ring_refuses_every_legacy_producer_entry() {
     EXPECT(engine.available_capacity() == capacity);
     CUDA_CHECK(cudaFree(counts));
     CUDA_CHECK(cudaFree(source));
+}
+
+static void test_delivery_barrier_returns_once_the_consumer_thread_exits() {
+    banner("delivery barrier returns when the consumer thread has exited");
+    DrainHarness harness(make_config());
+    ring_py::TensorMetaFifo fifo;
+    ring::P2PThread p2p(*harness.drain, fifo, harness.cfg, ring::SubmitFn{});
+    p2p.start();
+    harness.drain->stop();
+    harness.drain->signal_p2p_stop();     // the consumer loop exits
+    // An unbounded wait for a task that will never be processed must not
+    // hang: a watchdog fails the test instead of the whole suite stalling.
+    auto verdict = std::make_shared<std::promise<bool>>();
+    auto result = verdict->get_future();
+    std::thread([&p2p, verdict] {
+        verdict->set_value(p2p.wait_until_processed(1, 0));
+    }).detach();
+    if (result.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+        std::fprintf(stderr, "FAIL: wait_until_processed hung after thread exit\n");
+        std::_Exit(1);
+    }
+    EXPECT(result.get() == false);
+    EXPECT(p2p.wait_until_processed(0, 0) == true);
+    EXPECT(p2p.wait_until_processed(1, 50) == false);
+    p2p.stop();
 }
 
 static void test_static_force_flush() {
@@ -1369,6 +1395,7 @@ int main() {
     test_ring_room_saturates_past_capacity();
     test_eager_safety_net_delivers_past_the_task_ring();
     test_record_ring_refuses_every_legacy_producer_entry();
+    test_delivery_barrier_returns_once_the_consumer_thread_exits();
     test_static_force_flush();
     test_prefix_force_flush();
     test_chunked_short_then_static_preserves_payload_offset();
